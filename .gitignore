@@ -1,0 +1,25 @@
+# env
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# go
+apps/api/bin/
+
+# model weights & datasets (too big for git)
+apps/worker/weights/*.pt
+apps/worker/weights/*.onnx
+apps/worker/training/data/
+apps/worker/training/runs/
+
+# local run artifacts
+apps/worker/out/
+*.log

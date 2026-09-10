@@ -1,0 +1,47 @@
+services:
+  lavinmq:
+    image: cloudamqp/lavinmq:latest
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI
+    volumes:
+      - lavinmq-data:/var/lib/lavinmq
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: terjemahin
+      POSTGRES_PASSWORD: terjemahin
+      POSTGRES_DB: terjemahin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  api:
+    build: ./apps/api
+    env_file: .env
+    environment:
+      AMQP_URL: amqp://guest:guest@lavinmq:5672/
+      DATABASE_URL: postgres://terjemahin:terjemahin@postgres:5432/terjemahin?sslmode=disable
+      STORAGE_DIR: /data
+    ports:
+      - "8080:8080"
+    volumes:
+      - shared-data:/data
+    depends_on: [lavinmq, postgres]
+
+  worker:
+    build: ./apps/worker
+    env_file: .env
+    environment:
+      AMQP_URL: amqp://guest:guest@lavinmq:5672/
+      STORAGE_DIR: /data
+    volumes:
+      - shared-data:/data
+    depends_on: [lavinmq]
+
+volumes:
+  lavinmq-data:
+  pg-data:
+  shared-data:
