@@ -17,6 +17,7 @@ apps/api/bin/
 # model weights & datasets (too big for git)
 apps/worker/weights/*.pt
 apps/worker/weights/*.onnx
+apps/worker/data/
 apps/worker/training/data/
 apps/worker/training/runs/
 

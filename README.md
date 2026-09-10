@@ -36,12 +36,27 @@ DETECTOR=ctd .venv/bin/terjemahin-worker translate page.jpg -o out/page.png
 
 ### Train the detector (RTX 4060)
 
+Option A, Manga109-s (best labels; request access at https://huggingface.co/datasets/hal-utokyo/Manga109-s):
+
 ```sh
 uv pip install -p .venv/bin/python -e ".[train]"
 python training/prepare_manga109.py --root /path/to/Manga109 --out data/manga109-text
 python training/train.py --data data/manga109-text/dataset.yaml --epochs 60
 # -> weights/manga-text-yolo11n.onnx
 ```
+
+Option B, pseudo-labels from comic-text-detector on any folder of pages (no dataset access needed):
+
+```sh
+python training/download_pool.py --out data/pool          # or copy your own pages into data/pool
+DETECTOR=ctd python training/pseudo_label.py --pool data/pool --out data/pseudo-text
+# inspect data/pseudo-text/review/*.jpg, delete bad label files, then:
+python training/train.py --data data/pseudo-text/dataset.yaml --epochs 60
+```
+
+`download_pool.py` pulls PSImera/manga_bubbles_detect (CC BY-NC 4.0). Its pages are 640x640
+resized with text regions rotated 180 degrees, so treat it as a smoke-test pool, not the final
+training set.
 
 ## API quick start
 
