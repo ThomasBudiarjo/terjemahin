@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # detector
     detector: Literal["yolo", "ctd"] = "yolo"
     yolo_weights: Path = WORKER_ROOT / "weights" / "manga-text-yolo11n.onnx"
-    ctd_weights: Path = WORKER_ROOT / "weights" / "comictextdetector.pt.onnx"
+    ctd_weights: Path = WORKER_ROOT / "weights" / "comictextdetector-blk.onnx"
     detect_conf: float = 0.4
     detect_iou: float = 0.5
 

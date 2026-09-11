@@ -24,7 +24,10 @@ class CtdDetector:
 
     def __init__(self, weights: Path, conf: float = 0.4, iou: float = 0.5) -> None:
         if not Path(weights).exists():
-            raise FileNotFoundError(f"CTD weights not found at {weights}. Download from {CTD_URL}")
+            raise FileNotFoundError(
+                f"CTD weights not found at {weights}. Download {CTD_URL} and run "
+                "training/prune_ctd.py (see weights/README.md)."
+            )
         self.session = ort.InferenceSession(str(weights), providers=["CPUExecutionProvider"])
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
