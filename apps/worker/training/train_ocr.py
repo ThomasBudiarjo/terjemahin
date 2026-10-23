@@ -93,8 +93,11 @@ class Tokenizer:
         self.ids = {t: i for i, t in enumerate(vocab)}
 
     def encode(self, text: str, max_len: int) -> list[int]:
+        """Over-long targets keep their prefix but lose [SEP]: a [SEP] after a cut would teach
+        the model to stop reading early."""
         text = "".join(unicodedata.normalize("NFKC", text).split())
-        return [START] + [self.ids.get(c, UNK) for c in text][: max_len - 2] + [EOS]
+        ids = [START] + [self.ids.get(c, UNK) for c in text]
+        return ids[:max_len] if len(ids) >= max_len else ids + [EOS]
 
     def decode(self, ids: list[int]) -> str:
         return decode_tokens(ids, self.vocab)
@@ -178,10 +181,22 @@ def evaluate(model, samples: list[Sample], tok: Tokenizer, max_len: int, batch: 
 def save(model, vocab_src: Path, out: Path, info: dict) -> None:
     import shutil
 
+    if out.is_symlink():
+        out.unlink()
     out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out)
     shutil.copy(vocab_src, out / "vocab.txt")
     (out / "train_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False))
+
+
+def link(path: Path, target: str) -> None:
+    import shutil
+
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    path.symlink_to(target, target_is_directory=True)
 
 
 def resolve_vocab(model_id: str) -> Path:
@@ -267,9 +282,15 @@ def train(a: argparse.Namespace) -> dict:
                 info["best"] = {"step": step, "selected_on": key, **res}
                 save(model, vocab_path, a.out / "best", info)
     info["seconds"] = round(time.time() - t0, 1)
-    save(model, vocab_path, a.out / "final", info)
-    if "best" not in info:
-        save(model, vocab_path, a.out / "best", info)
+    # one ~440MB copy when best == final: the other name is a symlink
+    if info.get("best", {}).get("step") == steps:
+        link(a.out / "final", "best")
+        (a.out / "best" / "train_info.json").write_text(json.dumps(info, indent=2,
+                                                                   ensure_ascii=False))
+    else:
+        save(model, vocab_path, a.out / "final", info)
+        if "best" not in info:
+            link(a.out / "best", "final")
     (a.out / "metrics.json").write_text(json.dumps(info, indent=2, ensure_ascii=False))
     return info
 

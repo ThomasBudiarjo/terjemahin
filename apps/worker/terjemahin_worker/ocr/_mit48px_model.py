@@ -7,7 +7,7 @@ RGB, outline RGB and their presence). Parameter names match the checkpoint, so
 (no einops), a real KV cache, and a vectorised beam search that keeps every beam's own history
 (the reference's tensor beam search forgets to reorder its cache when beams are re-ranked).
 
-Imported lazily by `mit48px.py` because it needs torch.
+Underscore-prefixed so plugin discovery skips it; `mit48px.py` imports it lazily (needs torch).
 """
 
 from __future__ import annotations

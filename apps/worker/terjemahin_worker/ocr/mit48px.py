@@ -21,7 +21,11 @@ from ..weights import ensure
 from .base import OcrResult
 
 TEXT_HEIGHT = 48
-MAX_LINE_WIDTH = TEXT_HEIGHT * 48  # longer lines are squeezed; nothing real is that long
+MAX_LINE_WIDTH = TEXT_HEIGHT * 256  # warp cap; longer lines are squeezed
+# The model collapses (stops early or loops, still confident) on lines wider than ~2100px, so
+# longer lines are cut at blank columns into pieces of at most PIECE_WIDTH.
+SPLIT_WIDTH = TEXT_HEIGHT * 32
+PIECE_WIDTH = TEXT_HEIGHT * 26
 
 
 def order_quad(q: np.ndarray) -> np.ndarray:
@@ -175,8 +179,48 @@ def _latin(c: str) -> bool:
 
 
 def vertical_forms(text: str) -> str:
-    """In a rotated column the vertical two-dot leader (looks like a colon) reads as "："."""
-    return text.replace("：", "‥").replace(":", "‥")
+    """In a rotated column the vertical two-dot leader (looks like a colon) reads as "："; a
+    colon between Latin letters or digits (e.g. "10:30") is a real one and is kept."""
+    return "".join(
+        "‥"
+        if c in "：:"
+        and not (0 < i < len(text) - 1 and _latin(text[i - 1]) and _latin(text[i + 1]))
+        else c
+        for i, c in enumerate(text)
+    )
+
+
+def line_pieces(crop: np.ndarray) -> list[tuple[int, int, bool]]:
+    """Column spans (start, end, starts_after_space) cutting a long line crop at blank columns,
+    so that no piece exceeds PIECE_WIDTH. Short lines come back whole."""
+    w = crop.shape[1]
+    if w <= SPLIT_WIDTH:
+        return [(0, w, False)]
+    g = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY).astype(np.int16)
+    bg = np.median(np.concatenate([g[:2], g[-2:]]))  # the margin rows are background
+    ink = (np.abs(g - bg) > 48).sum(0)
+    # a cut gap reads as a word space when it is clearly wider than the usual letter gap
+    gaps = [e - s for s, e in _runs(ink == 0) if 0 < s and e < w]
+    space = max(2 * float(np.median(gaps)) if gaps else 0.0, TEXT_HEIGHT / 5)
+    pieces, start, gap = [], 0, False
+    while w - start > PIECE_WIDTH:
+        lo, hi = start + PIECE_WIDTH // 2, start + PIECE_WIDTH
+        win = ink[lo:hi]
+        runs = _runs(win <= win.min())
+        a, b = max(runs, key=lambda r: r[1] - r[0])
+        cut = lo + (a + b) // 2
+        pieces.append((start, cut, gap))
+        start, gap = cut, win.min() == 0 and b - a >= space
+    pieces.append((start, w, gap))
+    return pieces
+
+
+def _inside(q: np.ndarray, w: int, h: int) -> float:
+    """Fraction of the quad's bounding box that lies on the image."""
+    (x0, y0), (x1, y1) = q.min(0), q.max(0)
+    ix = max(0.0, min(x1, w) - max(x0, 0))
+    iy = max(0.0, min(y1, h) - max(y0, 0))
+    return ix * iy / max((x1 - x0) * (y1 - y0), 1e-6)
 
 
 def _rgb(v: np.ndarray) -> RGB:
@@ -206,7 +250,7 @@ class Mit48pxOCR:
     ) -> None:
         import torch
 
-        from .mit48px_model import OCR48px
+        from ._mit48px_model import OCR48px
 
         if threads:
             torch.set_num_threads(int(threads))
@@ -225,13 +269,37 @@ class Mit48pxOCR:
         ]
 
     def lines(self, gray: np.ndarray, region: TextRegion) -> list[np.ndarray]:
-        """Line quads of a region in reading order."""
+        """Line quads of a region in reading order; parts lying off the image are ignored."""
+        h, w = gray.shape
+        b = region.bbox
+        if min(b.x2, w) - max(b.x1, 0) < 2 or min(b.y2, h) - max(b.y1, 0) < 2:
+            return []
         quads = [np.asarray(q, np.float32) for q in region.lines if len(q) == 4]
-        quads = [q for q in quads if np.ptp(q, 0).min() >= 3] or split_lines(gray, region)
+        quads = [q for q in quads if np.ptp(q, 0).min() >= 3 and _inside(q, w, h) >= 0.5]
+        quads = quads or split_lines(gray, region)
         return [quads[i] for i in reading_order(quads, region.direction)]
 
     def read_lines(self, crops: list[np.ndarray]) -> list[tuple[str, float, np.ndarray]]:
         """Recognise 48px-high RGB line crops: (text, confidence, per-char colours (n, 10))."""
+        spans = [line_pieces(c) for c in crops]
+        pieces = [c[:, a:b] for c, sp in zip(crops, spans) for a, b, _ in sp]
+        read = self._read(pieces)
+        out, k = [], 0
+        for sp in spans:
+            part = read[k : k + len(sp)]
+            k += len(sp)
+            if len(part) == 1:
+                out.append(part[0])
+                continue
+            text = ""
+            for (t, _, _), (_, _, space) in zip(part, sp):
+                text += " " + t if space and text and t and _latin(text[-1]) and _latin(t[0]) else t
+            n = np.array([max(len(t), 1) for t, _, _ in part], np.float32)
+            conf = float(np.exp((np.log([max(c, 1e-9) for _, c, _ in part]) * n).sum() / n.sum()))
+            out.append((text, conf, np.concatenate([c for _, _, c in part])))
+        return out
+
+    def _read(self, crops: list[np.ndarray]) -> list[tuple[str, float, np.ndarray]]:
         import torch
 
         out: list[Any] = [None] * len(crops)
@@ -250,6 +318,10 @@ class Mit48pxOCR:
         return out
 
     def recognize(self, image_bgr: np.ndarray, regions: list[TextRegion]) -> list[OcrResult]:
+        if image_bgr.ndim == 2:
+            image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+        elif image_bgr.shape[2] == 4:
+            image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_BGRA2BGR)
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         owner, dirs, crops = [], [], []

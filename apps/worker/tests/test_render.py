@@ -395,3 +395,68 @@ def test_page01_reference_translations_fit_inside_balloons(tmp_path):
         ink = np.asarray(canvas).astype(int).sum(axis=2) < 600
         gap = cv2.distanceTransform(full, cv2.DIST_L2, 3)[ink]
         assert gap.min() >= 6, (p.text, gap.min())
+
+
+# -- robustness (verifier findings) -------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["default", "vertical"])
+def test_bad_boxes_and_grayscale_do_not_crash(name):
+    load_all()
+    img = np.full((300, 300, 3), 255, np.uint8)
+    cv2.ellipse(img, (150, 150), (120, 90), 0, 0, 360, (0, 0, 0), 3)
+    r = RENDERERS.build(name, Settings())
+    boxes = [
+        BBox(x1=150, y1=150, x2=150, y2=160),  # zero width
+        BBox(x1=400, y1=400, x2=500, y2=500),  # entirely off the page
+        BBox(x1=-80, y1=-80, x2=-10, y2=-10),
+        BBox(x1=110, y1=120, x2=190, y2=180),
+    ]
+    out = r.render(img, _bubbles(boxes, ["Halo", "Hilang", "Hilang", "Apa kabar?"]), img)
+    assert out.shape == img.shape
+    assert [p.bubble.region.id for p in r.plans] == [0, 3]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    out = r.render(gray, _bubbles(boxes[3:], ["Apa kabar?"]), gray)
+    assert out.shape == img.shape and (out != 255).any()
+
+
+def test_invalid_alignment_and_direction_fail_at_build():
+    load_all()
+    with pytest.raises(ValueError):
+        RENDERERS.build("default", Settings(), alignment="justify")
+    with pytest.raises(ValueError):
+        RENDERERS.build("default", Settings(), direction="x")
+
+
+def test_negative_offset_never_enlarges_or_overflows():
+    load_all()
+    img = np.full((400, 400, 3), 255, np.uint8)
+    cv2.ellipse(img, (200, 200), (34, 26), 0, 0, 360, (0, 0, 0), 3)  # tiny balloon
+    bub = _bubbles([BBox(x1=185, y1=190, x2=215, y2=210)], ["Gerak gerak"])
+    base = RENDERERS.build("default", Settings())
+    base.render(img, bub, img)
+    r = RENDERERS.build("default", Settings(), font_size_offset=-6)
+    r.render(img, bub, img)
+    b, p = base.plans[0].layout, r.plans[0].layout
+    assert p.size <= b.size and (p.fits or not b.fits)
+
+
+def test_a_word_is_split_at_most_once(measure):
+    text = "Aku pikir reaksi mereka selalu menyenangkan"
+    for w in range(90, 260, 6):
+        lay = fit(text, Shape.rect(w, 900), measure, min_size=14, max_size=40)
+        if not lay.fits:
+            continue
+        joins = [ln.join for ln in lay.lines]
+        for i in range(1, len(joins)):
+            assert not (joins[i - 1] == "soft" and joins[i] == "soft"), (w, lay.lines)
+        assert lay.text == text
+
+
+def test_coloured_midtone_area_is_art_not_balloon():
+    img = np.full((400, 400, 3), 40, np.uint8)
+    cv2.rectangle(img, (60, 60), (340, 340), (170, 130, 150), -1)  # flat purple between edges
+    assert not find_balloon(img, img, BBox(x1=170, y1=170, x2=230, y2=230)).closed
+    cv2.ellipse(img, (200, 200), (120, 90), 0, 0, 360, (255, 255, 255), -1)
+    cv2.ellipse(img, (200, 200), (120, 90), 0, 0, 360, (0, 0, 0), 3)
+    assert find_balloon(img, img, BBox(x1=170, y1=170, x2=230, y2=230)).closed

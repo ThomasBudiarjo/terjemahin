@@ -155,7 +155,8 @@ def text_zone(r: TextRegion, c, reach: float) -> np.ndarray:
 
 @pytest.mark.skipif(not (WEIGHTS.exists() and PAGE.exists()), reason="ctd weights missing")
 def test_page01_with_ctd():
-    """Real page: every glyph pixel of the 13 balloons erased, outlines kept, both modes."""
+    """Real page: every glyph pixel of the 13 balloons erased, outlines kept, with the detector
+    mask, without it, and with bare boxes (no lines, no font size: ctd_blk, yolo, hand-drawn)."""
     from terjemahin_worker.detect.ctd_full import CtdFullDetector
     from terjemahin_worker.mask.refine import blend_ink, make_crop, ring_median, structure
 
@@ -163,24 +164,118 @@ def test_page01_with_ctd():
     det = CtdFullDetector(WEIGHTS).detect(img)
     regions = [r for r in det.regions if r.bbox.y2 < 2020]  # skip the corner SFX over art
     assert len(regions) >= 13
-    H, W = img.shape[:2]
-    for raw in (det.mask, None):
-        m = GlyphMask().refine(img, regions, raw) > 0
-        ink_total = missed = outline_hit = 0
-        for r in regions:
-            c = make_crop(r, W, H, 0.5)
-            lines = text_zone(r, c, 0.25)
-            crop = img[c.sl]
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            dark = gray < 128
-            bg = ring_median(crop, dark & c.near, 5, 15)
-            ink = blend_ink(crop, bg, np.zeros(3), 0.25)
-            st = structure(ink, c)
-            glyph = dark & ~st & lines
-            ink_total += glyph.sum()
-            missed += (glyph & ~m[c.sl]).sum()
-            outline_hit += (st & (gray < 80) & m[c.sl]).sum()
-        assert ink_total > 40000
-        assert missed / ink_total < 0.002, (raw is None, missed, ink_total)
-        assert outline_hit < 300, (raw is None, outline_hit)
-        assert m.mean() < 0.08  # glyphs only: no page-sized blobs
+    boxes = [r.model_copy(update={"lines": [], "font_size": None}) for r in regions]
+    for fs, r in zip([font_size(b, img) for b in boxes], regions, strict=True):
+        assert 0.7 * r.font_size <= fs <= 1.3 * r.font_size  # measured from ink, not the box
+    for name, regs, raw in (
+        ("seg", regions, det.mask),
+        ("pixels", regions, None),
+        ("box", boxes, None),
+    ):
+        for refiner in (GlyphMask(), DilateMask()):
+            m = refiner.refine(img, regs, raw) > 0
+            ink_total = missed = outline_hit = 0
+            for r in regions:
+                c = make_crop(r, img, 0.5)
+                lines = text_zone(r, c, 0.25)
+                crop = img[c.sl]
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                dark = gray < 128
+                bg = ring_median(crop, dark & c.near, 5, 15)
+                ink = blend_ink(crop, bg, np.zeros(3), 0.25)
+                st = structure(ink, c)
+                glyph = dark & ~st & lines
+                ink_total += glyph.sum()
+                missed += (glyph & ~m[c.sl]).sum()
+                outline_hit += (st & (gray < 80) & m[c.sl]).sum()
+            tag = (name, type(refiner).__name__, missed, outline_hit)
+            assert ink_total > 40000
+            assert missed / ink_total < 0.002, tag
+            if isinstance(refiner, GlyphMask):
+                assert outline_hit < 300, tag
+            else:
+                assert outline_hit < 3000, tag
+            assert m.mean() < 0.08, tag  # glyphs only: no page-sized blobs
+
+
+def multi_column_page():
+    """Big white balloon with four columns of text and a dark art blob inside its bbox corner."""
+    H, W = 420, 420
+    img = np.full((H, W, 3), (120, 110, 115), np.uint8)
+    cv2.ellipse(img, (210, 210), (180, 190), 0, 0, 360, (250, 250, 250), -1)
+    cv2.ellipse(img, (210, 210), (180, 190), 0, 0, 360, (0, 0, 0), 4, cv2.LINE_AA)
+    glyphs = np.zeros((H, W), np.uint8)
+    for i, word in enumerate(("AB", "CD", "EF", "GH")):
+        for j, ch in enumerate(word):
+            org = (110 + 55 * i, 150 + 60 * j)
+            cv2.putText(glyphs, ch, org, cv2.FONT_HERSHEY_SIMPLEX, 1.3, 255, 3, cv2.LINE_AA)
+    img = blend(img, glyphs, (10, 10, 10))
+    ys, xs = np.nonzero(glyphs)
+    box = BBox(
+        x1=int(xs.min()) - 4, y1=int(ys.min()) - 4, x2=int(xs.max()) + 5, y2=int(ys.max()) + 5
+    )
+    return img, TextRegion(id=0, bbox=box), glyphs.astype(np.float32) / 255.0
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+def test_box_only_region_measures_glyph_size(cls):
+    img, region, glyphs = multi_column_page()
+    assert 25 <= font_size(region, img) <= 50  # not the 150 px short side of the box
+    m = cls().refine(img, [region], None)
+    assert covered(m, glyphs, 0.05 if cls is GlyphMask else 0.3) == 1.0
+    b = region.bbox
+    assert (m[b.y1 : b.y2, b.x1 : b.x2] > 0).mean() < 0.6
+    grown = cv2.dilate((glyphs > 0).astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
+    assert not (m.astype(bool) & ~grown).any()  # nothing far from a glyph
+
+
+def test_weak_seg_bleed_does_not_drop_glyph():
+    small, region, glyphs, _ = balloon_page()
+    img = np.full((700, 600, 3), (150, 140, 145), np.uint8)
+    oy, ox = 300, 250
+    img[oy : oy + 260, ox : ox + 300] = small
+    g = np.zeros((700, 600), np.float32)
+    g[oy : oy + 260, ox : ox + 300] = glyphs
+    seg = fake_seg(g, spurious=False)
+    b = region.bbox
+    region = region.model_copy(
+        update={
+            "bbox": BBox(x1=b.x1 + ox, y1=b.y1 + oy, x2=b.x2 + ox, y2=b.y2 + oy),
+            "lines": [[(x + ox, y + oy) for x, y in region.lines[0]]],
+        }
+    )
+    cy = (region.bbox.y1 + region.bbox.y2) // 2
+    cv2.line(seg, (region.bbox.x1 + 10, cy), (0, cy), 110, 3)  # bleed along a speed line
+    m = GlyphMask().refine(img, [region], seg)
+    assert covered(m, g, 0.05) == 1.0
+    assert not m[:, : ox - 20].any()
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+def test_malformed_boxes_are_tolerated(cls):
+    img, region, _, _ = balloon_page()
+    b = region.bbox
+    flipped = region.model_copy(update={"bbox": BBox(x1=b.x2, y1=b.y2, x2=b.x1, y2=b.y1)})
+    assert np.array_equal(cls().refine(img, [flipped], None), cls().refine(img, [region], None))
+    for bad in (BBox(x1=400, y1=400, x2=500, y2=500), BBox(x1=-50, y1=-50, x2=-10, y2=-10),
+                BBox(x1=50, y1=50, x2=50, y2=50)):  # fmt: skip
+        m = cls().refine(img, [TextRegion(id=1, bbox=bad)], None)
+        assert m.shape == img.shape[:2] and not m.any()
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+def test_raw_mask_dtypes(cls):
+    img, region, glyphs, _ = balloon_page()
+    u8 = fake_seg(glyphs)
+    ref = cls().refine(img, [region], u8)
+    assert covered(ref, glyphs, 0.3) > 0.99
+    for raw in (u8.astype(np.float32) / 255.0, u8 > 127, u8.astype(np.uint16) * 257):
+        m = cls().refine(img, [region], raw)
+        assert covered(m, glyphs, 0.3) > 0.99, raw.dtype
+
+
+def test_unknown_option_warns(caplog):
+    with caplog.at_level("WARNING"):
+        MASK_REFINERS.build("default", Settings(), dilatation="0.3")
+        MASK_REFINERS.build("dilate", Settings(), flat_spread="30")
+    assert len(caplog.records) == 1 and "dilatation" in caplog.records[0].getMessage()

@@ -22,6 +22,8 @@ COLOR_TOL = 14.0  # Lab distance from the interior colour that still counts as i
 INK_TOL = 60  # original-page pixels this much darker than the interior are outline/art
 MAX_AREA_RATIO = 30.0  # balloon / text-box area beyond which it is a background, not a balloon
 MIN_COVER = 0.6  # share of the text box the balloon must contain
+ART_L = (60, 200)  # a mid-tone interior (OpenCV 8-bit L) that is also coloured is art, not a
+ART_CHROMA = 8.0  # balloon: real balloons are white, black or pale; skin, sky and cloth are not
 WINDOW_SCALES = (0.9, 2.0, 3.5)  # search padding, x the box's longer side
 
 
@@ -93,7 +95,9 @@ def _extract(
     bx1, by1 = bbox.x1 - win.x1, bbox.y1 - win.y1
     bx2, by2 = bx1 + bbox.w, by1 + bbox.h
     box = np.zeros(crop.shape[:2], np.uint8)
-    box[max(0, by1) : by2, max(0, bx1) : bx2] = 255
+    box[max(0, by1) : max(0, by2), max(0, bx1) : max(0, bx2)] = 255
+    if not box.any():  # empty or off-page box: nothing to sample, treat as text over art
+        return Balloon(box, win.x1, win.y1, False, (255, 255, 255)), False
 
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).astype(np.float32)
     inside = lab[box > 0]
@@ -131,7 +135,14 @@ def _extract(
     )
     area = int((region > 0).sum())
     cover = float((region[box > 0] > 0).mean())
-    closed = not touches and area <= MAX_AREA_RATIO * max(1, bbox.w * bbox.h) and cover >= MIN_COVER
+    chroma = float(np.hypot(ref[1] - 128, ref[2] - 128))
+    art = ART_L[0] < ref[0] < ART_L[1] and chroma > ART_CHROMA
+    closed = (
+        not touches
+        and not art
+        and area <= MAX_AREA_RATIO * max(1, bbox.w * bbox.h)
+        and cover >= MIN_COVER
+    )
     return Balloon(region, win.x1, win.y1, closed, color), touches  # type: ignore[arg-type]
 
 

@@ -2,7 +2,8 @@
 
 Plain httpx, no SDK. `provider=` presets fill in the base URL of common hosts; `base_url=` always
 wins. Structured output degrades gracefully: json_schema -> json_object -> prompt-only, dropped
-automatically when an endpoint answers 400 to it.
+automatically when an endpoint answers 400 to it. Images are only sent by default to hosts whose
+default models see (OpenAI, OpenRouter); a 400 about image input switches to text-only requests.
 """
 
 from __future__ import annotations
@@ -12,7 +13,17 @@ import os
 from typing import Any
 
 from ..registry import TRANSLATORS
-from .llm_common import ChatRequest, Http, Image, LLMError, as_bool, make_translator, split_opts
+from .llm_common import (
+    ChatRequest,
+    Http,
+    Image,
+    ImagesRejected,
+    LLMError,
+    as_bool,
+    images_rejected,
+    make_translator,
+    split_opts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +39,8 @@ PRESETS: dict[str, str] = {
     "vllm": "http://localhost:8000/v1",
 }
 _OPTIONAL = ("response_format", "temperature", "max_tokens", "max_completion_tokens", "top_p")
+_VISION_HOSTS = ("api.openai.com", "openrouter.ai")
+LOCAL_TIMEOUT = 900.0  # a CPU-only 3B-7B model needs minutes for one manga page
 
 
 class OpenAICompatBackend:
@@ -95,7 +108,12 @@ class OpenAICompatBackend:
         return body
 
     def complete(self, req: ChatRequest) -> str:
-        data = self.http.post_adaptive(self.url, self.headers, self.body(req), _OPTIONAL)
+        try:
+            data = self.http.post_adaptive(self.url, self.headers, self.body(req), _OPTIONAL)
+        except LLMError as e:
+            if req.has_images and images_rejected(e):
+                raise ImagesRejected(str(e), e.status) from e
+            raise
         choices = data.get("choices") or []
         if not choices:
             raise LLMError(f"{self.name}: response has no choices: {str(data)[:300]}", retryable=True)
@@ -114,6 +132,10 @@ class OpenAICompatBackend:
         return content or ""
 
 
+def _is_local(url: str) -> bool:
+    return any(h in url for h in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]"))
+
+
 def _build(
     settings: Any,
     opts: dict[str, Any],
@@ -122,10 +144,14 @@ def _build(
     base_url: str,
     model: str,
     api_key: str,
-    vision: bool,
+    vision: bool | None,
     json_mode: str = "auto",
+    http_defaults: dict[str, Any] | None = None,
 ) -> Any:
     core, http_opts, rest = split_opts(dict(opts))
+    if http_defaults is None and _is_local(rest.get("base_url") or base_url):
+        http_defaults = {"timeout": LOCAL_TIMEOUT, "timeout_retries": 0}
+    http_opts = {**(http_defaults or {}), **http_opts}
     preset = rest.pop("provider", None)
     if preset:
         if preset not in PRESETS:
@@ -134,7 +160,8 @@ def _build(
     base_url = rest.pop("base_url", None) or base_url
     model = rest.pop("model", None) or model
     api_key = rest.pop("api_key", None) or api_key
-    vision = as_bool(rest.pop("vision", vision))
+    vision = rest.pop("vision", vision)
+    vision = any(h in base_url for h in _VISION_HOSTS) if vision is None else as_bool(vision)
     fallback = rest.pop("fallback", None)
     backend = OpenAICompatBackend(
         Http(**http_opts), base_url, model, api_key,
@@ -156,7 +183,7 @@ def _build(
 def _openai(settings, **opts):
     return _build(
         settings, opts, name="openai", base_url=settings.openai_base_url,
-        model=settings.openai_model, api_key=settings.openai_api_key, vision=True,
+        model=settings.openai_model, api_key=settings.openai_api_key, vision=None,
     )
 
 
@@ -178,7 +205,7 @@ def _deepseek(settings, **opts):
 @TRANSLATORS.register(
     "ollama",
     description="Local LLM through Ollama's OpenAI-compatible endpoint (no key; vision=true for "
-    "VLMs such as qwen2.5vl / gemma3).",
+    "VLMs such as qwen2.5vl / gemma3; 900s timeout for CPU inference).",
     offline=True,
 )
 def _ollama(settings, **opts):
@@ -188,4 +215,6 @@ def _ollama(settings, **opts):
         or PRESETS["ollama"],
         model=getattr(settings, "ollama_model", "") or os.environ.get("OLLAMA_MODEL") or "qwen2.5:7b",
         api_key="", vision=False, json_mode="object",
+        http_defaults={"timeout": float(os.environ.get("OLLAMA_TIMEOUT") or LOCAL_TIMEOUT),
+                       "timeout_retries": 0},
     )

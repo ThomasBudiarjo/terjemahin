@@ -198,3 +198,16 @@ def serve() -> None:
     from .consumer import run
 
     run(get_settings())
+
+
+@app.command()
+def web(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port", "-p"),
+) -> None:
+    """Serve the web UI: upload a page, pick methods per stage, edit and re-typeset bubbles."""
+    import uvicorn
+
+    from .web.app import create_app
+
+    uvicorn.run(create_app(get_settings()), host=host, port=port, log_level="info")

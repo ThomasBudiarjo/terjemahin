@@ -7,6 +7,8 @@ and as a check on the ONNX port.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from ..registry import OCRS
@@ -24,7 +26,8 @@ class MangaOcrHF(MangaOcrBase):
         super().__init__(**opts)
         self.torch = torch
         self.model = VisionEncoderDecoderModel.from_pretrained(repo).to(device).eval()
-        self.vocab = load_vocab(hf_hub_download(repo, "vocab.txt"))
+        local = Path(repo) / "vocab.txt"  # a training/train_ocr.py checkpoint dir
+        self.vocab = load_vocab(local if local.exists() else hf_hub_download(repo, "vocab.txt"))
         self.device = device
         self.beams = beams
         self.gen_kwargs = {

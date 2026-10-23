@@ -8,7 +8,7 @@ The instructions are written in Indonesian when translating into Indonesian (the
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -41,6 +41,10 @@ def _indonesian(target: str) -> bool:
     return target.strip().lower() in ("id", "ind", "in")
 
 
+def _cjk_target(target: str) -> bool:
+    return target.strip().lower() in ("ja", "zh", "zh-hant", "ko")
+
+
 # --- system prompts --------------------------------------------------------------------------
 
 _ID_ROLE = """\
@@ -52,7 +56,8 @@ utamakan maksud, emosi, dan ritme dialog.
 - Ikuti register bicara karakter: santai/gaul (aku, kamu, nggak, sih, kok, dong) untuk \
 obrolan teman, sopan/baku untuk situasi formal, kasar untuk karakter kasar.
 - Pertahankan honorifik yang lazim (-san, -kun, -chan, -senpai, -sensei); nama ditulis \
-dalam romaji (坂本 -> Sakamoto).
+dalam romaji (坂本 -> Sakamoto). "target" tidak boleh berisi huruf Jepang (kanji/kana) sama \
+sekali.
 - Gunakan glossary secara konsisten. Gunakan konteks halaman sebelumnya untuk kesinambungan.
 - Teks harus muat di balon: ringkas, hindari kalimat bertele-tele.
 - Tanda baca ekspresif dipertahankan (…, !, ?, ?!). Gagap ditulis "A-aku".
@@ -92,7 +97,7 @@ Translation guidelines:
 - Natural, fluent {tgt} as in an official localized release. Do not translate literally; \
 keep the intent, emotion and rhythm of the dialogue.
 - Match each character's register (casual, polite, rude, childish).
-- Keep common honorifics (-san, -kun, -chan, -senpai, -sensei); write names in romaji.
+- Keep common honorifics (-san, -kun, -chan, -senpai, -sensei); write names in romaji.{no_cjk}
 - Use the glossary consistently. Use previous pages for continuity.
 - Text must fit in the balloon: be concise.
 - Keep expressive punctuation (..., !, ?, ?!). Write stutters as "I-I".
@@ -136,7 +141,10 @@ def system_prompt(
         task = _ID_VISION.format(src=src) if mode == "vision" else _ID_TEXT.format(image_note=note)
         return f"{role}\n{task}\n{_ID_FORMAT.format()}"
     src, tgt = lang_name(source_lang), lang_name(target_lang)
-    role = _EN_ROLE.format(src=src, tgt=tgt, ocr_role=" and text reader (OCR)" if mode == "vision" else "")
+    no_cjk = ("" if _cjk_target(target_lang)
+              else f" A \"target\" must never contain {src} characters (kanji/kana).")
+    role = _EN_ROLE.format(src=src, tgt=tgt, no_cjk=no_cjk,
+                           ocr_role=" and text reader (OCR)" if mode == "vision" else "")
     note = (" The page image is attached for context; each line carries its balloon position "
             "(x%, y%)." if page_image else "")
     task = _EN_VISION.format(src=src) if mode == "vision" else _EN_TEXT.format(image_note=note)
@@ -242,13 +250,31 @@ def language_note(target_lang: str) -> str:
             f"{lang_name(target_lang)}.")
 
 
-def repair_note(missing: Sequence[int], target_lang: str) -> str:
+def repair_note(
+    missing: Sequence[int], target_lang: str, leaks: Mapping[int, Sequence[str]] | None = None
+) -> str:
+    """Ask again for `missing`; `leaks` names the source-script text each answer still kept."""
     idx = ", ".join(map(str, missing))
+    left = [(i, "".join(f"「{r}」" for r in leaks[i])) for i in missing if leaks and leaks.get(i)]
     if _indonesian(target_lang):
-        return (f"PENTING: jawaban sebelumnya tidak lengkap. Kembalikan TEPAT {len(missing)} item, "
-                f"satu untuk setiap index berikut: {idx}.")
-    return (f"IMPORTANT: the previous answer was incomplete. Return EXACTLY {len(missing)} items, "
-            f"one for each of these indices: {idx}.")
+        note = (f"PENTING: jawaban sebelumnya tidak lengkap atau masih berisi huruf Jepang. "
+                f"Kembalikan TEPAT {len(missing)} item, satu untuk setiap index berikut: {idx}. "
+                f"Terjemahkan seluruhnya; tulis nama dalam romaji.")
+        if left:
+            note += (" Item ini masih berisi huruf Jepang: "
+                     + "; ".join(f"#{i} {r}" for i, r in left)
+                     + ". Ganti dengan huruf Latin (nama dalam romaji, mis. 坂本 -> Sakamoto, "
+                     "くん -> -kun).")
+        return note
+    note = (f"IMPORTANT: the previous answer was incomplete or left source-language characters. "
+            f"Return EXACTLY {len(missing)} items, one for each of these indices: {idx}. "
+            f"Translate everything; write names in romaji.")
+    if left:
+        note += (" These items still contained source characters: "
+                 + "; ".join(f"#{i} {r}" for i, r in left)
+                 + ". Replace them with Latin script (names in romaji, e.g. 坂本 -> Sakamoto, "
+                 "くん -> -kun).")
+    return note
 
 
 def crop_label(index: int, target_lang: str) -> str:

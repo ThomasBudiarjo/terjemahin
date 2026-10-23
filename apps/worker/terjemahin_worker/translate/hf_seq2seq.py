@@ -88,6 +88,7 @@ class Seq2SeqTranslator:
         retries: int = 1,
         interjections: bool = True,
         glossary: bool = True,
+        names: bool = True,
         quantize: bool = False,
         casual: bool = True,
         pre_dict: dict[str, str] | None = None,
@@ -103,7 +104,7 @@ class Seq2SeqTranslator:
         self.repetition_penalty = float(repetition_penalty)
         self.retries = int(retries)
         self.interjections, self.use_glossary, self.quantize = interjections, glossary, quantize
-        self.casual = casual
+        self.casual, self.names = casual, names
         self.pre_dict, self.post_dict = pre_dict or {}, post_dict or {}
 
     def code(self, lang: str) -> str:
@@ -170,7 +171,9 @@ class Seq2SeqTranslator:
             return list(texts)
         gl = list(glossary) if self.use_glossary else []
         preps = [
-            tp.prepare(tp.apply_dict(t, self.pre_dict), source, target, gl, self.interjections)
+            tp.prepare(
+                tp.apply_dict(t, self.pre_dict), source, target, gl, self.interjections, self.names
+            )
             for t in texts
         ]
         # text that is only names/latin after preparation ("Sakamoto-kun？") needs no model

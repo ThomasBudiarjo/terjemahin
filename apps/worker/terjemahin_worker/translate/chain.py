@@ -47,28 +47,41 @@ class ChainTranslator:
     (textproc.prepare); only the remaining core text travels through the pivot hops, so
     "え？" stays "Eh?" instead of becoming "Huh?" -> "Apa itu?"."""
 
-    def __init__(self, settings, steps: Any, prepare: bool = True, casual: bool = True) -> None:
+    def __init__(
+        self,
+        settings,
+        steps: Any,
+        prepare: bool = True,
+        casual: bool = True,
+        threads: int | None = None,
+    ) -> None:
         self.steps = parse_steps(steps)
-        self.prepare, self.casual = prepare, casual
+        self.prepare, self.casual, self.threads = prepare, casual, threads
         self.translators = [
             TRANSLATORS.build(s["translator"], settings, **s["opts"]) for s in self.steps
         ]
         self.vision = bool(getattr(self.translators[0], "vision", False))
 
     def _hops(self, source: str, target: str) -> list[tuple[str, str]]:
-        hops, src = [], source
+        hops, src = [], tp.iso(source)
         for i, s in enumerate(self.steps):
             dst = s["to"] or (target if i == len(self.steps) - 1 else None)
             if dst is None:
                 raise ValueError(f"chain step {i} ({s['translator']}) needs 'to'")
+            dst = tp.iso(dst)
             hops.append((src, dst))
             src = dst
-        if src != target:
+        if src != tp.iso(target):
             raise ValueError(f"chain ends in '{src}' but the target language is '{target}'")
         return hops
 
     def translate(self, req: TranslationRequest) -> list[TranslationItem]:
         source = tp.detect_lang(req.sources) if req.source_lang == "auto" else req.source_lang
+        source = tp.iso(source)
+        if self.threads:  # torch's pool is process-wide, so one setting covers every hop
+            import torch
+
+            torch.set_num_threads(int(self.threads))
         preps = None
         if self.prepare and not self.vision:
             preps = [
@@ -82,9 +95,15 @@ class ChainTranslator:
                 context=req.context, source_lang=src, target_lang=dst,
             )
             step_items = tr.translate(step_req)
-            if not items:  # the first hop owns the source text (vision translators read it)
+            if not items:
+                # the item's source is the OCR text; only a vision first hop has better (what it
+                # read) — a text hop echoes its input, which is the *prepared* text
                 items = [
-                    TranslationItem(source=it.source or s, target=it.target, speaker=it.speaker)
+                    TranslationItem(
+                        source=(it.source or s) if self.vision else s,
+                        target=it.target,
+                        speaker=it.speaker,
+                    )
                     for it, s in zip(step_items, req.sources)
                 ]
             texts = [it.target for it in step_items]
@@ -109,5 +128,11 @@ class ChainTranslator:
     "chain",
     description="Pivot through several translators, e.g. steps='m2m100:en,nllb:id'.",
 )
-def _build(settings, steps: Any = "m2m100:en,nllb:id", prepare: bool = True, casual: bool = True, **_):
-    return ChainTranslator(settings, steps, prepare, casual)
+def _build(
+    settings,
+    steps: Any = "m2m100:en,nllb:id",
+    prepare: bool = True,
+    casual: bool = True,
+    threads: int | None = None,
+):
+    return ChainTranslator(settings, steps, prepare, casual, threads)

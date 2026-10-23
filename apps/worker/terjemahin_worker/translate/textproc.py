@@ -167,6 +167,13 @@ _HONORIFIC_ALT = "|".join(sorted(map(re.escape, HONORIFICS), key=len, reverse=Tr
 # after common nouns (店員さん is "the clerk", not "Ten'in-san").
 _LATIN_HON = re.compile(rf"([A-Za-z][A-Za-z'.\-]*)\s*({_HONORIFIC_ALT})")
 _KATA_HON = re.compile(rf"([ァ-ヺ][ァ-ヺー]*)({_HONORIFIC_ALT})")
+# Katakana common nouns that take さん/ちゃん (メイドさん = "the maid"): never romanised as names.
+KATAKANA_NOUNS = frozenset(_words(
+    "メイド シスター ナース コック パパ ママ バイト ウェイトレス ウエイトレス ウェイター ドクター "
+    "マスター オーナー サンタ ガイド スタッフ プロ カメラマン モデル アイドル シェフ パティシエ "
+    "ママン ベビー オバ オジ ボス リーダー キャプテン コーチ マネージャー ドライバー ポリス "
+    "パイロット ファン ゲスト レディ ヒーロー プリンセス"
+))
 
 _DOTS = re.compile(r"(?:[・･.．。‥…]\s*){2,}|[…‥]")
 _ELONG_AFTER = re.compile(r"(?<=[぀-ゟ一-鿿])[ーｰ〜～~]+")
@@ -178,13 +185,17 @@ _KANJI_ONSET = {"私": "わ", "僕": "ぼ", "俺": "お", "何": "な", "別": "
                 "好": "す", "本": "ほ", "知": "し", "君": "き", "待": "ま", "自": "じ", "全": "ぜ"}
 
 
-def _is_stutter(text: str) -> bool:
-    """'わ、私は' / 'ち、ちがう' — a lone kana repeating the next word's first sound."""
+def _stutter_on(text: str) -> str:
+    """'わ、私は' -> '私' / 'ち、ちがう' -> 'ち': the char a lone repeated kana stutters on."""
     m = _STUTTER.match(text)
     if not m:
-        return False
+        return ""
     head, nxt = m.group(1), m.group(2)
-    return _hira(head) == _hira(_KANJI_ONSET.get(nxt, nxt))
+    return nxt if _hira(head) == _hira(_KANJI_ONSET.get(nxt, nxt)) else ""
+
+
+_PRONOUN_KANJI = frozenset("私僕俺")
+PRONOUNS = {"id": ("aku", "saya", "gue", "gw"), "en": ("i", "me")}
 
 _PUNCT_JA = str.maketrans({"!": "！", "?": "？", ",": "、", "，": "、", "｡": "。", "､": "、"})
 
@@ -192,7 +203,9 @@ _PUNCT_JA = str.maketrans({"!": "！", "?": "？", ",": "、", "，": "、", "�
 def normalize_ja(text: str) -> str:
     """Strip manga-only noise MT models choke on; keep meaning-bearing punctuation."""
     text = unicodedata.normalize("NFKC", text).translate(_PUNCT_JA)
-    text = "".join(text.split())
+    # OCR spaces between CJK chars are noise; spaces next to Latin words (a pivot hop's "Mei は")
+    # keep the words apart
+    text = re.sub(r"(?<=[^0-9A-Za-z\s])\s+(?=[^0-9A-Za-z\s])", "", text.strip())
     text = _DOTS.sub("…", text)
     text = re.sub(r"ー{2,}", "ー", text).translate(_SMALL_VOWEL)
     text = re.sub(r"う[ー〜～]+ん", "ふむ", text)  # "hmm", before ー stripping turns it into "yes"
@@ -205,9 +218,13 @@ def normalize_ja(text: str) -> str:
 
 def map_honorifics(text: str) -> str:
     text = _LATIN_HON.sub(lambda m: f"{m.group(1)}-{HONORIFICS[m.group(2)]}", text)
-    return _KATA_HON.sub(
-        lambda m: f"{kana_to_romaji(m.group(1)).capitalize()}-{HONORIFICS[m.group(2)]}", text
-    )
+
+    def kata(m: re.Match[str]) -> str:
+        if m.group(1) in KATAKANA_NOUNS:
+            return m.group()
+        return f"{kana_to_romaji(m.group(1)).capitalize()}-{HONORIFICS[m.group(2)]}"
+
+    return _KATA_HON.sub(kata, text)
 
 
 # Common bare interjections. Leading/trailing ones are cut off and rendered from this table,
@@ -246,8 +263,14 @@ _PREFIX_OK = ("ねえねえ", "ふむ", "うんうん", "えっと", "あはは"
 _SEG = re.compile(r"[^、。！？…]+[、。！？…]*")
 
 
+# Words that are interjections only as exclamations: もう！ is "geez!", もう？ is "already?".
+_NOT_AS_QUESTION = frozenset(("もう",))
+
+
 def _interjection(seg: str, table: dict[str, str]) -> str | None:
     core = seg.rstrip("、。！？…")
+    if "？" in seg[len(core):] and core in _NOT_AS_QUESTION:
+        return None
     for key in (core, core.replace("ー", ""), re.sub(r"[ーっ]", "", core)):
         if key in table:
             return table[key]
@@ -269,6 +292,7 @@ class Prepared:
     lead: str = ""  # already-target-language prefix (interjections)
     trail: str = ""  # already-target-language suffix
     stutter: bool = False  # "わ、私" -> "A-aku"
+    stutter_on: str = ""  # the source char stuttered on ("私"), to find the matching word
     end: str = ""  # terminal punctuation of the source: "?", "!", "?!", "...", ""
     terms: list[str] = field(default_factory=list)  # glossary targets the output must contain
 
@@ -322,14 +346,32 @@ SURNAMES: dict[str, str] = dict(
         "白石:Shiraishi 東山:Higashiyama 桐生:Kiryu 神崎:Kanzaki 如月:Kisaragi 天野:Amano"
 )
 )
+# Surnames that are also everyday words (小川 stream, 大石 big rock, 望月 full moon, 山中 in the
+# mountains, 如月 February...): romanised only when an honorific follows (小川さん).
+AMBIGUOUS_SURNAMES = frozenset(_words(
+    "小川 大石 望月 山中 小山 清水 平野 川上 川口 小島 小池 大橋 石橋 白石 馬場 古川 金子 大野 "
+    "東山 西山 山下 木下 大谷 大塚 如月 中島 石原 山口 早川 土屋"
+))
+_HAN_CHAR = re.compile(r"[㐀-䶿一-鿿豈-﫿々]")
 _SURNAME_RE = re.compile("|".join(sorted(map(re.escape, SURNAMES), key=len, reverse=True)))
+_HONORIFIC_AHEAD = re.compile(rf"\s*(?:{_HONORIFIC_ALT})")
 
 
 def romanize_surnames(text: str) -> tuple[str, list[str]]:
+    """Japanese has no word boundaries, so a surname only counts when it is not glued into a
+    kanji compound (途中田んぼ, 日本間, 大西洋), and ambiguous ones need a following honorific."""
     found: list[str] = []
 
     def sub(m: re.Match[str]) -> str:
-        name = SURNAMES[m.group()]
+        word, a, b = m.group(), m.start(), m.end()
+        honorific = _HONORIFIC_AHEAD.match(text, b) is not None
+        if a > 0 and _HAN_CHAR.match(text[a - 1]):
+            return word
+        if b < len(text) and _HAN_CHAR.match(text[b]) and not honorific:
+            return word
+        if word in AMBIGUOUS_SURNAMES and not honorific:
+            return word
+        name = SURNAMES[word]
         found.append(name)
         return f" {name} "
 
@@ -346,9 +388,13 @@ def apply_glossary(text: str, glossary: Iterable[GlossaryEntry]) -> tuple[str, l
     """
     terms: list[str] = []
     for g in sorted(glossary, key=lambda g: len(g.source), reverse=True):
-        if g.source and g.source in text:
+        if not g.source or not g.target.strip():  # an empty target would delete the word
+            continue
+        if g.source in text:
             text = text.replace(g.source, f" {g.target} ")
             terms.append(g.target)
+        elif _LETTER.search(g.target) and has_term(text, g.target):
+            terms.append(g.target)  # already substituted (pivot hop): still must survive MT
     text = re.sub(r"\s+([、。！？…])", r"\1", text)
     return re.sub(r"\s{2,}", " ", text).strip(), terms
 
@@ -370,7 +416,8 @@ def prepare(
     text = normalize_ja(raw)
     end = _end_punct(text)
     # checked on the raw text: "あっ、あと" is an exclamation, only a bare "あ、あと" stutters
-    stutter = _is_stutter("".join(unicodedata.normalize("NFKC", raw).split()))
+    stutter_on = _stutter_on("".join(unicodedata.normalize("NFKC", raw).split()))
+    stutter = bool(stutter_on)
     if stutter:
         text = _STUTTER.sub("", text)
     text, terms = apply_glossary(text, glossary)
@@ -404,6 +451,7 @@ def prepare(
         lead=" ".join(lead),
         trail=" ".join(trail),
         stutter=stutter,
+        stutter_on=stutter_on,
         end=end,
         terms=terms,
     )
@@ -518,8 +566,13 @@ CASUAL: dict[str, list[tuple[str, str]]] = {
 }
 
 
+_LATIN_CHAR = r"[0-9A-Za-z\u00c0-\u024f]"
+
+
 def has_term(text: str, term: str) -> bool:
-    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE) is not None
+    """Whole-word match against Latin neighbours only: 'Meiは' contains 'Mei'."""
+    pat = rf"(?<!{_LATIN_CHAR}){re.escape(term)}(?!{_LATIN_CHAR})"
+    return re.search(pat, text, re.IGNORECASE) is not None
 
 
 def restore_terms(text: str, terms: Iterable[str], cutoff: float = 0.7) -> str:
@@ -550,18 +603,35 @@ def finish(prep: Prepared, output: str, target: str, casual: bool = True) -> str
         out = restore_terms(out, prep.terms)
     if out and casual:
         out = apply_dict(out, CASUAL.get(iso(target)))
-    if prep.text and out:
-        if prep.stutter and out[:1].isalpha():
-            out = f"{out[0].upper()}-{out[0].lower()}{out[1:]}"
-        if prep.lead:
-            out = _decap(out, prep.terms)
+    if prep.text and out and prep.lead:
+        out = _decap(out, prep.terms)
     parts = [p for p in (prep.lead, out, prep.trail) if p]
     text = clean_output(" ".join(parts))
     if not text:
         return ""
     if prep.text or prep.end:
         text = _set_end(text, prep.end)
+    if prep.stutter:
+        text = stutter(text, target, prep.stutter_on in _PRONOUN_KANJI)
     return _cap(text)
+
+
+def stutter(text: str, target: str, pronoun: bool = False) -> str:
+    """'aku tidak' -> 'A-aku tidak'. A pronoun stutter (わ、私) goes on the pronoun when it is
+    among the first words ('Maksudku, a-aku...'), otherwise on the first word."""
+    words = list(_WORD.finditer(text))
+    if not words:
+        return text
+    m = words[0]
+    if pronoun:
+        names = PRONOUNS.get(iso(target), ())
+        m = next((w for w in words[:3] if w.group().lower() in names), m)
+    w = m.group()
+    if not w[0].isalpha():
+        return text
+    first = w[0].upper() if m.start() == 0 or w == "I" else w[0].lower()
+    rest = w if w == "I" else w[0].lower() + w[1:]
+    return f"{text[: m.start()]}{first}-{rest}{text[m.end():]}"
 
 
 # --- pre/post replacement dictionaries (reference: manga-image-translator pre_dict/post_dict) ---

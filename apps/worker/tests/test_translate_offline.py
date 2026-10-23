@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -89,8 +90,35 @@ def test_prepare_glossary_honorifics_names():
     # no glossary: common surnames are romanised, katakana names get honorifics
     assert tp.prepare("坂本くん？", "ja", "id").text == "Sakamoto-kun？"
     assert tp.prepare("メシアちゃん、来て", "ja", "id").text.startswith("Meshia-chan")
-    # common nouns keep their さん (店員さん = the clerk)
+    # common nouns keep their さん (店員さん = the clerk), katakana ones too (メイドさん = the maid)
     assert "店員さん" in tp.prepare("店員さんに聞いた", "ja", "id").text
+    assert tp.prepare("メイドさん、こっち！", "ja", "id").text == "メイドさん、こっち！"
+    assert tp.prepare("シスターちゃん", "ja", "id").text == "シスターちゃん"
+
+
+@pytest.mark.parametrize("text", [
+    "途中田んぼがある", "日本間で寝よう", "大西洋を渡る船だ", "小川で遊んだ", "大石が落ちてきた！",
+    "登山中に雨が降った", "望月の夜だね",
+])
+def test_surnames_not_matched_inside_words(text):
+    p = tp.prepare(text, "ja", "id")
+    assert not p.terms and not re.search("[A-Za-z]", p.text), p.text
+
+
+def test_surnames_in_context():
+    assert tp.prepare("小川さんと遊んだ", "ja", "id").text.startswith("Ogawa-san")
+    assert tp.prepare("中田は来た", "ja", "id").terms == ["Nakata"]
+    assert tp.prepare("中田は来た", "ja", "id", names=False).text == "中田は来た"
+    assert FakeSeq2Seq(names=False).names is False
+
+
+def test_glossary_edge_cases():
+    p = tp.prepare("メシアだ", "ja", "id", [GlossaryEntry(source="メシア", target="")])
+    assert p.text == "メシアだ" and not p.terms  # an empty target must not delete the word
+    # a pivot hop gets the term already substituted; it must still be required in the output
+    p = tp.prepare("Mei は Sakamoto のこと", "ja", "en", GLOSSARY)
+    assert "Mei" in p.terms and p.text.startswith("Mei は")
+    assert tp.has_term("Meiは", "Mei") and not tp.has_term("Meiko", "Mei")
 
 
 def test_prepare_stutter():
@@ -98,6 +126,17 @@ def test_prepare_stutter():
     assert p.stutter and p.text == "私は…別にそんな…" and p.end == "..."
     assert tp.finish(p, "Aku tidak seperti itu.", "id") == "A-aku tidak seperti itu..."
     assert not tp.prepare("あっ、あとね", "ja", "id").stutter
+    # a stutter on an interjection stays on it instead of eating it
+    assert tp.finish(tp.prepare("あ、あの…", "ja", "id"), "", "id") == "A-anu..."
+    # a pronoun stutter lands on the pronoun even when MT opens with something else
+    p = tp.prepare("わ、私は", "ja", "id")
+    assert tp.finish(p, "Maksudku, aku tidak", "id") == "Maksudku, a-aku tidak"
+    assert tp.finish(tp.prepare("わ、私は", "ja", "en"), "I don't", "en") == "I-I don't"
+
+
+def test_interjection_context():
+    assert tp.prepare("もう？", "ja", "id").text == "もう？"  # "already?", not "geez"
+    assert tp.finish(tp.prepare("もう！", "ja", "id"), "", "id") == "Ih!"
 
 
 def test_finish_punctuation_casual_terms():
@@ -205,8 +244,12 @@ class Tagger:
         self.tag, self.seen = tag, []
 
     def translate(self, req):
+        """Echoes its input as `source`, like Seq2SeqTranslator does."""
         self.seen.append((req.source_lang, req.target_lang, list(req.sources)))
-        return [TranslationItem(target=f"[{self.tag}] {s}" if s else "") for s in req.sources]
+        return [
+            TranslationItem(source=s, target=f"[{self.tag}] {s}" if s else "")
+            for s in req.sources
+        ]
 
 
 def test_chain_hops(monkeypatch):
@@ -222,7 +265,11 @@ def test_chain_hops(monkeypatch):
     items = ch.translate(req)
     assert built["a"].seen == [("ja", "en", ["", "それだけ？"])]
     assert built["b"].seen[0][:2] == ("en", "id")
+    # sources stay the OCR text, not the prepared text the first hop saw
     assert [i.source for i in items] == ["え？", "えー、それだけー？"]
+    assert ChainTranslator(Settings(), "a:eng,b:ind")._hops("jpn", "id") == [
+        ("ja", "en"), ("en", "id"),
+    ]
     assert items[0].target == "Eh?"  # resolved once for the final language, not via English
     assert items[1].target == "Eh, [b] [a] それだけ?"
     with pytest.raises(ValueError):

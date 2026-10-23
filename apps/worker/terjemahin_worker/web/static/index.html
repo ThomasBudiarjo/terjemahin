@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>terjemahin</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6862; --line: #dedad3;
+  --accent: #c2410c; --accent-ink: #ffffff; --ok: #15803d; --err: #b91c1c; --hl: rgba(194,65,12,.18);
+  --field: #fbfaf8; --shadow: 0 1px 2px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161513; --panel: #1f1e1b; --ink: #ecebe7; --muted: #a29e96; --line: #36332e;
+    --accent: #fb923c; --accent-ink: #1a1007; --ok: #4ade80; --err: #f87171; --hl: rgba(251,146,60,.22);
+    --field: #191816; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161513; --panel: #1f1e1b; --ink: #ecebe7; --muted: #a29e96; --line: #36332e;
+  --accent: #fb923c; --accent-ink: #1a1007; --ok: #4ade80; --err: #f87171; --hl: rgba(251,146,60,.22);
+  --field: #191816; --shadow: none;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 17px; margin: 0; letter-spacing: .02em; }
+header .sub { color: var(--muted); font-size: 13px; }
+header .grow { flex: 1; }
+main { display: grid; grid-template-columns: 340px minmax(0, 1fr); min-height: calc(100% - 49px); }
+aside { border-right: 1px solid var(--line); background: var(--panel); padding: 14px 16px 24px; overflow-y: auto; }
+section.work { padding: 14px 16px 16px; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; }
+h2:first-child { margin-top: 0; }
+label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+input[type=text], select, textarea {
+  width: 100%; font: inherit; color: var(--ink); background: var(--field);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+}
+textarea { resize: vertical; }
+input[type=text]:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.stage-row { display: grid; grid-template-columns: 1fr 110px; gap: 6px; align-items: end; }
+.stage-row .opts { font-size: 12px; }
+.stage-row .opts.bad { outline: 2px solid var(--err); }
+.desc { font-size: 11.5px; color: var(--muted); margin: 3px 0 0; min-height: 1em; }
+button, .btn {
+  font: inherit; cursor: pointer; border-radius: 6px; padding: 7px 12px; border: 1px solid var(--line);
+  background: var(--field); color: var(--ink); text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+}
+button:hover:not(:disabled), .btn:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+.btn.disabled { opacity: .5; pointer-events: none; }
+#drop {
+  border: 1.5px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; color: var(--muted);
+  cursor: pointer; background: var(--field);
+}
+#drop.over { border-color: var(--accent); color: var(--ink); }
+#drop img { max-width: 100%; max-height: 150px; display: block; margin: 0 auto 6px; border-radius: 4px; }
+#go { width: 100%; justify-content: center; margin-top: 14px; padding: 10px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+#status { padding: 10px 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+#status .msg { flex: 1; min-width: 200px; }
+#status .msg.err { color: var(--err); white-space: pre-wrap; }
+.steps { display: flex; gap: 4px; flex-wrap: wrap; }
+.step { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.step.run { border-color: var(--accent); color: var(--accent); animation: pulse 1s ease-in-out infinite alternate; }
+.step.done { border-color: var(--ok); color: var(--ok); }
+@keyframes pulse { from { opacity: 1; } to { opacity: .45; } }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.toolbar .grow { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; padding: 5px 10px; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on { background: var(--accent); color: var(--accent-ink); }
+#zoomval { min-width: 48px; text-align: center; font-variant-numeric: tabular-nums; }
+#viewer { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); height: min(78vh, 980px); }
+#viewer.single { grid-template-columns: 1fr; }
+#viewer.single .pane.left { display: none; }
+.pane { position: relative; overflow: auto; background: var(--bg); }
+.pane .cap { position: sticky; top: 0; left: 0; z-index: 2; display: inline-block; font-size: 12px; padding: 2px 8px; margin: 6px; border-radius: 4px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+.canvas { position: relative; margin: 0 auto 12px; }
+.canvas img { display: block; width: 100%; height: 100%; user-select: none; -webkit-user-drag: none; image-rendering: auto; }
+.canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.canvas svg rect { fill: transparent; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: pointer; opacity: 0; }
+.canvas.boxes svg rect { opacity: .75; }
+.canvas svg rect.hl { fill: var(--hl); opacity: 1; stroke-width: 3; }
+.canvas svg text { fill: var(--accent); font-weight: 700; paint-order: stroke; stroke: var(--panel); stroke-width: 3px; opacity: 0; pointer-events: none; }
+.canvas.boxes svg text, .canvas svg text.hl { opacity: 1; }
+.empty { display: grid; place-items: center; height: 100%; color: var(--muted); text-align: center; padding: 24px; }
+#bubbles .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+#bubbles .head h3 { margin: 0; font-size: 14px; }
+#bubbles .head .grow { flex: 1; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; vertical-align: top; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+td.n { width: 34px; font-weight: 700; color: var(--accent); cursor: pointer; }
+td.k { width: 44px; text-align: center; }
+td textarea { min-height: 52px; }
+td .src { font-size: 15px; }
+td .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+tr.hl td { background: var(--hl); }
+tr.off textarea { opacity: .45; }
+.timings { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.hint { font-size: 12px; color: var(--muted); }
+@media (min-width: 901px) {
+  /* desktop: everything fits the viewport, so the page stays visible while editing bubbles */
+  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  main { flex: 1; min-height: 0; }
+  aside { overflow-y: auto; }
+  section.work { overflow: hidden; min-height: 0; }
+  #viewcard { flex: 1 1 60%; min-height: 260px; display: flex; flex-direction: column; }
+  #viewer { flex: 1; height: auto; min-height: 0; }
+  #bubbles { flex: 0 1 40%; min-height: 150px; display: flex; flex-direction: column; }
+  #bubbles[hidden] { display: none; }
+  #bubbles .tablewrap { overflow: auto; flex: 1; min-height: 0; }
+  #bubbles thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+  section.work.noresult #viewcard { flex-basis: 100%; }
+}
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  aside { border-right: 0; border-bottom: 1px solid var(--line); }
+  #viewer { grid-template-columns: 1fr; height: auto; }
+  #viewer .pane { height: 70vh; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>terjemahin</h1>
+  <span class="sub">detect &rarr; OCR &rarr; translate &rarr; mask &rarr; inpaint &rarr; typeset</span>
+  <span class="grow"></span>
+  <a class="btn" href="/api/docs" target="_blank" rel="noopener">API</a>
+</header>
+<main>
+<aside>
+  <h2>Page</h2>
+  <div id="drop" tabindex="0" role="button" aria-label="Choose a page image">
+    <div id="dropview">Drop a manga page here or click to choose (png, jpg, webp)</div>
+  </div>
+  <input id="file" type="file" accept="image/*" hidden>
+
+  <h2>Language</h2>
+  <div class="row2">
+    <div><label for="src">Source</label><input id="src" type="text" value="ja" list="langs"></div>
+    <div><label for="tgt">Target</label><input id="tgt" type="text" value="id" list="langs"></div>
+  </div>
+  <datalist id="langs">
+    <option value="ja">Japanese</option><option value="zh">Chinese</option><option value="ko">Korean</option>
+    <option value="en">English</option><option value="id">Indonesian</option><option value="ms">Malay</option>
+    <option value="vi">Vietnamese</option><option value="th">Thai</option><option value="es">Spanish</option>
+    <option value="fr">French</option><option value="de">German</option><option value="pt">Portuguese</option>
+  </datalist>
+
+  <h2>Methods</h2>
+  <div id="stages"><div class="hint">Loading methods...</div></div>
+
+  <h2>Context</h2>
+  <label for="series">Series title</label>
+  <input id="series" type="text" placeholder="optional">
+  <label for="glossary">Glossary (one per line: source = target)</label>
+  <textarea id="glossary" rows="4" class="mono" placeholder="先輩 = Senpai&#10;魔王 = Raja Iblis"></textarea>
+  <label for="style">Style notes</label>
+  <textarea id="style" rows="2" placeholder="e.g. casual tone, keep honorifics"></textarea>
+
+  <button id="go" class="primary" disabled>Translate page</button>
+</aside>
+
+<section class="work">
+  <div id="status" class="card">
+    <div class="steps" id="steps"></div>
+    <div class="msg" id="msg">Choose a page to start.</div>
+    <div class="timings" id="timings"></div>
+  </div>
+
+  <div class="card" id="viewcard">
+    <div class="toolbar">
+      <div class="seg" id="layout">
+        <button data-v="split" class="on">Side by side</button>
+        <button data-v="single">Single</button>
+      </div>
+      <label class="hint" style="margin:0" for="rightview">Right pane</label>
+      <select id="rightview" style="width:auto">
+        <option value="final">Translated</option>
+        <option value="inpainted">Inpainted</option>
+        <option value="mask">Erase mask</option>
+        <option value="detect">Detection</option>
+        <option value="original">Original</option>
+      </select>
+      <label class="hint" style="margin:0"><input type="checkbox" id="showboxes"> Boxes</label>
+      <span class="grow"></span>
+      <button id="zout" title="Zoom out">&minus;</button>
+      <span id="zoomval">fit</span>
+      <button id="zin" title="Zoom in">+</button>
+      <button id="zfit">Fit</button>
+      <a id="download" class="btn disabled" href="#" download>Download</a>
+    </div>
+    <div id="viewer">
+      <div class="pane left" id="paneL"><span class="cap">Original</span><div class="empty">No page yet</div></div>
+      <div class="pane right" id="paneR"><span class="cap" id="capR">Translated</span><div class="empty">Result appears here</div></div>
+    </div>
+  </div>
+
+  <div id="bubbles" class="card" hidden>
+    <div class="head">
+      <h3 id="bcount">Bubbles</h3>
+      <span class="hint">Edit text, untick a bubble to leave it as in the original, then re-typeset. Detector, OCR and translator do not run again (Ctrl+Enter).</span>
+      <span class="grow"></span>
+      <button id="retype" class="primary">Re-typeset</button>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>#</th><th>Source</th><th>Translation</th><th>Typeset</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+</main>
+
+<script>
+"use strict";
+const STAGES = ["detector", "ocr", "translator", "mask_refiner", "inpainter", "renderer"];
+const LABELS = { detector: "Detect", ocr: "OCR", translator: "Translate", mask_refiner: "Mask", inpainter: "Inpaint", renderer: "Typeset" };
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem("tj." + k)); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem("tj." + k, JSON.stringify(v)); } catch {} },
+};
+let file = null, job = null, busy = false, zoom = null, hl = -1;
+
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else e.setAttribute(k, v);
+  }
+  for (const c of kids) e.append(c);
+  return e;
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail || body));
+  return body;
+}
+
+/* ---------- methods ---------- */
+async function loadMethods() {
+  const m = await api("/api/methods");
+  const saved = store.get("methods") || {}, savedOpts = store.get("opts") || {};
+  const box = $("stages"); box.replaceChildren();
+  for (const stage of STAGES) {
+    const info = m.stages[stage]; if (!info) continue;
+    const sel = el("select", { id: "m-" + stage, "aria-label": LABELS[stage] + " method" });
+    for (const r of info.methods) {
+      const o = el("option", { value: r.name, text: r.name + (r.name === info.default ? " (default)" : "") + (r.available ? "" : " — unavailable") });
+      if (!r.available) { o.disabled = true; o.title = r.reason; }
+      o.dataset.desc = r.available ? r.description : r.reason + " — " + r.description;
+      sel.append(o);
+    }
+    const want = saved[stage];
+    const ok = (n) => info.methods.some((r) => r.name === n && r.available);
+    sel.value = ok(want) ? want : info.default;
+    const opts = el("input", { type: "text", id: "o-" + stage, class: "opts mono", placeholder: "{} options", "aria-label": LABELS[stage] + " options JSON" });
+    opts.value = savedOpts[stage] || "";
+    const desc = el("p", { class: "desc" });
+    const showDesc = () => { desc.textContent = sel.selectedOptions[0]?.dataset.desc || ""; };
+    sel.onchange = () => { showDesc(); persist(); };
+    opts.oninput = () => { opts.classList.toggle("bad", !parseOpts(opts.value).ok); persist(); };
+    showDesc();
+    box.append(el("label", { for: sel.id, text: LABELS[stage] }), el("div", { class: "stage-row" }, sel, opts), desc);
+  }
+  if (!$("src").value) $("src").value = m.source_lang;
+  if (!$("tgt").value) $("tgt").value = m.target_lang;
+  updateGo();
+}
+
+function parseOpts(s) {
+  if (!s.trim()) return { ok: true, v: null };
+  try { const v = JSON.parse(s); return { ok: v && typeof v === "object" && !Array.isArray(v), v }; } catch { return { ok: false }; }
+}
+
+function persist() {
+  const methods = {}, opts = {};
+  for (const s of STAGES) { if ($("m-" + s)) { methods[s] = $("m-" + s).value; opts[s] = $("o-" + s).value; } }
+  store.set("methods", methods); store.set("opts", opts);
+  store.set("ctx", { src: $("src").value, tgt: $("tgt").value, series: $("series").value, glossary: $("glossary").value, style: $("style").value });
+}
+
+function pipelineConfig(stages = STAGES) {
+  const cfg = { source_lang: $("src").value.trim() || "ja", target_lang: $("tgt").value.trim() || "id", options: {} };
+  for (const s of stages) {
+    if (!$("m-" + s)) continue;
+    cfg[s] = $("m-" + s).value;
+    const p = parseOpts($("o-" + s).value);
+    if (!p.ok) throw new Error(LABELS[s] + " options must be a JSON object");
+    if (p.v) cfg.options[s] = p.v;
+  }
+  return cfg;
+}
+
+function pageContext() {
+  const glossary = [];
+  for (const line of $("glossary").value.split("\n")) {
+    const m = line.match(/^\s*(.+?)\s*(?:=>|=|\t|→)\s*(.+?)\s*$/);
+    if (m) glossary.push({ source: m[1], target: m[2] });
+  }
+  const ctx = { glossary };
+  if ($("series").value.trim()) ctx.series_title = $("series").value.trim();
+  if ($("style").value.trim()) ctx.style_notes = $("style").value.trim();
+  return ctx;
+}
+
+/* ---------- file input ---------- */
+function setFile(f) {
+  if (!f || !f.type.startsWith("image/")) { setMsg("That is not an image.", true); return; }
+  file = f;
+  const url = URL.createObjectURL(f);
+  $("dropview").replaceChildren(el("img", { src: url, alt: "" }), el("div", { text: f.name + " · " + (f.size / 1024).toFixed(0) + " KB" }));
+  job = null; renderViewer(url); $("bubbles").hidden = true; setDownload(null);
+  setMsg("Ready. Choose methods and press Translate.");
+  updateGo();
+}
+function updateGo() { $("go").disabled = busy || !file || !$("m-detector"); $("retype").disabled = busy || !job; }
+
+/* ---------- status ---------- */
+function setMsg(text, err = false) { $("msg").textContent = text; $("msg").classList.toggle("err", err); }
+function setSteps(current, done) {
+  const box = $("steps"); box.replaceChildren();
+  const idx = STAGES.indexOf(current);
+  STAGES.forEach((s, i) => {
+    const cls = done ? "done" : current == null ? "" : i < idx ? "done" : i === idx ? "run" : "";
+    box.append(el("span", { class: "step " + cls, text: LABELS[s] }));
+  });
+}
+function setTimings(t) {
+  if (!t) { $("timings").textContent = ""; return; }
+  $("timings").textContent = Object.entries(t).map(([k, v]) => k + " " + v.toFixed(2) + "s").join(" · ");
+}
+function setDownload(url) {
+  const a = $("download");
+  if (url) { a.href = url; a.classList.remove("disabled"); } else { a.href = "#"; a.classList.add("disabled"); }
+}
+
+/* ---------- translate ---------- */
+async function translate() {
+  let cfg;
+  try { cfg = pipelineConfig(); } catch (e) { setMsg(e.message, true); return; }
+  busy = true; updateGo(); setSteps("detector"); setMsg("Uploading..."); setTimings(null);
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("pipeline", JSON.stringify(cfg));
+  fd.append("context", JSON.stringify(pageContext()));
+  fd.append("wait", "false");
+  const t0 = performance.now();
+  try {
+    let j = await api("/api/translate", { method: "POST", body: fd });
+    while (j.status === "queued" || j.status === "running") {
+      setSteps(j.stage || "detector");
+      const secs = ((performance.now() - t0) / 1000).toFixed(0);
+      setMsg((j.status === "queued" ? "Waiting for the worker" : "Running " + (LABELS[j.stage] || "...")) + " · " + secs + "s (first run loads models)");
+      await new Promise((r) => setTimeout(r, 600));
+      j = await api("/api/jobs/" + j.id);
+    }
+    if (j.status === "failed") { setSteps(null); throw new Error(j.error || "job failed"); }
+    showJob(j);
+    setMsg("Done in " + j.elapsed.toFixed(1) + "s — " + j.result.bubbles.length + " bubbles. Job " + j.id);
+  } catch (e) {
+    setMsg("Failed: " + e.message, true);
+  } finally { busy = false; updateGo(); }
+}
+
+function showJob(j) {
+  job = withDropped(j);
+  history.replaceState(null, "", "#job=" + j.id);
+  updateGo();
+  setSteps(null, true);
+  setTimings(j.result.timings);
+  setDownload(j.download);
+  renderViewer(j.images.original, j.images);
+  renderTable();
+}
+
+/* table rows = typeset bubbles + the ones the user unticked, in reading order */
+function withDropped(j) {
+  const off = (j.dropped || []).map((b) => ({ ...b, _off: true }));
+  j.result.bubbles = [...j.result.bubbles, ...off].sort((a, b) => a.region.id - b.region.id);
+  return j;
+}
+
+/* ---------- re-typeset ---------- */
+async function retypeset() {
+  if (!job) return;
+  const bubbles = [], dropped = [];
+  job.result.bubbles.forEach((b, i) => {
+    const { _off, ...edited } = { ...b, source_text: $("s-" + i).value, target_text: $("t-" + i).value };
+    ($("k-" + i).checked ? bubbles : dropped).push(edited);
+  });
+  let cfg;
+  try { cfg = pipelineConfig(["mask_refiner", "inpainter", "renderer"]); } catch (e) { setMsg(e.message, true); return; }
+  busy = true; updateGo(); setSteps("renderer"); setMsg("Re-typesetting " + bubbles.length + " bubbles...");
+  const t0 = performance.now();
+  try {
+    const j = await api("/api/compose", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: job.id, bubbles, dropped, pipeline: cfg }) });
+    job = withDropped(j);
+    setSteps(null, true); setTimings(j.result.timings); setDownload(j.download);
+    renderViewer(j.images.original, j.images, true); renderTable();
+    setMsg("Re-typeset in " + ((performance.now() - t0) / 1000).toFixed(1) + "s.");
+  } catch (e) {
+    setSteps(null); setMsg("Re-typeset failed: " + e.message, true);
+  } finally { busy = false; updateGo(); }
+}
+
+/* ---------- table ---------- */
+function renderTable() {
+  const rows = $("rows"); rows.replaceChildren();
+  const bs = job.result.bubbles;
+  const off = bs.filter((b) => b._off).length;
+  $("bcount").textContent = bs.length + " bubbles" + (off ? " (" + off + " kept original)" : "");
+  bs.forEach((b, i) => {
+    const s = el("textarea", { id: "s-" + i, class: "src", rows: "2", "aria-label": "source " + (i + 1) }); s.value = b.source_text;
+    const t = el("textarea", { id: "t-" + i, rows: "2", "aria-label": "translation " + (i + 1) }); t.value = b.target_text;
+    const k = el("input", { type: "checkbox", id: "k-" + i, "aria-label": "typeset bubble " + (i + 1) }); k.checked = !b._off;
+    const meta = [];
+    if (b.ocr_confidence != null) meta.push("ocr " + b.ocr_confidence.toFixed(2));
+    if (b.speaker) meta.push(b.speaker);
+    meta.push(b.region.direction === "v" ? "vertical" : "horizontal");
+    const tr = el("tr", { "data-i": i },
+      el("td", { class: "n", text: String(i + 1) }),
+      el("td", {}, s, el("div", { class: "meta", text: meta.join(" · ") })),
+      el("td", {}, t),
+      el("td", { class: "k" }, k));
+    tr.classList.toggle("off", !k.checked);
+    k.onchange = () => tr.classList.toggle("off", !k.checked);
+    tr.addEventListener("mouseenter", () => highlight(i, false));
+    tr.querySelector(".n").onclick = () => highlight(i, true);
+    s.onfocus = t.onfocus = () => highlight(i, true);
+    rows.append(tr);
+  });
+  $("bubbles").hidden = false;
+}
+
+/* ---------- viewer ---------- */
+function canvas(src, bubbles, w, h) {
+  const c = el("div", { class: "canvas" + ($("showboxes").checked ? " boxes" : "") });
+  const img = el("img", { src, alt: "" });
+  c.append(img);
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  if (w && h) svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  (bubbles || []).forEach((b, i) => {
+    const bb = b.region.bbox;
+    const r = document.createElementNS(svgNS, "rect");
+    r.setAttribute("x", bb.x1); r.setAttribute("y", bb.y1); r.setAttribute("width", bb.x2 - bb.x1); r.setAttribute("height", bb.y2 - bb.y1);
+    r.dataset.i = i;
+    r.addEventListener("click", () => { highlight(i, false); const row = document.querySelector(`tr[data-i="${i}"]`); row?.scrollIntoView({ block: "center", behavior: "smooth" }); $("t-" + i)?.focus({ preventScroll: true }); });
+    const t = document.createElementNS(svgNS, "text");
+    t.setAttribute("x", bb.x1 + 4); t.setAttribute("y", bb.y1 + 26); t.setAttribute("font-size", Math.max(18, (w || 1000) / 60)); t.textContent = i + 1; t.dataset.i = i;
+    svg.append(r, t);
+  });
+  c.append(svg);
+  img.addEventListener("load", () => { c.dataset.w = img.naturalWidth; c.dataset.h = img.naturalHeight; if (!w) svg.setAttribute("viewBox", `0 0 ${img.naturalWidth} ${img.naturalHeight}`); applyZoom(); }, { once: true });
+  return c;
+}
+
+function renderViewer(original, images, keepScroll) {
+  const L = $("paneL"), R = $("paneR");
+  const pos = keepScroll ? [L.scrollLeft, L.scrollTop] : null;
+  const bs = job ? job.result.bubbles : [];
+  const W = job?.result.width, H = job?.result.height;
+  L.replaceChildren(el("span", { class: "cap", text: "Original" }), canvas(original, bs, W, H));
+  const which = $("rightview").value;
+  const src = images ? (which === "original" ? images.original : images[which]) : null;
+  const capR = el("span", { class: "cap", id: "capR", text: $("rightview").selectedOptions[0].text });
+  if (src) R.replaceChildren(capR, canvas(src, bs, W, H));
+  else R.replaceChildren(capR, el("div", { class: "empty", text: "Result appears here" }));
+  applyZoom();
+  if (pos) requestAnimationFrame(() => { L.scrollLeft = R.scrollLeft = pos[0]; L.scrollTop = R.scrollTop = pos[1]; });
+  if (hl >= 0) highlight(hl, false);
+}
+
+function applyZoom() {
+  for (const pane of [$("paneL"), $("paneR")]) {
+    const c = pane.querySelector(".canvas"); if (!c) continue;
+    const w = +c.dataset.w || job?.result.width, h = +c.dataset.h || job?.result.height; if (!w || !h) continue;
+    let z = zoom;
+    if (z == null) z = Math.min((pane.clientWidth - 16) / w, (pane.clientHeight - 44) / h);
+    c.style.width = Math.max(50, Math.round(w * z)) + "px";
+    c.style.height = Math.max(50, Math.round(h * z)) + "px";
+  }
+  $("zoomval").textContent = zoom == null ? "fit" : Math.round(zoom * 100) + "%";
+}
+function currentZoom() {
+  const c = $("paneR").querySelector(".canvas") || $("paneL").querySelector(".canvas");
+  return c && c.dataset.w ? c.clientWidth / +c.dataset.w : 1;
+}
+function stepZoom(f) { zoom = Math.min(4, Math.max(0.1, (zoom ?? currentZoom()) * f)); applyZoom(); }
+
+function highlight(i, scroll) {
+  hl = i;
+  document.querySelectorAll(".canvas svg .hl, tr.hl").forEach((e) => e.classList.remove("hl"));
+  document.querySelectorAll(`.canvas svg [data-i="${i}"]`).forEach((e) => e.classList.add("hl"));
+  document.querySelector(`tr[data-i="${i}"]`)?.classList.add("hl");
+  if (scroll) {
+    const r = document.querySelector(`#paneL .canvas svg rect[data-i="${i}"]`);
+    const c = $("paneL").querySelector(".canvas");
+    if (r && c && zoom != null) {
+      const s = c.clientWidth / +c.dataset.w, pane = $("paneL");
+      pane.scrollTo({ left: +r.getAttribute("x") * s - pane.clientWidth / 3, top: +r.getAttribute("y") * s - pane.clientHeight / 3, behavior: "smooth" });
+    }
+  }
+}
+
+let syncing = false;
+function sync(from, to) {
+  from.addEventListener("scroll", () => {
+    if (syncing) return; syncing = true;
+    to.scrollLeft = from.scrollLeft; to.scrollTop = from.scrollTop;
+    requestAnimationFrame(() => { syncing = false; });
+  });
+}
+
+/* ---------- wiring ---------- */
+function init() {
+  const saved = store.get("ctx");
+  if (saved) for (const k of ["src", "tgt", "series", "glossary", "style"]) if (saved[k] != null) $(k).value = saved[k];
+  for (const k of ["src", "tgt", "series", "glossary", "style"]) $(k).addEventListener("input", persist);
+  const drop = $("drop");
+  drop.onclick = () => $("file").click();
+  drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click(); } };
+  $("file").onchange = () => setFile($("file").files[0]);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); setFile(e.dataTransfer.files[0]); };
+  document.addEventListener("paste", (e) => { const f = [...(e.clipboardData?.files || [])][0]; if (f) setFile(f); });
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && job && !busy && e.target.closest("#rows")) { e.preventDefault(); retypeset(); }
+  });
+  $("go").onclick = translate;
+  $("retype").onclick = retypeset;
+  $("rightview").onchange = () => { if (job) renderViewer(job.images.original, job.images, true); else { $("capR").textContent = $("rightview").selectedOptions[0].text; } };
+  $("showboxes").onchange = () => document.querySelectorAll(".canvas").forEach((c) => c.classList.toggle("boxes", $("showboxes").checked));
+  for (const b of $("layout").querySelectorAll("button")) b.onclick = () => {
+    $("layout").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+    $("viewer").classList.toggle("single", b.dataset.v === "single"); applyZoom();
+  };
+  $("zin").onclick = () => stepZoom(1.25);
+  $("zout").onclick = () => stepZoom(0.8);
+  $("zfit").onclick = () => { zoom = null; applyZoom(); };
+  for (const p of [$("paneL"), $("paneR")]) p.addEventListener("wheel", (e) => { if (e.ctrlKey) { e.preventDefault(); stepZoom(e.deltaY < 0 ? 1.1 : 0.9); } }, { passive: false });
+  sync($("paneL"), $("paneR")); sync($("paneR"), $("paneL"));
+  window.addEventListener("resize", () => { if (zoom == null) applyZoom(); });
+  setSteps(null);
+  loadMethods().catch((e) => setMsg("Cannot load methods: " + e.message, true));
+  const m = location.hash.match(/^#job=([0-9a-f]{16})$/);
+  if (m) api("/api/jobs/" + m[1]).then((j) => { if (j.status === "done") { showJob(j); setMsg("Loaded job " + j.id); } }).catch(() => {});
+}
+init();
+</script>
+</body>
+</html>

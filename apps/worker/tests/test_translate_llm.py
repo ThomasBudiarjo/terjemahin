@@ -481,3 +481,130 @@ def test_wrong_language_check():
     assert not wrong_language(TARGETS, "id")
     assert not wrong_language(["Hey, hey, what do you think about Sakamoto?"], "en")
     assert not wrong_language(["Sakamoto-kun?"], "id")  # too short to judge
+
+
+# --- regressions found by the independent verifier --------------------------------------------
+
+def test_vision_item_without_source_keeps_the_bubble():
+    # Small VLMs on json_object endpoints often omit "source"; the pipeline drops bubbles
+    # whose source_text is empty, which silently returned an untranslated page.
+    answer = json.dumps({"items": [{"index": i + 1, "target": t} for i, t in enumerate(TARGETS)]})
+    fake = Fake(_openai_response(answer))
+    tr = TRANSLATORS.build("ollama", Settings(), transport=fake.transport(), vision=True)
+    items = tr.translate(_req(["", "", ""]))
+    assert [i.target for i in items] == TARGETS
+    assert all(i.source.strip() for i in items)
+    assert len(fake.requests) == 1
+
+
+def test_ollama_defaults_suit_cpu_inference_and_read_timeouts_are_not_resent():
+    tr = TRANSLATORS.build("ollama", Settings())
+    http = tr.backend.http
+    assert http.client.timeout.read >= 600 and http.timeout_retries == 0
+    assert TRANSLATORS.build("openai", _settings(), base_url="http://localhost:1234/v1").backend.http.timeout_retries == 0
+    assert TRANSLATORS.build("openai", _settings()).backend.http.client.timeout.read == 120
+
+    calls = {"n": 0}
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("slow", request=request)
+
+    tr = TRANSLATORS.build("ollama", Settings(), transport=httpx.MockTransport(slow), sleep=lambda s: None)
+    with pytest.raises(LLMError, match="timeout option"):
+        tr.translate(_req())
+    assert calls["n"] == 1  # a slow local model is not asked to generate the page 5 times
+    tr = TRANSLATORS.build("openai", _settings(), transport=httpx.MockTransport(slow), sleep=lambda s: None)
+    calls["n"] = 0
+    with pytest.raises(LLMError):
+        tr.translate(_req())
+    assert calls["n"] == 2  # hosted default: one retry after a read timeout
+
+
+def test_leftover_cjk_is_repaired_then_glossary_then_stripped():
+    leak = "Hei, hei, Mei, menurutmu gimana soal坂本?"
+    # 1. repair: the model is asked again for the item that kept kanji
+    fake = Fake(_openai_response(_items_json([leak, *TARGETS[1:]])),
+                _openai_response(_items_json([TARGETS[0]])))
+    items = _build("openai", fake, page_image=False).translate(_req())
+    assert [i.target for i in items] == TARGETS
+    repair = fake.bodies[1]["messages"][1]["content"]
+    assert "#1 「坂本」" in repair and "2, 3" not in repair.split("PENTING")[1]
+    # 2. glossary substitution, no extra request
+    fake = Fake(_openai_response(_items_json([leak, *TARGETS[1:]])))
+    items = _build("openai", fake, page_image=False).translate(
+        _req(glossary=[GlossaryEntry(source="坂本", target="Sakamoto")]))
+    assert items[0].target == "Hei, hei, Mei, menurutmu gimana soal Sakamoto?"
+    assert len(fake.requests) == 1
+    # 3. the model insists: strip the CJK run rather than render tofu
+    fake = Fake(_openai_response(_items_json([leak, *TARGETS[1:]])))
+    items = _build("openai", fake, page_image=False).translate(_req())
+    assert items[0].target == "Hei, hei, Mei, menurutmu gimana soal?"
+    assert all(not any("぀" <= c <= "鿿" for c in i.target) for i in items)
+    # a full echo is still treated as missing, not stripped to punctuation
+    fake = Fake(_openai_response(_items_json([TARGETS[0], "坂本くん？", TARGETS[2]])))
+    assert _build("openai", fake, page_image=False, repair=0).translate(_req())[1].target == ""
+
+
+def test_fallback_covers_failed_requests_in_text_mode():
+    fake = Fake((503, {"error": {"message": "overloaded"}}, {}))
+    tr = _build("openai", fake, page_image=False, fallback="original", max_retries=2)
+    items = tr.translate(_req())
+    assert [i.target for i in items] == SOURCES  # 'original' copies the source
+    assert len(fake.requests) == 3
+    refusal = Fake(_anthropic_response("", stop="refusal"))
+    items = _build("anthropic", refusal, fallback="original").translate(_req())
+    assert [i.target for i in items] == SOURCES
+    with pytest.raises(LLMError, match="503"):  # no fallback configured: the error surfaces
+        _build("openai", Fake((503, {"error": {"message": "overloaded"}}, {})), max_retries=0).translate(_req())
+
+
+def test_string_options_are_coerced():
+    def server(request: httpx.Request):
+        user = json.loads(request.content)["messages"][1]["content"]
+        return 200, _openai_response(_items_json([f"T{i}" for i in range(1, user.count("<|") + 1)])), {}
+
+    fake = Fake(server)
+    tr = _build("openai", fake, max_items="2", repair="0", temperature="0.2", page_image="false",
+                timeout="30", max_retries="1")
+    assert len(tr.translate(_req())) == 3
+    assert len(fake.requests) == 2
+    assert fake.bodies[0]["temperature"] == 0.2
+    assert tr.backend.http.client.timeout.read == 30.0
+    assert _build("openai", Fake({}), temperature="none").temperature is None
+
+
+def test_openai_vision_default_by_host_and_image_rejection():
+    assert _build("openai", Fake({})).vision
+    assert _build("openai", Fake({}), provider="openrouter").vision
+    for preset in ("groq", "together", "mistral", "lmstudio"):
+        assert not _build("openai", Fake({}), provider=preset).vision
+    assert _build("openai", Fake({}), provider="groq", vision="true").vision
+
+    def server(request: httpx.Request):
+        content = json.loads(request.content)["messages"][1]["content"]
+        if not isinstance(content, str):
+            return 400, {"error": {"message": "messages[1].content must be a string; image input is not supported"}}, {}
+        return 200, _openai_response(_items_json(TARGETS)), {}
+
+    fake = Fake(server)
+    tr = _build("openai", fake)  # vision host, but this model is text-only
+    assert [i.target for i in tr.translate(_req())] == TARGETS
+    assert [isinstance(b["messages"][1]["content"], str) for b in fake.bodies] == [False, True]
+    tr.translate(_req())
+    assert isinstance(fake.bodies[2]["messages"][1]["content"], str)  # remembered, no wasted call
+    with pytest.raises(LLMError, match="image"):  # vision mode cannot drop the images
+        _build("openai", Fake(server)).translate(_req(["", "", ""]))
+
+
+def test_salvage_respects_braces_inside_strings():
+    broken = '{"items":[{"index":1,"target":"a {x}"},{"index":2,"target":"b}"},{"index":3,"target":"c"}'
+    got = parse_items(broken, [1, 2, 3])
+    assert {k: v.target for k, v in got.items()} == {1: "a {x}", 2: "b}", 3: "c"}
+    assert parse_items('[{"index": 1.0, "target": "a"}]', [1])[1].target == "a"
+
+
+def test_failed_repair_call_keeps_items_already_translated():
+    fake = Fake(_openai_response(_items_json(TARGETS[:2])), (401, {"error": {"message": "key revoked"}}, {}))
+    items = _build("openai", fake, page_image=False).translate(_req())
+    assert [i.target for i in items] == [*TARGETS[:2], ""]

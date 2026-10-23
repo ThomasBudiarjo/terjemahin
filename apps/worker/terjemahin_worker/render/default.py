@@ -82,6 +82,10 @@ class DefaultRenderer:
         fg_color: RGB | None = None,
         debug: bool = False,
     ) -> None:
+        if alignment not in ("center", "left", "right"):
+            raise ValueError(f"alignment must be center, left or right, not {alignment!r}")
+        if direction not in ("auto", "h", "v"):
+            raise ValueError(f"direction must be auto, h or v, not {direction!r}")
         self.measure = FontMeasure(font_path)
         self.cjk_font_path = cjk_font_path
         self._cjk: Any = None
@@ -221,10 +225,13 @@ class DefaultRenderer:
     # -- rendering --------------------------------------------------------------------------
 
     def render(self, inpainted_bgr, bubbles: list[Bubble], original_bgr) -> np.ndarray:
-        bubbles = [b for b in bubbles if b.target_text.strip()]
+        inpainted_bgr, original_bgr = _bgr(inpainted_bgr), _bgr(original_bgr)
+        H, W = inpainted_bgr.shape[:2]
+        if original_bgr.shape[:2] != (H, W):
+            original_bgr = cv2.resize(original_bgr, (W, H), interpolation=cv2.INTER_AREA)
+        bubbles = [b for b in (_on_page(b, W, H) for b in bubbles if b.target_text.strip()) if b]
         if not bubbles:
             return inpainted_bgr.copy()
-        H, W = inpainted_bgr.shape[:2]
         min_size = self.min_font_size or max(10, round((W + H) / 200))
         plans = self._plan(inpainted_bgr, original_bgr, bubbles)
         for p in plans:
@@ -234,8 +241,12 @@ class DefaultRenderer:
                 if smaller.fits:
                     p.layout = smaller
             if self.font_size_offset < 0 and p.layout.fits:
-                target = max(min_size, p.layout.size + self.font_size_offset)
-                p.layout = self._fit(p, min(min_size, target), target)
+                # never below the page minimum, nor below a size the overflow shrink chose
+                floor = min(min_size, p.layout.size)
+                target = max(floor, p.layout.size + self.font_size_offset)
+                smaller = self._fit(p, target, target)
+                if smaller.fits:
+                    p.layout = smaller
 
         if self.normalize and len(plans) >= 3:
             sizes = sorted(p.layout.size for p in plans if p.layout.fits)
@@ -331,6 +342,30 @@ class DefaultRenderer:
                     for q in pts:
                         cv2.circle(out, q, 1, col, -1)
         return out
+
+
+def _bgr(img: np.ndarray) -> np.ndarray:
+    """Pages may arrive grayscale or with alpha; the renderer works on 3-channel BGR."""
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
+
+
+def _on_page(b: Bubble, W: int, H: int) -> Bubble | None:
+    """Bubble with its box clipped to the page and at least 1 px wide and high; None when the
+    box lies entirely off the page (hand-edited PageResult JSON is not validated upstream)."""
+    r = b.region.bbox
+    x1, y1, x2, y2 = max(0, r.x1), max(0, r.y1), min(W, r.x2), min(H, r.y2)
+    if x1 >= W or y1 >= H or x2 <= 0 or y2 <= 0 or (x2 < x1) or (y2 < y1):
+        log.warning("bubble %s: box %s is off the page, not rendered", b.region.id, r)
+        return None
+    x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)
+    if (x1, y1, x2, y2) != (r.x1, r.y1, r.x2, r.y2):
+        box = BBox(x1=min(x1, W - 1), y1=min(y1, H - 1), x2=x2, y2=y2)
+        b = b.model_copy(update={"region": b.region.model_copy(update={"bbox": box})})
+    return b
 
 
 def _median(img: np.ndarray, b: BBox) -> tuple[int, int, int]:

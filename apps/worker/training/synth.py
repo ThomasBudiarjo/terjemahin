@@ -53,6 +53,8 @@ FONT_DIRS = [
 DEFAULT_VOCAB = ROOT / "weights" / "koharu-vocab.txt"
 # never start a column/line with these (simple kinsoku shori)
 ELLIPSES = ["…", "…", "・・", "・・・", "……", "．．．"]
+# hiragana, katakana, common kanji and punctuation every usable face must define
+PROBE_CHARS = "あいうえおかきくけこっゃーアカサタナッ漢字見今日私何事、。「」！？…"
 NO_START = set("、。，．！？!?ーっゃゅょッャュョ」』）)…・〜～")
 
 CORPUS = """\
@@ -226,26 +228,146 @@ def _render(font: ImageFont.FreeTypeFont, text: str, direction: str = "ltr") -> 
     return np.asarray(im)
 
 
+# A tiny sfnt reader (no fontTools here): the cmap says exactly which characters a face
+# defines. Comparing renders against a "surely missing" codepoint is not enough: unifont_csur
+# defines the plane-15 private-use area, so its tofu box passed as a real glyph.
+JA_LANGS = {(3, 0x0411), (1, 11)}  # (platform, language) of Japanese name records
+
+
+def _u16(b: bytes, o: int) -> int:
+    return int.from_bytes(b[o : o + 2], "big")
+
+
+def _u32(b: bytes, o: int) -> int:
+    return int.from_bytes(b[o : o + 4], "big")
+
+
+@lru_cache(maxsize=8)
+def _font_bytes(path: str) -> bytes:
+    return Path(path).read_bytes()
+
+
+def face_count(path: str) -> int:
+    b = _font_bytes(path)
+    return _u32(b, 8) if b[:4] == b"ttcf" else 1
+
+
+def _tables(b: bytes, index: int) -> dict[str, tuple[int, int]]:
+    off = _u32(b, 12 + 4 * index) if b[:4] == b"ttcf" else 0
+    return {b[off + 12 + 16 * i : off + 16 + 16 * i].decode("latin1"):
+            (_u32(b, off + 20 + 16 * i), _u32(b, off + 24 + 16 * i))
+            for i in range(_u16(b, off + 4))}
+
+
+def _parse_cmap(b: bytes, o: int) -> frozenset[int]:
+    best = None
+    for i in range(_u16(b, o + 2)):
+        plat, sub = _u16(b, o + 4 + 8 * i), _u32(b, o + 8 + 8 * i)
+        fmt = _u16(b, o + sub)
+        if plat in (0, 3) and fmt in (4, 12) and (best is None or fmt > best[0]):
+            best = (fmt, o + sub)
+    if best is None:
+        raise ValueError("no unicode cmap")
+    fmt, t = best
+    cps: set[int] = set()
+    if fmt == 12:
+        for g in range(_u32(b, t + 12)):
+            g0 = t + 16 + 12 * g
+            start, end, gid = _u32(b, g0), _u32(b, g0 + 4), _u32(b, g0 + 8)
+            cps.update(range(start + (gid == 0), end + 1))
+        return frozenset(cps)
+    n = _u16(b, t + 6) // 2
+    ends, starts, deltas, ro = t + 14, t + 16 + 2 * n, t + 16 + 4 * n, t + 16 + 6 * n
+    for s in range(n):
+        start, end = _u16(b, starts + 2 * s), _u16(b, ends + 2 * s)
+        delta, rng_off = _u16(b, deltas + 2 * s), _u16(b, ro + 2 * s)
+        for c in range(start, min(end, 0xFFFE) + 1):
+            if rng_off == 0:
+                gid = (c + delta) & 0xFFFF
+            else:
+                gid = _u16(b, ro + 2 * s + rng_off + 2 * (c - start))
+                gid = (gid + delta) & 0xFFFF if gid else 0
+            if gid:
+                cps.add(c)
+    return frozenset(cps)
+
+
+@lru_cache(maxsize=64)
+def cmap(path: str, index: int) -> frozenset[int] | None:
+    """Codepoints the face maps to a real glyph; None if the file can't be parsed."""
+    try:
+        b = _font_bytes(path)
+        return _parse_cmap(b, _tables(b, index)["cmap"][0])
+    except (KeyError, ValueError, IndexError, OSError):
+        return None
+
+
+@lru_cache(maxsize=64)
+def is_japanese_face(path: str, index: int) -> bool:
+    """Japanese name records, a JP family name, or a JIS-only OS/2 code page.
+
+    Chinese faces (wqy-zenhei, Microsoft YaHei, Noto CJK SC/TC) draw kana too, but with
+    Chinese kanji forms and punctuation placement (centred 、。), which would teach wrong
+    shapes; they also claim JIS among their code pages, so the code page alone is not enough.
+    """
+    try:
+        b = _font_bytes(path)
+        t = _tables(b, index)
+    except (ValueError, IndexError, OSError):
+        return False
+    names = []
+    if "name" in t:
+        o = t["name"][0]
+        strings = o + _u16(b, o + 4)
+        for i in range(_u16(b, o + 2)):
+            r = o + 6 + 12 * i
+            plat, lang, nid = _u16(b, r), _u16(b, r + 4), _u16(b, r + 6)
+            if (plat, lang) in JA_LANGS:
+                return True
+            if nid in (1, 4) and plat == 3:
+                ln, so = _u16(b, r + 8), _u16(b, r + 10)
+                names.append(b[strings + so : strings + so + ln].decode("utf-16-be", "replace"))
+    if any("JP" in n.split() or "Japan" in n for n in names):  # Noto Sans CJK JP, Source Han JP
+        return True
+    if "OS/2" in t and _u16(b, t["OS/2"][0]) >= 1:
+        cp = _u32(b, t["OS/2"][0] + 78)
+        return bool(cp >> 17 & 1) and not cp & (1 << 18 | 1 << 20)  # JIS, not GB/Big5
+    return False
+
+
+def is_pixel_font(font: ImageFont.FreeTypeFont) -> bool:
+    """Bitmap-style outlines (unifont) render with no antialiased edge at integer scales."""
+    a = _render(font, "あ漢字")
+    ink = a > 0
+    return bool(ink.any()) and ((a > 0) & (a < 255)).sum() < 0.03 * ink.sum()
+
+
 @lru_cache(maxsize=64)
 def _missing_glyph(path: str, index: int) -> bytes:
-    return _render(load_font(path, index, 32), "\U000f0000").tobytes()
+    return _render(load_font(path, index, 32), "\U0010fffd").tobytes()
 
 
 @lru_cache(maxsize=200_000)
 def has_glyph(path: str, index: int, ch: str) -> bool:
     if ch.isspace():
         return True
+    cps = cmap(path, index)
+    if cps is not None and ord(ch) not in cps:
+        return False
     a = _render(load_font(path, index, 32), ch)
-    return a.any() and a.tobytes() != _missing_glyph(path, index)
+    return bool(a.any()) and (cps is not None or a.tobytes() != _missing_glyph(path, index))
 
 
-def probe_font(path: str, index: int) -> FontFace | None:
-    """A face that draws kana and kanji; `vertical` when its ttb layout stacks glyphs properly."""
+def probe_font(path: str, index: int, any_cjk: bool = False) -> FontFace | None:
+    """An outline face that draws kana and kanji in Japanese style (any CJK with `any_cjk`);
+    `vertical` when its ttb layout stacks glyphs properly."""
     try:
         font = load_font(path, index, 32)
     except OSError:
         return None
-    if not all(has_glyph(path, index, c) for c in "あカ漢字。"):
+    if not all(has_glyph(path, index, c) for c in PROBE_CHARS):
+        return None
+    if is_pixel_font(font) or not (any_cjk or is_japanese_face(path, index)):
         return None
     ys, xs = np.nonzero(_render(font, "あいう国", "ttb"))
     stacked = len(ys) > 0 and np.ptp(ys) > 3.3 * 32 and np.ptp(xs) < 1.4 * 32
@@ -254,20 +376,26 @@ def probe_font(path: str, index: int) -> FontFace | None:
     return FontFace(path, index, bool(vertical))
 
 
-def find_fonts(sources: list[Path]) -> list[FontFace]:
+def find_fonts(sources: list[Path], any_cjk: bool = False) -> list[FontFace]:
     files: list[Path] = []
     for s in sources:
         if s.is_file():
             files.append(s)
         elif s.is_dir():
             files += [p for p in s.rglob("*") if p.suffix.lower() in FONT_EXT]
-    faces = []
+    faces, seen = [], set()
     for p in sorted(set(files)):
-        for idx in range(4 if p.suffix.lower() == ".ttc" else 1):
-            f = probe_font(str(p), idx)
-            if f is None:
-                break
-            faces.append(f)
+        real = p.resolve()
+        if real in seen or not real.is_file():
+            continue
+        seen.add(real)
+        try:
+            n = face_count(str(p)) if p.suffix.lower() == ".ttc" else 1
+        except OSError:
+            continue
+        for idx in range(min(n, 32)):
+            if f := probe_font(str(p), idx, any_cjk):
+                faces.append(f)
     return faces
 
 
@@ -873,6 +1001,8 @@ def main(argv: list[str] | None = None) -> dict:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fonts", type=Path, nargs="*", default=None,
                     help="font files or folders (default: common system font dirs)")
+    ap.add_argument("--any-cjk-font", action="store_true",
+                    help="also use Chinese/Korean faces (Chinese kanji forms and punctuation)")
     ap.add_argument("--corpus", type=Path, default=None, help="UTF-8 file, one line per text")
     ap.add_argument("--backgrounds", type=Path, default=None,
                     help="folder of text-free page images (e.g. inpainted pages)")
@@ -887,7 +1017,11 @@ def main(argv: list[str] | None = None) -> dict:
     ap.add_argument("--emit", default="det,ocr,inpaint", help="outputs to write")
     a = ap.parse_args(argv)
 
-    fonts = find_fonts(a.fonts if a.fonts else FONT_DIRS)
+    fonts = find_fonts(a.fonts if a.fonts else FONT_DIRS, a.any_cjk_font)
+    if not fonts:
+        raise SystemExit("no usable Japanese font found; pass --fonts")
+    print("fonts: " + ", ".join(f"{Path(f.path).name}#{f.index}{'(v)' if f.vertical else ''}"
+                                for f in fonts), file=sys.stderr)
     bgs = []
     if a.backgrounds:
         bgs = sorted(p for p in a.backgrounds.rglob("*") if p.suffix.lower() in IMG_EXT)

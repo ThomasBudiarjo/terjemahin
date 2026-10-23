@@ -10,8 +10,12 @@ quality and robustness lives here once:
   0-based indices, and finally `<|n|>` / `n.` numbered lines;
 - repair: items that are missing, empty or still in the source script are re-requested with an
   explicit index list; whatever is still missing goes to an optional fallback translator;
-- HTTP retries with exponential backoff (honouring Retry-After) on 429/5xx/timeouts, and
-  automatic removal of optional request fields an endpoint rejects with 400;
+- HTTP retries with exponential backoff (honouring Retry-After) on 429/5xx/connection errors,
+  read timeouts retried at most `timeout_retries` times (a slow model would only be asked to
+  generate the whole page again), and automatic removal of optional request fields an endpoint
+  rejects with 400; an endpoint that rejects images falls back to text-only requests;
+- a request that still fails goes to the fallback translator (text mode) instead of failing the
+  page, and source-script characters never leak into a non-CJK target;
 - the result always has exactly one item per region.
 """
 
@@ -31,7 +35,7 @@ from typing import Any, Protocol
 import cv2
 import numpy as np
 
-from ..models import PageContext, TextRegion
+from ..models import GlossaryEntry, PageContext, TextRegion
 from . import prompt as P
 from .base import TranslationItem, TranslationRequest
 
@@ -63,6 +67,19 @@ class LLMError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+
+
+class ImagesRejected(LLMError):
+    """The endpoint/model does not accept image input (text-only model behind a vision API)."""
+
+
+_IMAGE_ERROR = re.compile(
+    r"image|vision|multi-?modal|image_url|content.{0,40}(?:array|list|type|string)", re.IGNORECASE
+)
+
+
+def images_rejected(e: LLMError) -> bool:
+    return e.status in (400, 404, 415, 422) and bool(_IMAGE_ERROR.search(str(e)))
 
 
 @dataclass
@@ -112,6 +129,7 @@ class Http:
         self,
         timeout: float = 120.0,
         max_retries: int = 4,
+        timeout_retries: int = 1,
         backoff: float = 1.5,
         max_wait: float = 60.0,
         transport: Any = None,
@@ -124,6 +142,7 @@ class Http:
             timeout=httpx.Timeout(timeout, connect=min(timeout, 15.0)), transport=transport
         )
         self.max_retries = max_retries
+        self.timeout_retries = timeout_retries
         self.backoff = backoff
         self.max_wait = max_wait
         self.sleep = sleep
@@ -138,10 +157,17 @@ class Http:
 
     def post(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
         last: LLMError | None = None
+        read_timeouts = 0
         for attempt in range(self.max_retries + 1):
             retry_after = None
             try:
                 r = self.client.post(url, headers=headers, json=body)
+            except self.httpx.ReadTimeout as e:
+                read_timeouts += 1
+                last = LLMError(f"no answer within {self.client.timeout.read}s (timeout option): {e}",
+                                retryable=True)
+                if read_timeouts > self.timeout_retries:
+                    raise last from e
             except self.httpx.TimeoutException as e:
                 last = LLMError(f"timeout: {e}", retryable=True)
             except self.httpx.TransportError as e:
@@ -307,7 +333,7 @@ def _row(row: Any) -> tuple[int | None, Parsed] | None:
     if isinstance(row, dict):
         idx = _first(row, _INDEX_KEYS)
         try:
-            idx = int(str(idx).strip("#<|> ")) if idx is not None else None
+            idx = int(float(str(idx).strip("#<|> "))) if idx is not None else None
         except ValueError:
             idx = None
         return idx, Parsed(
@@ -332,15 +358,34 @@ def _from_json(text: str, expected: Sequence[int]) -> dict[int, Parsed] | None:
     return None
 
 
-_FLAT_OBJECT = re.compile(r"\{[^{}]*\}")
+def _objects(text: str) -> list[str]:
+    """Every balanced {...} span, innermost first; braces inside JSON strings are ignored."""
+    out: list[str] = []
+    stack: list[int] = []
+    in_str = esc = False
+    for i, c in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            out.append(text[stack.pop() : i + 1])
+    return out
 
 
 def _from_objects(text: str, expected: Sequence[int]) -> dict[int, Parsed]:
     """Salvage item objects from a broken document (bad brackets, truncation, stray prose)."""
     rows = []
-    for m in _FLAT_OBJECT.finditer(text):
+    for span in _objects(text):
         try:
-            obj = json.loads(_TRAILING_COMMA.sub(r"\1", m.group()))
+            obj = json.loads(_TRAILING_COMMA.sub(r"\1", span))
         except ValueError:
             continue
         if isinstance(obj, dict) and any(k in obj for k in _TARGET_KEYS):
@@ -396,12 +441,36 @@ _LETTER = re.compile(r"[^\W\d_]")
 _CJK_TARGETS = ("ja", "zh", "zh-hant", "ko")
 
 
+_CJK_RUN = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯ｦ-ﾟ々〆ー]+")
+_EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]|「\s*」|『\s*』")
+NO_SOURCE = "[?]"  # vision model translated a balloon without transcribing it
+
+
 def untranslated(target: str, source: str, target_lang: str) -> bool:
-    """Target still mostly in the source's CJK script (the model echoed instead of translating)."""
+    """Target still contains source-script (CJK) characters although the target language has none.
+
+    Any CJK counts, not only a mostly-CJK echo: a single name left in kanji renders as tofu boxes
+    with a Latin font.
+    """
     if target_lang in _CJK_TARGETS or not _CJK.search(source):
         return False
-    letters = _LETTER.findall(target)
-    return bool(letters) and sum(1 for c in letters if _CJK.match(c)) / len(letters) > 0.3
+    return bool(_CJK.search(target))
+
+
+def apply_glossary(target: str, glossary: Sequence[GlossaryEntry]) -> str:
+    """Replace glossary source terms the model left untranslated (坂本 -> Sakamoto)."""
+    if not _CJK.search(target):
+        return target
+    for g in sorted(glossary, key=lambda g: -len(g.source)):
+        if g.source and g.target and g.source in target:
+            target = target.replace(g.source, f" {g.target} " if g.target.isascii() else g.target)
+    return clean_text(re.sub(r"\s+([?!.,…、。？！])", r"\1", target))
+
+
+def strip_cjk(target: str) -> str:
+    """Last resort for a non-CJK target: drop leftover CJK runs rather than render tofu."""
+    out = _EMPTY_BRACKETS.sub("", _CJK_RUN.sub(" ", target))
+    return clean_text(re.sub(r"\s+([?!.,…])", r"\1", out))
 
 
 def _words(s: str) -> frozenset[str]:
@@ -485,6 +554,7 @@ class LLMTranslator:
         self.prev_pages = prev_pages
         self.memory: deque[list[str]] = deque(maxlen=max(0, remember_pages))
         self.fallback = fallback
+        self.images_ok = True  # cleared when the endpoint rejects image input
         self.calls = 0
 
     @property
@@ -516,15 +586,25 @@ class LLMTranslator:
             page_jpeg = encode_jpeg(req.page_bgr, self.page_max_side)
 
         results: dict[int, Parsed] = {}
+        tainted: dict[int, Parsed] = {}
         pos_list = list(positions)
+        can_fall_back = self.fallback is not None and mode == "text"
         for start in range(0, len(pos_list), self.max_items):
             chunk = pos_list[start : start + self.max_items]
             slots = [_Slot(p, k + 1, req.regions[p], sources[p]) for k, p in enumerate(chunk)]
-            got = self._run(req, mode, slots, context, page_jpeg)
+            chunk_tainted: dict[int, Parsed] = {}
+            try:
+                got = self._run(req, mode, slots, context, page_jpeg, chunk_tainted)
+            except LLMError as e:
+                if not can_fall_back:
+                    raise
+                log.warning("%s failed (%s); %d item(s) go to the fallback", self.backend.name, e, len(slots))
+                got = {}
             results.update({s.pos: got[s.number] for s in slots if s.number in got})
+            tainted.update({s.pos: chunk_tainted[s.number] for s in slots if s.number in chunk_tainted})
 
         missing = [p for p in pos_list if p not in results]
-        if missing and self.fallback and mode == "text":
+        if missing and can_fall_back:
             log.warning("%s: %d item(s) still missing, using fallback", self.backend.name, len(missing))
             sub = TranslationRequest(
                 page_bgr=req.page_bgr, regions=[req.regions[p] for p in missing],
@@ -534,8 +614,15 @@ class LLMTranslator:
             for p, it in zip(missing, self.fallback(sub)):
                 if it.target.strip():
                     results[p] = Parsed(it.target, sources[p])
-        elif missing:
-            log.warning("%s: %d item(s) left untranslated", self.backend.name, len(missing))
+        for p in [p for p in pos_list if p not in results and p in tainted]:
+            it = tainted[p]
+            if not _LETTER.search(strip_cjk(it.target)):
+                continue  # a full echo: nothing usable once the CJK is gone
+            log.warning("%s: item %d kept CJK %r; stripping it", self.backend.name, p + 1, it.target)
+            results[p] = Parsed(strip_cjk(it.target), it.source, it.speaker)
+        left = sum(p not in results for p in pos_list)
+        if left:
+            log.warning("%s: %d item(s) left untranslated", self.backend.name, left)
 
         items: list[TranslationItem] = []
         for i in range(n):
@@ -543,7 +630,10 @@ class LLMTranslator:
             if got_item is None:
                 items.append(TranslationItem(source=sources[i]))
                 continue
-            src = got_item.source if mode == "vision" else sources[i]
+            src = sources[i]
+            if mode == "vision":
+                # the pipeline drops bubbles without source text; keep translated ones
+                src = got_item.source or (NO_SOURCE if got_item.target else "")
             items.append(TranslationItem(source=src, target=got_item.target, speaker=got_item.speaker))
         if self.memory.maxlen:
             self.memory.append([it.target for it in items if it.target])
@@ -552,41 +642,66 @@ class LLMTranslator:
     # one chunk: request, parse, repair
     def _run(
         self, req: TranslationRequest, mode: str, slots: list[_Slot], context: PageContext,
-        page_jpeg: bytes | None,
+        page_jpeg: bytes | None, tainted: dict[int, Parsed],
     ) -> dict[int, Parsed]:
         expected = [s.number for s in slots]
+        glossary = context.glossary
+        leaks: dict[int, list[str]] = {}  # index -> CJK runs the model left in its target
+
+        def accept(text: str, want: Sequence[int]) -> dict[int, Parsed]:
+            got = self._accept(parse_items(text, want), slots, mode, req.target_lang, glossary, tainted)
+            for k in want:
+                if k in got:
+                    leaks.pop(k, None)
+                elif k in tainted:
+                    leaks[k] = _CJK_RUN.findall(tainted[k].target)
+            return got
+
         system = P.system_prompt(mode, req.source_lang, req.target_lang, page_image=page_jpeg is not None and mode == "text")
         ctx = P.context_block(context, [s.source for s in slots], req.target_lang, self.prev_pages)
 
         got: dict[int, Parsed] = {}
         for attempt in range(self.parse_retries + 1):
-            text = self._complete(system, self._parts(req, mode, slots, ctx, page_jpeg, None))
-            got = self._accept(parse_items(text, expected), slots, mode, req.target_lang)
+            text = self._complete(system, self._parts(req, mode, slots, ctx, page_jpeg, None), mode)
+            got = accept(text, expected)
             if got:
                 break
             log.warning("%s: unparseable answer (attempt %d): %.200r", self.backend.name, attempt + 1, text)
 
-        if self.repair and wrong_language([g.target for g in got.values()], req.target_lang):
-            log.warning("%s: answer is not in '%s', asking again", self.backend.name, req.target_lang)
-            note = P.language_note(req.target_lang)
-            text = self._complete(system, self._parts(req, mode, slots, ctx, page_jpeg, None, note))
-            again = self._accept(parse_items(text, expected), slots, mode, req.target_lang)
-            if len(again) >= len(got) and not wrong_language([g.target for g in again.values()], req.target_lang):
-                got = again
+        try:
+            if self.repair and wrong_language([g.target for g in got.values()], req.target_lang):
+                log.warning("%s: answer is not in '%s', asking again", self.backend.name, req.target_lang)
+                note = P.language_note(req.target_lang)
+                text = self._complete(system, self._parts(req, mode, slots, ctx, page_jpeg, None, note), mode)
+                again = accept(text, expected)
+                if len(again) >= len(got) and not wrong_language([g.target for g in again.values()], req.target_lang):
+                    got = again
 
-        for _ in range(self.repair):
-            missing = [n for n in expected if n not in got]
-            if not missing:
-                break
-            log.warning("%s: %d/%d items missing (%s), asking again", self.backend.name,
-                        len(missing), len(expected), missing)
-            text = self._complete(system, self._parts(req, mode, slots, ctx, page_jpeg, missing))
-            fixed = self._accept(parse_items(text, missing), slots, mode, req.target_lang)
-            got.update({k: v for k, v in fixed.items() if k in missing})
+            for _ in range(self.repair):
+                missing = [n for n in expected if n not in got]
+                if not missing:
+                    break
+                log.warning("%s: %d/%d items missing (%s), asking again", self.backend.name,
+                            len(missing), len(expected), missing)
+                parts = self._parts(req, mode, slots, ctx, page_jpeg, missing, leaks=leaks)
+                text = self._complete(system, parts, mode)
+                fixed = accept(text, missing)
+                got.update({k: v for k, v in fixed.items() if k in missing})
+        except LLMError as e:  # a failed follow-up call must not throw away what we already have
+            if not got:
+                raise
+            log.warning("%s: follow-up request failed (%s); keeping %d item(s)", self.backend.name, e, len(got))
         return got
 
-    def _accept(self, parsed: dict[int, Parsed], slots: list[_Slot], mode: str, target_lang: str) -> dict[int, Parsed]:
-        """Drop items that need a retry: empty targets for real text, or echoed source."""
+    def _accept(
+        self, parsed: dict[int, Parsed], slots: list[_Slot], mode: str, target_lang: str,
+        glossary: Sequence[GlossaryEntry], tainted: dict[int, Parsed],
+    ) -> dict[int, Parsed]:
+        """Drop items that need a retry: empty targets for real text, or source script left in.
+
+        A mostly-translated item that only kept some CJK is remembered in `tainted` so it can
+        still be used (CJK stripped) if repair and fallback do not produce anything better.
+        """
         by_num = {s.number: s for s in slots}
         out: dict[int, Parsed] = {}
         for k, it in parsed.items():
@@ -594,20 +709,37 @@ class LLMTranslator:
             if not it.target and (mode == "text" and src.strip()):
                 continue
             if it.target and untranslated(it.target, src or it.target, target_lang):
-                continue
+                it.target = apply_glossary(it.target, glossary)
+                if untranslated(it.target, src or it.target, target_lang):
+                    if k not in tainted or _LETTER.search(strip_cjk(it.target)):
+                        tainted[k] = it
+                    continue
+            tainted.pop(k, None)
             out[k] = it
         return out
 
-    def _complete(self, system: str, parts: list[Part]) -> str:
+    def _complete(self, system: str, parts: list[Part], mode: str) -> str:
         self.calls += 1
         t = time.perf_counter()
-        text = self.backend.complete(ChatRequest(system, parts, RESPONSE_SCHEMA, self.max_tokens, self.temperature))
+        if mode == "text" and not self.images_ok:
+            parts = [p for p in parts if isinstance(p, str)]
+        req = ChatRequest(system, parts, RESPONSE_SCHEMA, self.max_tokens, self.temperature)
+        try:
+            text = self.backend.complete(req)
+        except ImagesRejected as e:
+            if mode != "text" or not req.has_images:
+                raise  # vision mode cannot work without images
+            log.warning("%s rejects images (%s); continuing text-only", self.backend.name, e)
+            self.images_ok = False
+            req.parts = [p for p in parts if isinstance(p, str)]
+            text = self.backend.complete(req)
         log.info("%s: answer in %.1fs (%d chars)", self.backend.name, time.perf_counter() - t, len(text))
         return text
 
     def _parts(
         self, req: TranslationRequest, mode: str, slots: list[_Slot], ctx: str,
         page_jpeg: bytes | None, missing: list[int] | None, note: str | None = None,
+        leaks: dict[int, list[str]] | None = None,
     ) -> list[Part]:
         parts: list[Part] = []
         if mode == "text":
@@ -623,7 +755,7 @@ class LLMTranslator:
             ]
             task = P.text_task(lines, req.target_lang, req.source_lang)
             if missing:
-                task += "\n\n" + P.repair_note(missing, req.target_lang)
+                task += "\n\n" + P.repair_note(missing, req.target_lang, leaks)
             if note:
                 task += "\n\n" + note
             parts.append(f"{ctx}\n\n{task}" if ctx else task)
@@ -650,18 +782,42 @@ class LLMTranslator:
 
 # --- factory helpers -------------------------------------------------------------------------
 
-CORE_OPTS = (
-    "mode", "page_image", "crops", "positions", "max_items", "repair", "parse_retries",
-    "page_max_side", "crop_max_side", "crop_pad", "max_tokens", "temperature", "prev_pages",
-    "remember_pages",
-)
-HTTP_OPTS = ("timeout", "max_retries", "backoff", "max_wait", "transport", "sleep")
+def as_bool(v: Any) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def as_int(v: Any) -> int:
+    return int(float(v)) if isinstance(v, str) else int(v)
+
+
+def _optional(conv: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    def f(v: Any) -> Any:
+        if v is None or (isinstance(v, str) and v.strip().lower() in ("", "none", "null", "auto")):
+            return None
+        return conv(v)
+
+    return f
+
+
+# Options may arrive as strings (web/API job payloads), so every known one is coerced.
+CORE_OPTS: dict[str, Callable[[Any], Any]] = {
+    "mode": lambda v: str(v).strip().lower(), "page_image": _optional(as_bool), "crops": as_bool,
+    "positions": as_bool, "max_items": as_int, "repair": as_int, "parse_retries": as_int,
+    "page_max_side": as_int, "crop_max_side": as_int, "crop_pad": as_int, "max_tokens": as_int,
+    "temperature": _optional(float), "prev_pages": as_int, "remember_pages": as_int,
+}
+HTTP_OPTS: dict[str, Callable[[Any], Any]] = {
+    "timeout": float, "max_retries": as_int, "timeout_retries": as_int, "backoff": float,
+    "max_wait": float, "transport": lambda v: v, "sleep": lambda v: v,
+}
 
 
 def split_opts(opts: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """(core translator opts, Http opts, provider opts)."""
-    core = {k: opts.pop(k) for k in CORE_OPTS if k in opts}
-    http = {k: opts.pop(k) for k in HTTP_OPTS if k in opts}
+    """(core translator opts, Http opts, provider opts), known ones coerced to their types."""
+    core = {k: conv(opts.pop(k)) for k, conv in CORE_OPTS.items() if k in opts}
+    http = {k: conv(opts.pop(k)) for k, conv in HTTP_OPTS.items() if k in opts}
     return core, http, opts
 
 
@@ -679,8 +835,3 @@ def make_translator(backend: Backend, settings: Any, core: dict[str, Any], fallb
 
     return LLMTranslator(backend, fallback=fb, **core)
 
-
-def as_bool(v: Any) -> bool:
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on")
-    return bool(v)

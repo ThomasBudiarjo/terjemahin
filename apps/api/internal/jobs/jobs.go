@@ -23,6 +23,10 @@ type Job struct {
 	OutputPath string          `json:"output_path"`
 	ResultPath string          `json:"result_path"`
 	Context    json.RawMessage `json:"context,omitempty"`
+	// Pipeline is the worker's PipelineConfig (method per stage + options), passed through.
+	Pipeline json.RawMessage `json:"pipeline,omitempty"`
+	// DebugDir, relative to the storage dir, receives per-stage images when set.
+	DebugDir string `json:"debug_dir,omitempty"`
 
 	Status    Status    `json:"status"`
 	Error     string    `json:"error,omitempty"`

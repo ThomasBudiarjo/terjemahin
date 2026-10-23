@@ -259,7 +259,14 @@ def _last_position_head(m) -> None:
     weights=("manga_ocr_onnx", "manga_ocr_vocab"),
 )
 def _build(settings, **opts):
+    """`weights=` loads a fine-tuned export (training/export_ocr_onnx.py), whose vocab sits
+    next to it as <name>.vocab.txt unless `vocab=` says otherwise."""
     opts.setdefault("threads", int(os.environ.get("OCR_THREADS", "0")))
+    weights, vocab = opts.pop("weights", None), opts.pop("vocab", None)
+    if weights and not vocab:
+        vocab = Path(weights).with_suffix(".vocab.txt")
     return MangaOcrOnnx(
-        ensure("manga_ocr_onnx", settings), ensure("manga_ocr_vocab", settings), **opts
+        weights or ensure("manga_ocr_onnx", settings),
+        vocab or ensure("manga_ocr_vocab", settings),
+        **opts,
     )

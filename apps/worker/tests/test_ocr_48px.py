@@ -1,3 +1,4 @@
+import itertools
 import json
 import time
 import unicodedata
@@ -10,9 +11,12 @@ import pytest
 from terjemahin_worker.config import Settings
 from terjemahin_worker.models import BBox, TextRegion
 from terjemahin_worker.ocr.mit48px import (
+    PIECE_WIDTH,
+    SPLIT_WIDTH,
     TEXT_HEIGHT,
     join_lines,
     line_direction,
+    line_pieces,
     order_quad,
     reading_order,
     split_lines,
@@ -101,11 +105,28 @@ def test_text_helpers():
     assert join_lines(["ねえねえ、", "めいは"]) == "ねえねえ、めいは"
     assert join_lines(["HELLO", "WORLD"]) == "HELLO WORLD"
     assert vertical_forms("そうだなあ：") == "そうだなあ‥"
+    assert vertical_forms("：あ:") == "‥あ‥"
+    assert vertical_forms("10:30に") == "10:30に"  # a real colon between digits stays
+
+
+def test_line_pieces_cut_at_blank_columns():
+    short = np.full((TEXT_HEIGHT, SPLIT_WIDTH, 3), 255, np.uint8)
+    assert line_pieces(short) == [(0, SPLIT_WIDTH, False)]
+    w, pitch = 5000, 44
+    crop = np.full((TEXT_HEIGHT, w, 3), 255, np.uint8)
+    for x in range(0, w - pitch, pitch):  # 40px glyphs with 4px gaps
+        crop[4:44, x : x + 40] = 0
+    pieces = line_pieces(crop)
+    assert pieces[0][0] == 0 and pieces[-1][1] == w
+    assert all(a == pb for (_, pb, _), (a, _, _) in itertools.pairwise(pieces))  # contiguous
+    assert all(b - a <= PIECE_WIDTH for a, b, _ in pieces)
+    for _, b, _ in pieces[:-1]:
+        assert crop[:, b].min() == 255  # never through a glyph
 
 
 def test_xpos_cache_matches_reference_formula():
     torch = pytest.importorskip("torch")
-    from terjemahin_worker.ocr.mit48px_model import XPOS, centred
+    from terjemahin_worker.ocr._mit48px_model import XPOS, centred
 
     xp = XPOS()
     x = torch.randn(2, 7, 80)
@@ -138,7 +159,7 @@ def test_xpos_cache_matches_reference_formula():
 
 def test_beam_search_shapes_on_random_weights():
     torch = pytest.importorskip("torch")
-    from terjemahin_worker.ocr.mit48px_model import OCR48px
+    from terjemahin_worker.ocr._mit48px_model import OCR48px
 
     torch.manual_seed(0)
     m = OCR48px(50).eval()
@@ -252,7 +273,7 @@ def norm(t: str) -> str:
     t = unicodedata.normalize("NFKC", t)
     for a in "‥…・:.。":
         t = t.replace(a, "・")
-    return "".join(t.split()).replace("ぁ", "あ")
+    return "".join(t.split())
 
 
 def lev(a: str, b: str) -> int:
@@ -282,3 +303,44 @@ def test_degenerate_inputs(ocr):
     ]
     res = ocr.recognize(blank, regions)
     assert len(res) == 3 and all(r.text == "" or r.confidence < 0.5 for r in res)
+
+
+@needs_model
+def test_odd_images_and_off_page_regions(ocr):
+    img = cv2.imread(str(PAGE))
+    regions = page_lines()[:1]
+    (want,) = ocr.recognize(img, regions)
+    (gray,) = ocr.recognize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), regions)
+    (bgra,) = ocr.recognize(cv2.cvtColor(img, cv2.COLOR_BGR2BGRA), regions)
+    assert gray.text == want.text == bgra.text
+    h, w = img.shape[:2]
+    off = [
+        TextRegion(id=0, bbox=BBox(x1=w + 10, y1=h + 10, x2=w + 50, y2=h + 50), direction="h"),
+        TextRegion(id=1, bbox=BBox(x1=-80, y1=-80, x2=-10, y2=-10), direction="v"),
+        regions[0].model_copy(
+            update={"lines": [[(w + 5, 0), (w + 45, 0), (w + 45, 90), (w + 5, 90)]]}
+        ),
+    ]
+    res = ocr.recognize(img, off)
+    assert [r.text for r in res[:2]] == ["", ""]
+    assert cer(res[2].text, want.text) < 0.1  # off-page quad ignored, falls back to the box
+
+
+@needs_model
+def test_long_line_is_split_not_collapsed(ocr):
+    """The model collapses on lines over ~2100px at 48px high; long lines are read in pieces."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    text = (
+        "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND THEN RUNS AWAY "
+        "INTO THE DARK FOREST NEAR THE OLD RIVER BANK"
+    )
+    font = ImageFont.truetype(str(ROOT / "fonts" / "ComicShanns2.ttf"), 40)
+    im = Image.new("RGB", (int(font.getlength(text)) + 40, 70), "white")
+    ImageDraw.Draw(im).text((20, 10), text, font=font, fill="black")
+    img = np.ascontiguousarray(np.array(im)[..., ::-1])
+    assert img.shape[1] * TEXT_HEIGHT / 50 > SPLIT_WIDTH
+    region = TextRegion(id=0, bbox=BBox(x1=0, y1=0, x2=img.shape[1], y2=70), direction="h")
+    (o,) = ocr.recognize(img, [region])
+    assert cer(o.text, text) < 0.03, o.text
+    assert " " in o.text and o.fg_color is not None

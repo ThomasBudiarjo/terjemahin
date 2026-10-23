@@ -289,8 +289,13 @@ def _break(
     caps: list[float],
     space_w: float,
     hyphen_w: float,
+    ladder: bool = False,
 ) -> tuple[float, list[int]] | None:
-    """Min-cost split of `frags` into exactly len(caps) non-empty lines, or None."""
+    """Min-cost split of `frags` into exactly len(caps) non-empty lines, or None.
+
+    Unless `ladder`, no line may be the middle of a word ("menye- / nang- / kan"): a word is
+    split at most once.
+    """
     n, m = len(caps), len(frags)
     if m < n:
         return None
@@ -328,9 +333,11 @@ def _break(
                 fill = w / cap
                 cost = (1.0 - fill) ** 2
                 if frags[b - 1].join == "soft" and b < m:
-                    cost += HYPHEN_COST
                     if a > 0 and frags[a - 1].join == "soft":
+                        if not ladder and all(f.join == "soft" for f in frags[a:b]):
+                            continue
                         cost += HYPHEN_COST  # hyphen ladders read badly
+                    cost += HYPHEN_COST
                 if last_line and n > 1 and all(f.join != "space" for f in frags[a : b - 1]):
                     cost += ORPHAN_COST * (1.0 - fill)
                 if base + cost < dp[i + 1][b]:
@@ -403,7 +410,7 @@ def _try_size(
                 caps.append(hi - lo)
             if min(caps) <= 0 or sum(caps) * SAFETY < total:
                 continue
-            res = _break(frags, caps, space_w, hyphen_w)
+            res = _break(frags, caps, space_w, hyphen_w, ladder=force_chars or hyphenate >= 2)
             if res is None:
                 continue
             cost = res[0] / n + OFFSET_COST * abs(k)

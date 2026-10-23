@@ -11,7 +11,7 @@ import logging
 from typing import Any
 
 from ..registry import TRANSLATORS
-from .llm_common import ChatRequest, Http, Image, LLMError, make_translator, split_opts
+from .llm_common import ChatRequest, Http, Image, LLMError, as_bool, make_translator, split_opts
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ def _build(settings, **opts):
         rest.pop("api_key", None) or settings.gemini_api_key,
         rest.pop("model", None) or settings.gemini_model,
         base_url=rest.pop("base_url", None) or API_URL,
-        structured=bool(rest.pop("structured", True)),
+        structured=as_bool(rest.pop("structured", True)),
     )
     if rest:
         log.warning("gemini: ignoring unknown options %s", sorted(rest))
