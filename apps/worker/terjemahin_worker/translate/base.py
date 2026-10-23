@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
+from pydantic import BaseModel
 
-from ..models import Bubble, PageContext, TextRegion
+from ..models import PageContext, TextRegion
+
+
+@dataclass
+class TranslationRequest:
+    page_bgr: np.ndarray
+    regions: list[TextRegion]
+    sources: list[str]  # OCR output, one per region ("" when OCR was skipped)
+    context: PageContext = field(default_factory=PageContext)
+    source_lang: str = "ja"
+    target_lang: str = "id"
+
+
+class TranslationItem(BaseModel):
+    source: str = ""  # vision translators fill this with what they read
+    target: str = ""
+    speaker: str | None = None
 
 
 class Translator(Protocol):
-    def translate(
-        self,
-        page_bgr: np.ndarray,
-        regions: list[TextRegion],
-        context: PageContext,
-    ) -> list[Bubble]:
-        """Read the Japanese text in each region and translate it to Indonesian.
+    vision: bool
+    """True if the translator reads text from the image itself (works with ocr='none')."""
 
-        Must return exactly one Bubble per region, in the same order.
-        """
+    def translate(self, req: TranslationRequest) -> list[TranslationItem]:
+        """Exactly one item per region, in the same order."""
         ...

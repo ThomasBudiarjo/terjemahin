@@ -48,7 +48,13 @@ def run(settings: Settings) -> None:
             page = cv2.imread(str(_resolve(settings.storage_dir, job.input_path)))
             if page is None:
                 raise FileNotFoundError(job.input_path)
-            out_img, result = pipeline.run(page, job.context)
+            res = pipeline.run(page, job.context, job.pipeline, debug=bool(job.debug_dir))
+            out_img, result = res.image, res.result
+            if job.debug_dir:
+                dbg = _resolve(settings.storage_dir, job.debug_dir)
+                dbg.mkdir(parents=True, exist_ok=True)
+                for name, img in res.debug.items():
+                    cv2.imwrite(str(dbg / f"{name}.png"), img)
 
             out_path = _resolve(settings.storage_dir, job.output_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)

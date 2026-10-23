@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from google import genai
-from google.genai import types
 from pydantic import BaseModel
 
-from ..models import Bubble, PageContext, TextRegion
+from ..registry import TRANSLATORS
+from .base import TranslationItem, TranslationRequest
 from .prompt import SYSTEM_PROMPT, build_user_prompt
 
 PAGE_MAX_SIDE = 1536
@@ -40,18 +39,22 @@ def _downscale(image_bgr: np.ndarray, max_side: int) -> np.ndarray:
 
 
 class GeminiTranslator:
+    """Vision LLM: reads each crop and translates it in one call, with page + series context."""
+
+    vision = True
+
     def __init__(self, api_key: str, model: str) -> None:
+        from google import genai
+
         if not api_key:
             raise ValueError("GEMINI_API_KEY is empty")
         self.client = genai.Client(api_key=api_key)
         self.model = model
 
-    def translate(
-        self,
-        page_bgr: np.ndarray,
-        regions: list[TextRegion],
-        context: PageContext,
-    ) -> list[Bubble]:
+    def translate(self, req: TranslationRequest) -> list[TranslationItem]:
+        from google.genai import types
+
+        page_bgr, regions, context = req.page_bgr, req.regions, req.context
         if not regions:
             return []
 
@@ -79,15 +82,25 @@ class GeminiTranslator:
         parsed = _Response.model_validate_json(resp.text or "{}")
         by_index = {it.index: it for it in parsed.items}
 
-        bubbles: list[Bubble] = []
-        for r in regions:
+        items: list[TranslationItem] = []
+        for i, r in enumerate(regions):
             it = by_index.get(r.id)
-            bubbles.append(
-                Bubble(
-                    region=r,
-                    source_text=(it.source if it else "").strip(),
-                    target_text=(it.target if it else "").strip(),
+            items.append(
+                TranslationItem(
+                    source=(it.source if it else req.sources[i] if i < len(req.sources) else "").strip(),
+                    target=(it.target if it else "").strip(),
                     speaker=it.speaker if it else None,
                 )
             )
-        return bubbles
+        return items
+
+
+@TRANSLATORS.register(
+    "gemini",
+    description="Gemini vision: reads + translates every crop with page and series context.",
+    requires=("google.genai",),
+    needs_key="gemini_api_key",
+    offline=False,
+)
+def _build(settings, model: str | None = None, **_):
+    return GeminiTranslator(settings.gemini_api_key, model or settings.gemini_model)

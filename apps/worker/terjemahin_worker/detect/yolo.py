@@ -6,6 +6,8 @@ import numpy as np
 import onnxruntime as ort
 
 from ..models import TextRegion
+from ..registry import DETECTORS
+from .base import Detection
 from .onnx_common import letterbox, xywh_to_regions
 
 
@@ -29,10 +31,24 @@ class YoloDetector:
         self.conf = conf
         self.iou = iou
 
-    def detect(self, image_bgr: np.ndarray) -> list[TextRegion]:
+    def detect(self, image_bgr: np.ndarray) -> Detection:
         tensor, scale, pad = letterbox(image_bgr, self.size)
         (out,) = self.session.run(None, {self.input_name: tensor})
-        return decode_ultralytics(out, scale, pad, image_bgr.shape[1::-1], self.conf, self.iou)
+        return Detection(
+            decode_ultralytics(out, scale, pad, image_bgr.shape[1::-1], self.conf, self.iou)
+        )
+
+
+@DETECTORS.register(
+    "yolo",
+    description="YOLO11n fine-tuned on Manga109 / pseudo-labels (training/train.py). Boxes only.",
+)
+def _build(settings, conf: float | None = None, iou: float | None = None, weights=None):
+    return YoloDetector(
+        Path(weights or settings.yolo_weights),
+        settings.detect_conf if conf is None else conf,
+        settings.detect_iou if iou is None else iou,
+    )
 
 
 def decode_ultralytics(

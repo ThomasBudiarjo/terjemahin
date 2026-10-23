@@ -24,3 +24,5 @@ apps/worker/training/runs/
 # local run artifacts
 apps/worker/out/
 *.log
+apps/worker/weights/*
+!apps/worker/weights/README.md

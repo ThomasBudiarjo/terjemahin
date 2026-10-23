@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
+
+RGB = tuple[int, int, int]
+Point = tuple[int, int]
 
 
 class BBox(BaseModel):
@@ -40,9 +45,22 @@ class BBox(BaseModel):
 
 
 class TextRegion(BaseModel):
+    """A text block (usually one speech bubble's worth of text).
+
+    `lines` holds the individual text-line quads (4 points each, clockwise from top-left) when
+    the detector produces them; renderers and OCR may use them, but `bbox` is always valid.
+    """
+
     id: int
     bbox: BBox
     score: float = 1.0
+    lines: list[list[Point]] = Field(default_factory=list)
+    direction: Literal["h", "v"] = "v"
+    angle: float = 0.0
+    font_size: int | None = None  # estimated source glyph size in px
+    fg_color: RGB | None = None
+    bg_color: RGB | None = None
+    kind: Literal["text", "bubble", "sfx"] = "text"
 
 
 class Bubble(BaseModel):
@@ -52,6 +70,7 @@ class Bubble(BaseModel):
     source_text: str = ""
     target_text: str = ""
     speaker: str | None = None
+    ocr_confidence: float | None = None
 
 
 class GlossaryEntry(BaseModel):
@@ -73,10 +92,30 @@ class PageContext(BaseModel):
     style_notes: str | None = None
 
 
+class PipelineConfig(BaseModel):
+    """Which method runs at each stage, plus per-stage options.
+
+    `options` is keyed by stage name, e.g. {"inpainter": {"size": 1024}}. Unset method names
+    fall back to Settings defaults (env vars DETECTOR, OCR, TRANSLATOR, ...).
+    """
+
+    detector: str | None = None
+    ocr: str | None = None
+    translator: str | None = None
+    mask_refiner: str | None = None
+    inpainter: str | None = None
+    renderer: str | None = None
+    source_lang: str = "ja"
+    target_lang: str = "id"
+    options: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 class PageResult(BaseModel):
     bubbles: list[Bubble]
     width: int
     height: int
+    pipeline: PipelineConfig | None = None
+    timings: dict[str, float] = Field(default_factory=dict)
 
 
 class JobMessage(BaseModel):
@@ -86,3 +125,5 @@ class JobMessage(BaseModel):
     output_path: str
     result_path: str
     context: PageContext = Field(default_factory=PageContext)
+    pipeline: PipelineConfig | None = None
+    debug_dir: str | None = None

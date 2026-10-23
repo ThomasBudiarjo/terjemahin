@@ -5,7 +5,8 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
-from ..models import TextRegion
+from ..registry import DETECTORS
+from .base import Detection
 from .onnx_common import letterbox, xywh_to_regions
 
 CTD_URL = (
@@ -35,7 +36,7 @@ class CtdDetector:
         self.conf = conf
         self.iou = iou
 
-    def detect(self, image_bgr: np.ndarray) -> list[TextRegion]:
+    def detect(self, image_bgr: np.ndarray) -> Detection:
         tensor, scale, pad = letterbox(image_bgr, self.size)
         outputs = self.session.run(None, {self.input_name: tensor})
         blks = next(o for o in outputs if o.ndim == 3 and o.shape[-1] >= 6)[0]
@@ -43,4 +44,18 @@ class CtdDetector:
         obj = blks[:, 4]
         cls = blks[:, 5:].max(axis=1) if blks.shape[1] > 5 else np.ones_like(obj)
         scores = obj * cls
-        return xywh_to_regions(boxes, scores, scale, pad, image_bgr.shape[1::-1], self.conf, self.iou)
+        return Detection(
+            xywh_to_regions(boxes, scores, scale, pad, image_bgr.shape[1::-1], self.conf, self.iou)
+        )
+
+
+@DETECTORS.register(
+    "ctd_blk",
+    description="comic-text-detector pruned to the box head (training/prune_ctd.py). Boxes only.",
+)
+def _build(settings, conf: float | None = None, iou: float | None = None, weights=None):
+    return CtdDetector(
+        Path(weights or settings.ctd_weights),
+        settings.detect_conf if conf is None else conf,
+        settings.detect_iou if iou is None else iou,
+    )
