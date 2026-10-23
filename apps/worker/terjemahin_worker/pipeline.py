@@ -70,7 +70,7 @@ class Pipeline:
 
         t = time.perf_counter()
         detection = self.stage("detector", cfg).detect(page_bgr)
-        regions = sort_reading_order(detection.regions)
+        regions = sort_reading_order(detection.regions, image=page_bgr)
         timings["detect"] = time.perf_counter() - t
 
         t = time.perf_counter()
