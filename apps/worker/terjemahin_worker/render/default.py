@@ -14,7 +14,7 @@ import inspect
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,7 +36,7 @@ AUTO_STROKE = 0.14  # outline width as a fraction of the font size, when one is 
 MAX_SCALE = 1.0  # max Latin font size relative to the source glyph size
 MARGIN = 0.08  # interior inset as a fraction of the balloon's smaller side
 PADDING = 0.1  # clearance between glyphs and the interior edge, x font size
-OVERFLOW_SHRINK = 0.65  # how far below the page minimum a size may go before text overflows
+LEGIBLE = 0.9  # smallest size a translation is set at, x the page minimum; below it, it spills
 PAGE_ASPECT = 1.6  # long/short side of a page; a taller strip (webtoon) is many pages
 
 
@@ -46,6 +46,14 @@ def page_min_size(W: int, H: int) -> int:
     any of its balloons could hold, so every fit collapsed to one size and overflowed)."""
     short, long = min(W, H), max(W, H)
     return max(10, round((short + min(long, PAGE_ASPECT * short)) / 200))
+
+
+def legible_size(min_size: int) -> int:
+    """The floor of the overflow shrink. It went down to 0.65 x the page minimum (8 px at
+    worst) without a word: 'Diamlah!' came out at 11 px in a 45x200 px balloon of a 1149 px
+    page, most of the balloon empty. Below this size the text is set at it and spills out of
+    the balloon (with an outline), which reads better than type nobody can read."""
+    return min(min_size, max(11, round(LEGIBLE * min_size)))
 
 
 def luminance(c: RGB) -> float:
@@ -182,6 +190,10 @@ class DefaultRenderer:
         H, W = inpainted.shape[:2]
         balloons = [find_balloon(inpainted, original, b.region.bbox) for b in bubbles]
         split_shared(balloons, [b.region.bbox for b in bubbles])
+        balloons = [
+            bal if not bal.closed or _holds(bal, b.region.bbox) else replace(bal, closed=False)
+            for b, bal in zip(bubbles, balloons)
+        ]
         plans = []
         for b, bal in zip(bubbles, balloons):
             text = b.target_text.strip()
@@ -251,7 +263,7 @@ class DefaultRenderer:
             line_spacing=self.line_spacing,
             hyphenate=self.hyphenate,
             align=self.alignment,
-            padding=PADDING + self.colors(p, 100)[2] / 100,  # keep any outline clear too
+            padding=PADDING + self.colors(p, 100, spill=False)[2] / 100,  # outline clear too
         )
 
     # -- rendering --------------------------------------------------------------------------
@@ -265,17 +277,27 @@ class DefaultRenderer:
         if not bubbles:
             return inpainted_bgr.copy()
         min_size = self.min_font_size or page_min_size(W, H)
+        legible = self.min_font_size or legible_size(min_size)
         plans = self._plan(inpainted_bgr, original_bgr, bubbles)
         for p in plans:
+            # a tiny source glyph (a handwritten aside) still gets readable type
+            p.max_size = max(p.max_size, legible)
             lo = min(min_size, p.max_size)
             p.layout = self._fit(p, lo, p.max_size)
-            shrink = max(8, round(min_size * OVERFLOW_SHRINK))
-            if shrink >= lo:  # a balloon smaller than the page minimum: shrink from its own
-                shrink = max(8, round(lo * OVERFLOW_SHRINK))
-            if not p.layout.fits and shrink < lo:  # rather smaller than spilling out of the balloon
-                smaller = self._fit(p, shrink, p.max_size)
-                if smaller.fits:
-                    p.layout = smaller
+            if not p.layout.fits and legible < lo:  # rather smaller than spilling out
+                smaller = self._fit(p, legible, p.max_size)
+                p.layout = smaller if smaller.fits else self._fit(p, legible, legible)
+            if _free_column(p) and _in_margin(p, W) and _covers_art(inpainted_bgr, p):
+                # a tall narrow column of free text in the page margin (a note: "この物語は
+                # フィクションであり…"), set across a box widened to 3/4 of its height, covered
+                # the panel art beside it: run the translation down the column instead, as on
+                # a book's spine, when that keeps more of it inside the column. A tall open
+                # balloon inside the page ('でもねでもね', Arisa_010) keeps horizontal text.
+                side = _down_the_column(p)
+                side.layout = self._fit(side, legible, max(legible, p.max_size))
+                box = p.bubble.region.bbox
+                if side.layout.fits or _outside(side, box) < _outside(p, box):
+                    plans[plans.index(p)] = p = side
             if self.font_size_offset < 0 and p.layout.fits:
                 # never below the page minimum, nor below a size the overflow shrink chose
                 floor = min(min_size, p.layout.size)
@@ -294,17 +316,19 @@ class DefaultRenderer:
 
         pil = Image.fromarray(cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB))
         for p in plans:
-            self._draw(pil, p)
+            self._draw(pil, p, W, H)
             if not p.layout.fits:
-                log.warning("text overflows its balloon at %dpx: %r", p.layout.size, p.text)
+                log.warning("text does not fit its balloon at the legible minimum (%dpx), set "
+                            "spilling over it with an outline: %r", p.layout.size, p.text)
         self.plans = plans
         out = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
         if self.debug:
             out = self._debug_overlay(out, plans)
         return out
 
-    def colors(self, p: Plan, size: int) -> tuple[RGB, RGB, int]:
-        """(fill, stroke colour, stroke px)."""
+    def colors(self, p: Plan, size: int, spill: bool | None = None) -> tuple[RGB, RGB, int]:
+        """(fill, stroke colour, stroke px). `spill`: whether the text runs out of its balloon
+        (None: as its current layout does)."""
         r = p.bubble.region
         fg = self.fg_color or r.fg_color
         if fg is None:
@@ -319,10 +343,11 @@ class DefaultRenderer:
             sw = round(self.stroke_width * size)
         else:
             weak = abs(luminance(fg) - luminance(p.local_bg)) < LOW_CONTRAST
-            sw = max(2, round(AUTO_STROKE * size)) if (not p.closed or weak) else 0
+            spills = (p.layout is not None and not p.layout.fits) if spill is None else spill
+            sw = max(2, round(AUTO_STROKE * size)) if (not p.closed or weak or spills) else 0
         return tuple(fg), tuple(sc), sw  # type: ignore[return-value]
 
-    def _draw(self, pil: Image.Image, p: Plan) -> None:
+    def _draw(self, pil: Image.Image, p: Plan, W: int | None = None, H: int | None = None) -> None:
         lay = p.layout
         fg, sc, sw = self.colors(p, lay.size)
         if p.vertical:
@@ -332,10 +357,11 @@ class DefaultRenderer:
             return
         font = (p.measure or self.measure).font(lay.size)
         if not p.angle:
+            dx, dy = _onto_page(p, lay, sw, W or pil.width, H or pil.height)
             draw = ImageDraw.Draw(pil)
             for ln in lay.lines:
                 draw.text(
-                    (p.ox + ln.x, p.oy + ln.y),
+                    (p.ox + ln.x + dx, p.oy + ln.y + dy),
                     ln.text,
                     font=font,
                     fill=fg,
@@ -346,11 +372,17 @@ class DefaultRenderer:
             return
         # tilted text: draw upright in the de-rotated frame, rotate it back about its centre
         fw, fh = p.frame
-        layer = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
+        # a layer centred on the frame's centre, large enough for lines that spill out of it
+        lh = lay.line_height or lay.size
+        hw = max([fw / 2] + [max(abs(ln.x - fw / 2), abs(ln.x + ln.width - fw / 2)) for ln in lay.lines]) + sw + 2
+        hh = max([fh / 2] + [max(abs(ln.y - fh / 2), abs(ln.y + lh - fh / 2)) for ln in lay.lines]) + sw + 2
+        lw, lh2 = int(np.ceil(2 * hw)), int(np.ceil(2 * hh))
+        offx, offy = lw / 2 - fw / 2, lh2 / 2 - fh / 2
+        layer = Image.new("RGBA", (lw, lh2), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
         for ln in lay.lines:
             d.text(
-                (ln.x, ln.y),
+                (ln.x + offx, ln.y + offy),
                 ln.text,
                 font=font,
                 fill=(*fg, 255),
@@ -378,6 +410,111 @@ class DefaultRenderer:
                     for q in pts:
                         cv2.circle(out, q, 1, col, -1)
         return out
+
+
+def _holds(bal: Balloon, box: BBox) -> bool:
+    """Whether the balloon's usable interior (as `_shape` insets it) is where the text is: a
+    white page margin around a margin note passed as a 'closed balloon' whose inset interior
+    was a 1x19 px sliver beside the note, and the note was set far away from it."""
+    m = bal.mask
+    bb = bal.bbox
+    inset = max(3, round(MARGIN * min(bb.w, bb.h)))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inset + 1, 2 * inset + 1))
+    inner = cv2.erode(m, k, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    x1, y1 = max(0, box.x1 - bal.x0), max(0, box.y1 - bal.y0)
+    x2, y2 = max(0, box.x2 - bal.x0), max(0, box.y2 - bal.y0)
+    inside = inner[y1:y2, x1:x2]
+    return bool(inside.size) and float(inside.mean()) >= 0.25
+
+
+COLUMN_ASPECT = 4.0  # a free-text box this many times taller than wide is a column
+
+
+def _free_column(p: Plan) -> bool:
+    b = p.bubble.region.bbox
+    return (not p.closed and not p.vertical and not p.angle and b.h >= COLUMN_ASPECT * b.w
+            and p.bubble.region.direction == "v")
+
+
+def _outside(p: Plan, box: BBox) -> float:
+    """Area (px²) of a plan's text block, on the page, outside `box`."""
+    lay = p.layout
+    if not lay or not lay.lines:
+        return 0.0
+    lh = lay.line_height or lay.size
+    x1 = min(ln.x for ln in lay.lines)
+    x2 = max(ln.x + ln.width for ln in lay.lines)
+    y1 = min(ln.y for ln in lay.lines)
+    y2 = max(ln.y for ln in lay.lines) + lh
+    if p.angle:  # turned a quarter about the frame centre: the extents swap
+        fw, fh = p.frame
+        cx, cy = p.ox + fw / 2, p.oy + fh / 2
+        dx, dy = (x1 + x2) / 2 - fw / 2, (y1 + y2) / 2 - fh / 2
+        w, h = y2 - y1, x2 - x1
+        cx, cy = cx - dy, cy + dx
+        x1, x2, y1, y2 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+    else:
+        x1, x2, y1, y2 = p.ox + x1, p.ox + x2, p.oy + y1, p.oy + y2
+    iw = max(0.0, min(x2, box.x2) - max(x1, box.x1))
+    ih = max(0.0, min(y2, box.y2) - max(y1, box.y1))
+    return (x2 - x1) * (y2 - y1) - iw * ih
+
+
+MARGIN_BAND = 0.08  # share of the page width at each side where margin notes sit
+
+
+def _in_margin(p: Plan, W: int) -> bool:
+    """A column in the outer band of the page (beside the panels), not a tall balloon."""
+    b = p.bubble.region.bbox
+    return b.x1 >= (1 - MARGIN_BAND) * W or b.x2 <= MARGIN_BAND * W
+
+
+def _covers_art(img: np.ndarray, p: Plan) -> bool:
+    """Whether the box a free column's horizontal text is widened to (see `_shape`) covers
+    art rather than the paper the column sits on: then the text goes down the column."""
+    H, W = img.shape[:2]
+    b = p.bubble.region.bbox.clamp(W, H)
+    x1, y1 = int(max(0, p.ox)), int(max(0, p.oy))
+    x2, y2 = int(min(W, p.ox + p.frame[0])), int(min(H, p.oy + p.frame[1]))
+    if x2 - x1 <= b.w + 2 or y2 <= y1:
+        return False
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    zone = np.zeros(gray.shape, bool)
+    zone[y1:y2, x1:x2] = True
+    zone[b.y1 : b.y2, b.x1 : b.x2] = False
+    if not zone.any():
+        return False
+    tone = float(np.median(gray[b.y1 : b.y2, b.x1 : b.x2]))
+    return float((np.abs(gray[zone] - tone) <= 25).mean()) < 0.8
+
+
+def _down_the_column(p: Plan) -> Plan:
+    """The plan with its text laid out along the box's length and turned 90 degrees clockwise
+    (reading top to bottom), centred on the box."""
+    b = p.bubble.region.bbox
+    fw, fh = b.h, b.w  # frame before turning: as long as the box is tall
+    return replace(
+        p, shape=Shape.rect(float(fw), int(fh)), ox=b.cx - fw / 2, oy=b.cy - fh / 2,
+        angle=-90.0, frame=(int(fw), int(fh)), layout=None,
+    )
+
+
+def _onto_page(p: Plan, lay: Any, sw: int, W: int, H: int) -> tuple[float, float]:
+    """Shift that keeps a text block on the page: a balloon at the page edge (page01's
+    handwritten あとね) had its translation cut off by the edge."""
+    if not lay.lines:
+        return 0.0, 0.0
+    x1 = min(p.ox + ln.x for ln in lay.lines) - sw
+    x2 = max(p.ox + ln.x + ln.width for ln in lay.lines) + sw
+    y1 = min(p.oy + ln.y for ln in lay.lines) - sw
+    y2 = max(p.oy + ln.y for ln in lay.lines) + (lay.line_height or lay.size) + sw
+    dx = -x1 if x1 < 0 else (W - x2 if x2 > W else 0.0)
+    dy = -y1 if y1 < 0 else (H - y2 if y2 > H else 0.0)
+    if x2 - x1 > W:
+        dx = -x1
+    if y2 - y1 > H:
+        dy = -y1
+    return dx, dy
 
 
 def _bgr(img: np.ndarray) -> np.ndarray:

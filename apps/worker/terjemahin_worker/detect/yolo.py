@@ -41,7 +41,9 @@ class YoloDetector:
 
 @DETECTORS.register(
     "yolo",
-    description="YOLO11n fine-tuned on Manga109 / pseudo-labels (training/train.py). Boxes only.",
+    description="YOLO11n trained in this repo on synthetic pages + ctd pseudo-labels of page01 "
+    "views (training/README.md): page01 is in its training data. Boxes only; misses small "
+    "text on real B/W scans (Arisa_010 19/30), use ctd.",
 )
 def _build(settings, conf: float | None = None, iou: float | None = None, weights=None):
     from ..opts import as_float

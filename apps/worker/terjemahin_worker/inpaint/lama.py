@@ -57,10 +57,19 @@ class Tile:
     own: tuple[int, int, int, int]
 
 
+FLAT_INLIERS = 0.8  # share of the ring that must sit within 4 x tol of its median colour
+
+
 def flat_fill(
     img: np.ndarray, hole: np.ndarray, tol: float, ring: int = 3
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fill hole components whose surrounding ring is one flat colour; return (image, rest)."""
+    """Fill hole components whose surrounding ring is one flat colour; return (image, rest).
+
+    Flat means: the ring is uniform (std <= tol, 2-98% range <= 4 tol), or, on a noisy scan,
+    nearly all of it (FLAT_INLIERS) lies within 4 tol of its median and those pixels are
+    uniform (std <= 2 tol): scan grain, JPEG noise and the stretch of balloon outline a ring
+    brushes past (up to 1 - FLAT_INLIERS of it). Such holes went to LaMa before, which on B/W scans rebuilt dotted
+    ghosts of furigana and glyph fringes in plain white balloons (Arisa_010)."""
     out = img.copy()
     rest = hole.copy()
     n, labels, stats, _ = cv2.connectedComponentsWithStats(hole.astype(np.uint8), connectivity=8)
@@ -76,9 +85,17 @@ def flat_fill(
         if len(px) < 8:
             continue
         lo, hi = np.percentile(px, (2, 98), axis=0)
-        if px.std(axis=0).max() > tol or (hi - lo).max() > 4 * tol:
+        fill = None
+        if px.std(axis=0).max() <= tol and (hi - lo).max() <= 4 * tol:
+            fill = np.median(px, axis=0)
+        else:
+            med = np.median(px, axis=0)
+            inl = np.abs(px - med).max(axis=1) <= 4 * tol
+            if inl.mean() >= FLAT_INLIERS and px[inl].std(axis=0).max() <= 2 * tol:
+                fill = np.median(px[inl], axis=0)
+        if fill is None:
             continue
-        out[y1:y2, x1:x2][comp] = np.median(px, axis=0).round().astype(np.uint8)
+        out[y1:y2, x1:x2][comp] = fill.round().astype(np.uint8)
         rest[y1:y2, x1:x2][comp] = False
     return out, rest
 

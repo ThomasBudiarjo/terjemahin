@@ -133,6 +133,20 @@ class Pipeline:
                 f"'{cfg.translator}' only translates OCR text, so nothing would be translated"
             )
 
+    def detect(self, page_bgr: np.ndarray, cfg: PipelineConfig) -> tuple[Any, list[TextRegion]]:
+        """(raw detection, its regions refined from the pixels and in reading order).
+
+        Refinement (Settings.detect_refine, detect/postprocess.py) splits a box laid over two
+        balloons and grows a box that stops short of its text, whatever the detector."""
+        detection = self.stage("detector", cfg).detect(page_bgr)
+        regions = detection.regions
+        if self.settings.detect_refine:
+            from .detect.postprocess import refine_regions
+
+            regions = refine_regions(regions, page_bgr)
+        rtl = lang_code(cfg.source_lang) in RTL_SOURCES
+        return detection, sort_reading_order(regions, image=page_bgr, rtl=rtl)
+
     def min_confidence(self, cfg: PipelineConfig) -> float:
         v = cfg.min_ocr_confidence
         return float(self.settings.min_ocr_confidence if v is None else v)
@@ -152,9 +166,7 @@ class Pipeline:
         dbg: dict[str, np.ndarray] = {}
 
         t = time.perf_counter()
-        detection = self.stage("detector", cfg).detect(page_bgr)
-        rtl = lang_code(cfg.source_lang) in RTL_SOURCES
-        regions = sort_reading_order(detection.regions, image=page_bgr, rtl=rtl)
+        detection, regions = self.detect(page_bgr, cfg)
         detected = regions
         timings["detect"] = time.perf_counter() - t
 

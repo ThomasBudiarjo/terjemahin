@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # default method per stage (see `terjemahin-worker methods`)
     detector: str = "ctd"
     ocr: str = "manga_ocr"
-    translator: str = "nllb"
+    translator: str = "m2m100"  # best offline seq2seq on page01 + eval/fixtures/lines_ja_id.tsv
     mask_refiner: str = "default"
     inpainter: str = "lama_manga"
     renderer: str = "default"
@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     ctd_weights: Path = WORKER_ROOT / "weights" / "comictextdetector-blk.onnx"
     detect_conf: float = 0.4
     detect_iou: float = 0.5
+    # split boxes laid over two balloons, grow boxes that stop short of their text
+    # (detect/postprocess.py); applies to every detector
+    detect_refine: bool = True
     device: str = "cpu"  # torch-based methods: cpu | cuda | mps
 
     # llm / api translators

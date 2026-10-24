@@ -364,11 +364,13 @@ def _rules(v: Any, name: str) -> dict[str, str]:
 
 _KNOWN = {
     "nllb": ("facebook/nllb-200-distilled-600M", "nllb",
-             "NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): fluent ja->id; glossary + manga pre/post."),
+             ("NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): weaker than m2m100 on ja->id "
+             "(page01 8/13, held-out lines 19/36 adequate); strong en->id (local_llm's pivot).")),
     "nllb_big": ("facebook/nllb-200-distilled-1.3B", "nllb",
                  "NLLB-200 1.3B distilled (offline, downloads ~5GB on first use, slower)."),
     "m2m100": ("facebook/m2m100_418M", "m2m100",
-               "M2M100 418M (offline, fastest): ja->id on par with nllb-600M on page01; ja->en pivot."),
+               ("M2M100 418M (offline, fastest; the default): best offline seq2seq ja->id (page01 "
+               "10/13, held-out lines 23/36 adequate). One bubble at a time, no page context.")),
     "m2m100_big": ("facebook/m2m100_1.2B", "m2m100",
                    "M2M100 1.2B (offline, downloads ~5GB on first use)."),
 }

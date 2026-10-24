@@ -306,6 +306,7 @@ class LocalLLMTranslator:
         out, _ = tp.apply_glossary(text, context.glossary)
         if self.names:
             out, _ = tp.romanize_surnames(out)
+            out, _ = tp.romanize_kana_names(out)
             out = tp.map_honorifics(out)
         return out
 

@@ -1,0 +1,35 @@
+{
+ "image": "psimera_val_000005.jpg",
+ "source": "PSImera/manga_bubbles_detect (Hugging Face), images/val, CC BY-NC 4.0. Not in the YOLO training data (training/README.md used images/test and views of page01).",
+ "note": "Hand transcription (final fixer), dialogue only, with furigana over most kanji. 640x640 resize of a B/W page. The vertical margin disclaimer and the ザッ footsteps are listed as sfx (not scored). References are in plain standard Indonesian.",
+ "bubbles": [
+  {
+   "ja": "…ずっと",
+   "id_ref": "...Terus-menerus."
+  },
+  {
+   "ja": "同じ夢を見るんだ",
+   "id_ref": "Aku selalu memimpikan mimpi yang sama."
+  },
+  {
+   "ja": "開拓地で首を吊ったおじさんの夢だ",
+   "id_ref": "Mimpi tentang paman yang gantung diri di daerah pemukiman."
+  },
+  {
+   "ja": "何で首をくくる前に僕達にあんな話したんだろうって…",
+   "id_ref": "Kenapa dia menceritakan hal itu kepada kami sebelum gantung diri..."
+  },
+  {
+   "ja": "そんなの…",
+   "id_ref": "Hal seperti itu..."
+  },
+  {
+   "ja": "わかるわけないだろ",
+   "id_ref": "Mana mungkin kami tahu."
+  }
+ ],
+ "sfx": [
+  "★この物語はフィクションであり、実在の人物・団体・出来事などとは、一切関係ありません。",
+  "ザッ"
+ ]
+}

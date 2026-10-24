@@ -6,8 +6,9 @@ panel that touches its neighbour's frame still splits); a band of such rows beco
 if it runs along a frame edge, which tells a real gutter from a flat patch of sky inside a
 panel. Balloons and text boxes are ignored because they routinely cross gutters, and a small
 fraction of blocked pixels is tolerated for art that breaks out of its frame. Horizontal cuts
-come first (manga tiers); pieces of a vertical cut are read right-to-left (`rtl=False` for
-western comics). Inside a panel, blocks whose vertical spans overlap form a row read in the
+come first (manga tiers), except on a two-page spread and where full-height gutters cut the
+page into tall 4-koma strips: there the vertical cut comes first. Pieces of a vertical cut are
+read right-to-left (`rtl=False` for western comics). Inside a panel, blocks whose vertical spans overlap form a row read in the
 same horizontal direction; rows go top to bottom.
 """
 
@@ -89,12 +90,26 @@ def _xy_cut(
     depth: int = 0,
 ) -> None:
     x1, y1, x2, y2 = box
+    found = {}
     for axis in (0, 1):  # 0: horizontal cuts (tiers), 1: vertical cuts (columns)
         if axis == 0:
             sep, edge, lo, hi = maps.row_sep[y1:y2, x1:x2], maps.hedge[y1:y2, x1:x2], y1, y2
         else:
             sep, edge, lo, hi = maps.col_sep[y1:y2, x1:x2].T, maps.vedge[y1:y2, x1:x2].T, x1, x2
-        cuts = _cut_points(sep, edge, min_size, tol=0.12, support=0.4)
+        found[axis] = (_cut_points(sep, edge, min_size, tol=0.12, support=0.4), lo, hi)
+    order = (0, 1)
+    vcuts, vlo, vhi = found[1]
+    w = x2 - x1
+    if vcuts and depth == 0 and w >= SPREAD_ASPECT * (y2 - y1):
+        # two pages: cut at the gap between them only, each page is cut on its own
+        mid = min(vcuts, key=lambda c: abs(c - w / 2))
+        if abs(mid - w / 2) <= 0.15 * w:
+            found[1] = ([mid], vlo, vhi)
+            order = (1, 0)
+    elif vcuts and _strips(maps, vcuts, box):
+        order = (1, 0)
+    for axis in order:
+        cuts, lo, hi = found[axis]
         if cuts and depth < 12:
             bounds = [lo, *(lo + c for c in cuts), hi]
             spans = list(itertools.pairwise(bounds))
@@ -105,6 +120,27 @@ def _xy_cut(
                 _xy_cut(maps, sub, rtl, min_size, out, depth + 1)
             return
     out.append(box)
+
+
+SPREAD_ASPECT = 1.2  # a page this much wider than tall is two pages: read the right one first
+STRIP_ASPECT = 2.0  # columns this tall (h / w) are 4-koma strips: read each top to bottom
+
+
+def _strips(maps: _Maps, cuts: list[int], box: tuple[int, int, int, int]) -> bool:
+    """Whether full-height vertical cuts split the box into tall strips (4-koma columns),
+    which are read one after the other, each top to bottom, instead of tier by tier. A strip
+    gutter has panel frames along nearly all of its height; a cut that is gutter only because
+    it crosses white art in a wide panel below (the panel spans both "strips") does not."""
+    x1, y1, x2, y2 = box
+    bounds = [0, *cuts, x2 - x1]
+    if not all((y2 - y1) >= STRIP_ASPECT * (b - a) for a, b in itertools.pairwise(bounds)):
+        return False
+    reach = max(10, round(0.03 * (x2 - x1)))
+    for c in cuts:
+        band = maps.vedge[y1:y2, max(x1, x1 + c - reach) : min(x2, x1 + c + reach)]
+        if band.size == 0 or band.any(axis=1).mean() < 0.75:
+            return False
+    return True
 
 
 def find_panels(

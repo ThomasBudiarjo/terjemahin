@@ -918,6 +918,86 @@ def busy_box(c: Crop) -> np.ndarray:
     return cv2.dilate(c.lines.astype(np.uint8), ellipse(k)) * 255
 
 
+SWEEP_TOL = 20  # grey levels off the balloon's paper tone that count as leftover ink
+SWEEP_REACH = 1.0  # x font: how far from the text box the sweep looks
+SWEEP_FLAT = 0.85  # share of the balloon's paper within 20 levels of its tone (no screentone)
+
+
+def _sorted_box(r: TextRegion) -> TextRegion:
+    b = r.bbox
+    x1, x2 = sorted((b.x1, b.x2))
+    y1, y2 = sorted((b.y1, b.y2))
+    if (x1, y1, x2, y2) == (b.x1, b.y1, b.x2, b.y2):
+        return r
+    return r.model_copy(update={"bbox": BBox(x1=x1, y1=y1, x2=x2, y2=y2)})
+
+
+def balloon_sweep(
+    img: np.ndarray, regions: list[TextRegion], mask: np.ndarray
+) -> np.ndarray:
+    """The text's patch of a closed, flat, light balloon, leftover ink near the text included.
+
+    The glyph mask works from the detector's text lines and the glyph colour, so it misses
+    what lies beside them or is only faintly darker: furigana (Arisa_010: dotted ruby ghosts
+    over the translation), glyph pieces outside a short box, and the grey JPEG ringing around
+    strokes on a compressed scan (page01 at 0.75x, q75: 20 dark specks left). LaMa then also
+    rebuilds grey ghosts from those unmasked fringes. Inside a closed balloon whose paper is
+    flat, nothing near the text but text is darker than the paper, so every pixel there off
+    the paper tone by more than SWEEP_TOL joins the mask, and so does the paper between the
+    glyph masks (their union closed by ~0.3 font, within the text zone and the interior):
+    fewer, rounder holes with flat rings, which inpaint/lama.flat_fill fills exactly. Balloons with
+    screentone or a gradient inside, and text over art, are left to the glyph mask."""
+    from ..render.balloon import find_balloon
+
+    H, W = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    out = np.zeros((H, W), np.uint8)
+    # the balloon is found as on an inpainted page: masked glyphs painted over with the paper
+    # colour around them, so a dense box still samples paper, not ink
+    regions = [_sorted_box(r) for r in regions]
+    erased = img.copy()
+    for r in regions:
+        b = r.bbox.pad(2).clamp(W, H)
+        sel = mask[b.y1 : b.y2, b.x1 : b.x2] > 0
+        if not sel.any():
+            continue
+        ring = r.bbox.pad(max(4, font_size(r, img) // 2)).clamp(W, H)
+        around = img[ring.y1 : ring.y2, ring.x1 : ring.x2][mask[ring.y1 : ring.y2, ring.x1 : ring.x2] == 0]
+        if len(around) >= 8:
+            erased[b.y1 : b.y2, b.x1 : b.x2][sel] = np.median(around, axis=0).astype(np.uint8)
+    for r in regions:
+        b = r.bbox.clamp(W, H)
+        if b.w < 2 or b.h < 2:
+            continue
+        bal = find_balloon(erased, img, b)
+        if not bal.closed or sum(bal.color) / 3 < 180:
+            continue
+        ys, xs = bal.page_slice()
+        interior = cv2.erode(bal.mask, ellipse(7)) > 0
+        g = gray[ys, xs]
+        done = cv2.dilate((mask[ys, xs] > 0).astype(np.uint8), ellipse(5)) > 0
+        paper = interior & ~done
+        if paper.sum() < 32:
+            continue
+        tone = float(np.median(g[paper]))
+        if tone < 180 or (np.abs(g[paper] - tone) <= 20).mean() < SWEEP_FLAT:
+            continue
+        fs = font_size(r, img)
+        reach = max(3, round(SWEEP_REACH * fs))
+        zone = np.zeros(g.shape, bool)
+        zx1, zy1 = max(0, b.x1 - reach - bal.x0), max(0, b.y1 - reach - bal.y0)
+        zone[zy1 : max(0, b.y2 + reach - bal.y0), zx1 : max(0, b.x2 + reach - bal.x0)] = True
+        left = interior & zone & (np.abs(g - tone) > SWEEP_TOL) & (mask[ys, xs] == 0)
+        # the text's whole patch of balloon goes, not just the leftover pixels: thin strips of
+        # paper left between glyph masks are what LaMa grows dotted ghosts from, and one
+        # flat-ringed hole is filled with the paper colour exactly (inpaint/lama.flat_fill)
+        k = ellipse(2 * max(2, round(0.3 * fs)) + 1)
+        near = cv2.morphologyEx(((mask[ys, xs] > 0) | left).astype(np.uint8), cv2.MORPH_CLOSE, k)
+        near = (near > 0) | (cv2.dilate(left.astype(np.uint8), ellipse(5)) > 0)
+        out[ys, xs] |= ((near & interior & zone).astype(np.uint8) * 255)
+    return out
+
+
 METHODS = ("auto", "seg", "pixels")
 
 
@@ -941,6 +1021,7 @@ class GlyphMask:
         flat_spread: float = 40.0,
         method: str = "auto",
         glyphs: bool = True,
+        sweep: bool = True,
     ) -> None:
         if method not in METHODS:
             raise ValueError(f"mask method must be one of {METHODS}, got {method!r}")
@@ -950,6 +1031,7 @@ class GlyphMask:
         self.dilation, self.min_dilate = dilation, min_dilate
         self.ink, self.protect, self.flat_spread = ink, protect, flat_spread
         self.glyphs = glyphs
+        self.sweep = sweep
 
     def refine(
         self, image_bgr: np.ndarray, regions: list[TextRegion], raw_mask: np.ndarray | None
@@ -958,6 +1040,7 @@ class GlyphMask:
         H, W = img.shape[:2]
         raw = as_u8_mask(raw_mask, (H, W)) if self.method != "pixels" else None
         out = np.zeros((H, W), np.uint8)
+        erased: list[TextRegion] = []  # regions this refiner erases: the sweep extends those
         for r in regions:
             c = make_crop(r, img, self.reach)
             if c is None:
@@ -971,6 +1054,10 @@ class GlyphMask:
             else:
                 m = self._from_pixels(crop, c, img)
             out[c.sl] |= m
+            if m.any():
+                erased.append(r)
+        if self.sweep and erased:
+            out |= balloon_sweep(img, erased, out)
         return out
 
     def _from_seg(self, crop: np.ndarray, seg: np.ndarray, c: Crop, page: np.ndarray) -> np.ndarray:
@@ -1122,7 +1209,7 @@ class DilateMask:
 
 DEFAULT_OPTS = (
     "threshold", "strong", "reach", "grow", "dilation", "min_dilate", "ink", "protect",
-    "flat_spread", "method", "glyphs",
+    "flat_spread", "method", "glyphs", "sweep",
 )  # fmt: skip
 DILATE_OPTS = ("threshold", "reach", "dilation", "min_dilate", "flat_spread", "glyphs")
 
@@ -1153,6 +1240,7 @@ def _build_default(
     flat_spread: float = 40.0,
     method: str = "auto",
     glyphs: bool = True,
+    sweep: bool = True,
     **extra,
 ):
     _unknown("default", extra, DEFAULT_OPTS)
@@ -1168,6 +1256,7 @@ def _build_default(
         float(flat_spread),
         str(method),
         _bool(glyphs),
+        _bool(sweep),
     )
 
 

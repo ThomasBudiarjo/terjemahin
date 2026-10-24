@@ -134,6 +134,134 @@ def chrf(hyps: list[str], refs: list[str], word_order: int = 0, beta: float = 2.
     return chrf_score(acc, beta) if acc else 0.0
 
 
+# -- meaning conflicts (Indonesian) -------------------------------------------------------
+#
+# Sentence embeddings are close to bags of words: "Kau tidak akan pernah memaafkanku" and
+# "Aku nggak akan pernah memaafkanmu" score 0.94, "Aku marah pada guru" and "Aku dimarahi
+# guru" 0.84. These checks catch what they miss: a flipped negation, swapped or invented
+# participants, and an active verb where the reference has its passive (or the reverse).
+
+NEGATION = frozenset(
+    [
+        "tidak", "tak", "nggak", "ngga", "enggak", "engga", "gak", "ga", "kagak", "ndak", "bukan",
+        "bukannya", "jangan", "belum", "tanpa", "takkan", "tiada"
+    ]
+)
+FIRST = frozenset(["aku", "saya", "gue", "gua", "gw", "kami", "kita", "daku"])
+SECOND = frozenset(["kau", "kamu", "anda", "engkau", "lo", "lu", "elo", "elu", "kalian", "dikau"])
+THIRD = frozenset(["dia", "ia", "beliau", "mereka"])
+# words ending in -ku / -mu that carry no pronoun
+_KU_WORDS = frozenset(
+    [
+        "buku", "laku", "kuku", "saku", "suku", "paku", "baku", "taku", "liku", "siku"
+    ]
+)
+_MU_WORDS = frozenset(["ilmu", "jamu", "tamu", "temu", "jemu", "ramu", "kamu", "semu"])
+# di- words that are no passive verbs
+_DI_WORDS = frozenset(
+    [
+        "dia", "diri", "dini", "dingin", "dimana", "disini", "disana", "disitu", "dikit", "diam",
+        "diamlah", "dinding", "dirinya", "dirimu", "diriku", "dinas", "dina", "dia-dia", "dijah",
+        "digital", "dilema", "dimensi", "dinasti", "diet", "direktur", "diskon", "diskusi", "dosa"
+    ]
+)
+_WORD = re.compile(r"[a-z]+(?:-[a-z]+)*")
+_VERB_PREFIXES = ("me", "di", "ber", "ter", "ng")
+
+
+def _id_words(text: str) -> list[str]:
+    return _WORD.findall(text.lower())
+
+
+def persons(text: str, standalone: bool = False) -> list[int]:
+    """Grammatical persons in order of first mention: 1 (aku, -ku, ku-), 2 (kau, kamu, -mu,
+    kau-), 3 (dia, mereka, -nya on a verb). `standalone`: pronoun words only, the usual
+    subjects (an object suffix such as memaafkan-mu is often only implied in Japanese)."""
+    seen: list[int] = []
+
+    def add(p: int) -> None:
+        if p not in seen:
+            seen.append(p)
+
+    for w in _id_words(text):
+        base = w.split("-")[0]
+        if base in FIRST:
+            add(1)
+        elif base in SECOND:
+            add(2)
+        elif base in THIRD:
+            add(3)
+        elif standalone:
+            continue
+        elif len(w) > 4 and w.startswith("ku") and w[2] not in "aiueo" and w not in _KU_WORDS:
+            add(1)  # kubilang, kuaduin
+        elif len(w) > 5 and w.startswith("kau"):
+            add(2)  # kaulihat
+        elif len(w) > 3 and w.endswith("ku") and w not in _KU_WORDS:
+            add(1)  # namaku, memaafkanku
+        elif len(w) > 3 and w.endswith("mu") and w not in _MU_WORDS:
+            add(2)  # menurutmu, membuatmu
+        elif len(w) > 6 and w.endswith("nya") and w.startswith(_VERB_PREFIXES):
+            add(3)  # menyukainya, memukulnya (on a noun, -nya is mostly "the": skipped)
+    return seen
+
+
+def _negated(text: str) -> bool:
+    return any(w in NEGATION for w in _id_words(text))
+
+
+def _passive_roots(words: list[str]) -> set[str]:
+    out = set()
+    for w in words:
+        if len(w) >= 5 and w.startswith("di") and w not in _DI_WORDS and "-" not in w:
+            root = w[2:]
+            for suf in ("kannya", "nya", "kan", "in", "i"):
+                if root.endswith(suf) and len(root) - len(suf) >= 3:
+                    root = root[: -len(suf)]
+                    break
+            out.add(root)
+    return out
+
+
+def _active_use(root: str, words: list[str]) -> bool:
+    """`root` used without the passive di- (bare or with an active prefix)."""
+    for w in words:
+        if w.startswith(("di", "ter")):
+            continue
+        if w == root or (w.startswith(root) and len(w) - len(root) <= 3):
+            return True
+        for pre in ("me", "mem", "men", "meng", "meny", "ng", "nge"):
+            if w.startswith((pre + root, pre + root[1:])):
+                return True
+    return False
+
+
+def meaning_conflicts(hyp: str, ref: str) -> list[str]:
+    """Reasons a translation means something else than its (Indonesian) reference, beyond
+    what an embedding sees; [] when none is found. Heuristic and deliberately narrow."""
+    out = []
+    if not hyp.strip() or not ref.strip():
+        return out
+    if _negated(hyp) != _negated(ref):
+        out.append("negation")
+    ph, pr = persons(hyp), persons(ref)
+    sh, sr = set(ph), set(pr)
+    if (sh - sr) and (sr - sh):
+        out.append("participants")  # someone else does or undergoes it
+    elif (set(persons(hyp, standalone=True)) - sr) & {1, 2} and sr & {1, 2}:
+        out.append("participants")  # an "I" or "you" the reference does not have
+    elif len(sh & sr) >= 2:
+        common = [p for p in ph if p in sr]
+        if common != [p for p in pr if p in sh]:
+            out.append("roles")  # the same people, the other way round
+    wh, wr = _id_words(hyp), _id_words(ref)
+    if any(_active_use(r, wh) for r in _passive_roots(wr) - _passive_roots(wh)) or any(
+        _active_use(r, wr) for r in _passive_roots(wh) - _passive_roots(wr)
+    ):
+        out.append("voice")
+    return out
+
+
 # -- assignment ---------------------------------------------------------------------------
 
 
@@ -188,6 +316,7 @@ class Match:
     gt: int  # index into the GT bubbles
     cer: float  # normalised, punctuation kept
     cer_text: float  # punctuation and long-vowel marks ignored
+    coverage: float = 1.0  # share of the GT text (no punctuation) the read contains, in order
 
 
 @dataclass
@@ -202,12 +331,42 @@ class DetectionScore:
     missed: list[int] = field(default_factory=list)  # GT bubbles nothing matched
 
     @property
+    def partial(self) -> list[Match]:
+        """Matches whose box read less than PARTIAL_COVERAGE of the bubble's text: the
+        detector boxed part of it ("クン" for "ドクン", "はー" for "はーい"), so the rest of the
+        original stays on the page next to the translation."""
+        return [m for m in self.matches if m.coverage < PARTIAL_COVERAGE]
+
+    @property
     def mean_cer(self) -> float | None:
         return float(np.mean([m.cer for m in self.matches])) if self.matches else None
 
     @property
     def mean_cer_text(self) -> float | None:
         return float(np.mean([m.cer_text for m in self.matches])) if self.matches else None
+
+
+PARTIAL_COVERAGE = 0.75
+
+
+def lcs(a: str, b: str) -> int:
+    """Length of the longest common subsequence."""
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0]
+        for j, cb in enumerate(b, 1):
+            cur.append(prev[j - 1] + 1 if ca == cb else max(prev[j], cur[j - 1]))
+        prev = cur
+    return prev[-1]
+
+
+def coverage(hyp: str, ref: str) -> float:
+    """Share of `ref` (normalised, no punctuation) found in order in `hyp`; 1 when the read
+    is not shorter than the reference (a misread, not a cut-off box)."""
+    h, r = normalize_ja(hyp, punct=False), normalize_ja(ref, punct=False)
+    if not r or len(h) >= len(r):
+        return 1.0
+    return lcs(h, r) / len(r)
 
 
 def _contained(part: str, whole: str) -> bool:
@@ -243,7 +402,10 @@ def match_detections(
     ref = [normalize_ja(t, punct=False) for t in gt_texts]
     cost = np.array([[min(cer(h, r), 2.0) for r in ref] for h in hyp]).reshape(len(hyp), len(ref))
     matches = [
-        Match(d, g, cer(normalize_ja(det_texts[d]), normalize_ja(gt_texts[g])), float(cost[d, g]))
+        Match(
+            d, g, cer(normalize_ja(det_texts[d]), normalize_ja(gt_texts[g])), float(cost[d, g]),
+            coverage(det_texts[d], gt_texts[g]),
+        )
         for d, g in hungarian(cost)
         if cost[d, g] <= max_cer
     ]
@@ -570,6 +732,20 @@ def render_check(
         quads = [ink_lines(m.astype(np.uint8)) if ok else [] for m, ok in zip(mines, latin)]
         texts = reader(canvas, quads)
         reads = [(t if q else "") if ok else None for t, q, ok in zip(texts, quads, latin)]
+        # text the renderer turned a quarter (a margin note set down its column) is read
+        # turned back upright
+        for i, b in enumerate(bubbles):
+            angle = getattr(by_bubble.get(id(b)), "angle", 0.0)
+            if not latin[i] or abs(abs(angle) - 90) > 1 or not mines[i].any():
+                continue
+            ys, xs = np.nonzero(mines[i])
+            y1, y2 = max(0, ys.min() - 4), ys.max() + 5
+            x1, x2 = max(0, xs.min() - 4), xs.max() + 5
+            turn = cv2.ROTATE_90_COUNTERCLOCKWISE if angle < 0 else cv2.ROTATE_90_CLOCKWISE
+            sub = np.ascontiguousarray(cv2.rotate(canvas[y1:y2, x1:x2], turn))
+            m = np.ascontiguousarray(cv2.rotate(mines[i][y1:y2, x1:x2].astype(np.uint8), turn))
+            q = ink_lines(m)
+            reads[i] = reader(sub, [q])[0] if q else ""
     overlay = final.copy()
     results = []
     for i, (b, cont) in enumerate(zip(bubbles, conts)):

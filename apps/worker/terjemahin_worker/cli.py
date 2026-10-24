@@ -205,7 +205,6 @@ def detect(
     opt: list[str] = typer.Option([], "--opt"),
 ) -> None:
     """Debug: draw detected regions with their reading-order index."""
-    from .detect import sort_reading_order
     from .pipeline import Pipeline, draw_regions
 
     pipe = Pipeline(get_settings())
@@ -215,8 +214,7 @@ def detect(
         pipe.check(cfg, ("detector",))
     except (ValueError, FileNotFoundError) as e:
         raise _fail(e) from None
-    det = pipe.stage("detector", cfg).detect(page)
-    regions = sort_reading_order(det.regions, image=page)  # the ids translate assigns
+    det, regions = pipe.detect(page, cfg)  # the regions and ids translate uses
     out.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out), draw_regions(page, regions))
     if det.mask is not None:

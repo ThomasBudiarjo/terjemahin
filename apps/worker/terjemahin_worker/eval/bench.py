@@ -228,7 +228,10 @@ def score_detection(
         "gt_bubbles": s.n_gt,
         "detections": s.n_det,
         "matched": len(s.matches),
-        "recall": len(s.matches) / max(1, s.n_gt),
+        # a box that reads only part of its bubble leaves the rest of the original on the page
+        "partial": len(s.partial),
+        "partial_gt": [m.gt for m in s.partial],
+        "recall": (len(s.matches) - len(s.partial)) / max(1, s.n_gt),
         "false_positives": len(s.false_positives),
         "fragments": len(s.fragments),
         "duplicates": len(s.duplicates),
@@ -266,7 +269,9 @@ def score_translation(
         # embedding puts the Japanese to its reference
         sim[[not h.strip() or M.is_japanese(h) for h in hyps_all]] = 0.0
         own = np.diag(sim)
-        ok = own >= sim_min
+        # embeddings miss flipped negations, swapped roles and voice (metrics.meaning_conflicts)
+        conflicts = [M.meaning_conflicts(h, r) for h, r in zip(hyps_all, gt.id_ref)]
+        ok = (own >= sim_min) & np.array([not c for c in conflicts], bool)
         sem = {
             "semantic": {
                 "own_sim": [round(float(x), 3) for x in own],
@@ -275,6 +280,7 @@ def score_translation(
                 "adequate_frac": float(ok.mean()),
                 "aligned": int(sum(int(np.argmax(sim[g])) == g for g in range(len(own)))),
                 "inadequate_gt": [int(g) for g in np.flatnonzero(~ok)],
+                "conflicts": {int(g): c for g, c in enumerate(conflicts) if c},
             }
         }
     return sem | {
@@ -284,6 +290,7 @@ def score_translation(
         if matched
         else 0.0,
         "outputs": len(targets),
+        "has_refs": bool(gt.id_ref) and all(gt.id_ref),
         "empty": sum(not t.strip() for t in targets),
         "japanese": sum(M.is_japanese(t) for t in targets),
     }
@@ -397,7 +404,9 @@ def checks(m: dict, T: dict | None = None) -> dict[str, bool | None]:
         )
     if o:
         out["ocr"] = o["mean_cer"] is not None and o["mean_cer"] <= T["ocr_cer"]
-    if t:
+    if t and not t.get("has_refs", True):
+        out["translate"] = None  # no reference translations: chrF / meaning not measurable
+    elif t:
         sem = t.get("semantic")
         out["translate"] = (
             t["chrf"] >= T["chrf"]
@@ -727,7 +736,10 @@ def markdown(report: dict) -> str:
             "positives and duplicate detections; OCR = mean CER over matched bubbles; chrF vs `id_ref` "
             "(missing bubbles count as empty), e/j = empty / Japanese outputs; meaning = GT bubbles "
             f"whose translation has embedding cosine >= {THRESHOLDS['semantic_sim']} to its reference "
-            "(paraphrase-multilingual-MiniLM) and the mean cosine; "
+            "(paraphrase-multilingual-MiniLM) and no meaning conflict with it (flipped negation, "
+            "swapped or added participants, active for passive), and the mean cosine; "
+            "detection counts a bubble whose box covers less than 75% of its text as partial, "
+            "not found; "
             "residual = text regions the judge detector+OCR "
             "still reads inside erased areas / dark and off-tone (ghost) pixel shares left in "
             "erased balloon interiors; "
@@ -751,8 +763,11 @@ def markdown(report: dict) -> str:
         d, o, t, i, rd = (base.get(k) or {} for k in ("detection", "ocr", "translation", "inpaint", "render"))
         if d:
             L.append(
-                f"- **detect** {_ck(c.get('detect'))}: {d['matched']}/{d['gt_bubbles']} GT bubbles matched "
-                f"(need >= {T['detect_recall']:.0%}), {d['false_positives']} false positives, "
+                f"- **detect** {_ck(c.get('detect'))}: {d['matched']}/{d['gt_bubbles']} GT bubbles matched, "
+                f"{d.get('partial', 0)} of them partial (box covers < 75% of the text: "
+                f"{', '.join(map(str, d.get('partial_gt', []))) or 'none'}), "
+                f"{d['gt_bubbles'] - d['matched'] + d.get('partial', 0)} not fully found "
+                f"(need >= {T['detect_recall']:.0%} fully found), {d['false_positives']} false positives, "
                 f"{d['sfx_hits']} SFX regions, {d['fragments']} fragments, {d['duplicates']} duplicates, "
                 f"{base['regions_detected']} raw regions."
             )
@@ -768,13 +783,17 @@ def markdown(report: dict) -> str:
                 f"of {t['outputs']}; "
                 + (
                     f"meaning: {t['semantic']['adequate']}/{len(t['semantic']['own_sim'])} GT bubbles "
-                    f"adequate (cosine >= {T['semantic_sim']}, need >= {T['adequate_frac']:.0%}), mean "
+                    f"adequate (cosine >= {T['semantic_sim']} and no meaning conflict, need >= "
+                    f"{T['adequate_frac']:.0%}), mean "
                     f"cosine {_f(t['semantic']['mean_sim'], 3)}, {t['semantic']['aligned']} closest to "
                     f"their own reference; inadequate GT #"
                     + ", #".join(map(str, t["semantic"]["inadequate_gt"]))
+                    + "; conflicts: "
+                    + (", ".join(f"#{g} {'/'.join(c)}" for g, c in t["semantic"].get("conflicts", {}).items()) or "none")
                     + "."
                     if t.get("semantic")
-                    else "meaning NOT checked (embedding model unavailable)."
+                    else "meaning NOT checked ("
+                    + ("embedding model unavailable)." if t.get("has_refs", True) else "the GT has no id_ref).")
                 )
             )
         L.append(

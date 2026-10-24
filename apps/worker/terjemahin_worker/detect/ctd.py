@@ -7,7 +7,7 @@ import numpy as np
 from ..models import TextRegion
 from ..registry import DETECTORS
 from .base import Detection
-from .ctd_full import CtdFullDetector
+from .ctd_full import SPREAD_ASPECT, CtdFullDetector
 
 CTD_URL = (
     "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/"
@@ -53,6 +53,7 @@ def _build(
     weights=None,
     threads: int = 0,
     tile_aspect: float = 2.5,
+    spread: float = SPREAD_ASPECT,
     **extra,
 ):
     from ..opts import warn_unknown
@@ -64,4 +65,5 @@ def _build(
         iou,
         threads=threads,
         tile_aspect=tile_aspect,
+        spread=spread,
     )

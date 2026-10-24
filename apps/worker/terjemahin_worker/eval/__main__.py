@@ -1,4 +1,5 @@
-"""python -m terjemahin_worker.eval bench --page PAGE --gt GT.json --out out/bench [--matrix]"""
+"""python -m terjemahin_worker.eval bench --page PAGE --gt GT.json --out out/bench [--matrix]
+python -m terjemahin_worker.eval lines [--lines TSV] -t nllb -t m2m100 [--out DIR]"""
 
 from __future__ import annotations
 
@@ -91,6 +92,21 @@ def bench_cmd(
     base_run = report["runs"][0]
     if base_run.get("status") == "ok":
         typer.echo(json.dumps(base_run["checks"]))
+
+
+@app.command("lines")
+def lines_cmd(
+    lines: Annotated[Path, Opt("--lines", exists=True, help="TSV: ja<TAB>id_ref[<TAB>note]")] = Path(
+        "eval/fixtures/lines_ja_id.tsv"
+    ),
+    translator: Annotated[list[str] | None, Opt("--translator", "-t")] = None,
+    out: Annotated[Path | None, Opt("--out")] = None,
+) -> None:
+    """Translate held-out lines with each translator and score their meaning."""
+    from .lines import markdown, run
+
+    report = run(lines, translator or [get_settings().translator], out, get_settings())
+    typer.echo(markdown(report))
 
 
 if __name__ == "__main__":

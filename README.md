@@ -13,7 +13,7 @@ the web UI, the HTTP API or `.env`.
                      ┌──────────────────── apps/worker (Python) ──────────────────────┐
  CLI  ──────────────▶│                                                                │
  web UI / JSON API ─▶│  detect ─▶ OCR ─▶ translate ─▶ mask refine ─▶ inpaint ─▶ render │──▶ page.png
- (terjemahin-worker  │   ctd      manga  nllb         default        lama_manga  default │    + page.json
+ (terjemahin-worker  │   ctd      manga  m2m100       default        lama_manga  default │    + page.json
   web, :8000)        │            _ocr                                                │      (bubbles)
                      └───────────▲────────────────────────────────────────────────────┘
  apps/api (Go, :8080)            │ JobMessage (input path, PageContext, PipelineConfig)
@@ -43,7 +43,7 @@ use.
 | detector | classical | – | OpenCV only, no weights: white balloons + glyph projection + line merge. Misses text outside balloons. |
 | detector | **ctd** | weights | comic-text-detector, all heads: blocks + DBNet text lines + glyph mask (~0.6s CPU) |
 | detector | ctd_blk | `prune-ctd` ONNX | comic-text-detector pruned to the box head (training/prune_ctd.py). Boxes only. |
-| detector | yolo | trained ONNX | YOLO11n fine-tuned on Manga109 / pseudo-labels (training/train.py). Boxes only. |
+| detector | yolo | trained ONNX | YOLO11n trained in this repo on synthetic pages + ctd pseudo-labels of page01 views (training/README.md): page01 is in its training data. Boxes only; misses small text on real B/W scans (Arisa_010 19/30), use ctd. |
 | ocr | 48px | torch, weights | manga-image-translator 48px autoregressive OCR, per text line, beam search; predicts glyph/outline colours (torch, ~1-2s/page CPU) |
 | ocr | **manga_ocr** | weights | manga-ocr ViT+BERT on onnxruntime (split encoder/decoder, batched greedy). Japanese, whole-bubble crops. |
 | ocr | manga_ocr_hf | torch, HF | manga-ocr via transformers/torch (kha-white/manga-ocr-base); supports beam search. |
@@ -53,9 +53,9 @@ use.
 | translator | deepseek | `DEEPSEEK_API_KEY`, network | DeepSeek chat API (text only, JSON mode). |
 | translator | gemini | `GEMINI_API_KEY`, network | Gemini (REST): reads + translates every crop with page and series context when OCR is off, or translates OCR lines with the page image attached. |
 | translator | local_llm | torch, HF | Local chat LLM via transformers (offline; Qwen/Qwen2.5-3B-Instruct bf16, ~9.5GB RAM, 30-60 s/page on 4 CPU cores): whole page in one generation into English, NLLB to the target; glossary + previous pages, per-item fallback to m2m100. Opts: model, dtype, max_new_tokens, threads, pivot (en\|none), pivot_translator, fallback. |
-| translator | m2m100 | torch, HF | M2M100 418M (offline, fastest): ja->id on par with nllb-600M on page01; ja->en pivot. |
+| translator | **m2m100** | torch, HF | M2M100 418M (offline, fastest; the default): best offline seq2seq ja->id (page01 10/13, held-out lines 23/36 adequate). One bubble at a time, no page context. |
 | translator | m2m100_big | torch, HF | M2M100 1.2B (offline, downloads ~5GB on first use). |
-| translator | **nllb** | torch, HF | NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): fluent ja->id; glossary + manga pre/post. |
+| translator | nllb | torch, HF | NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): weaker than m2m100 on ja->id (page01 8/13, held-out lines 19/36 adequate); strong en->id (local_llm's pivot). |
 | translator | nllb_big | torch, HF | NLLB-200 1.3B distilled (offline, downloads ~5GB on first use, slower). |
 | translator | none | – | Erase text only: inpaint without typesetting. |
 | translator | ollama | Ollama server | Local LLM through Ollama's OpenAI-compatible endpoint (no key; vision=true for VLMs such as qwen2.5vl / gemma3; 900s timeout for CPU inference). |
@@ -85,7 +85,7 @@ uv pip install -p .venv/bin/python -e ".[torch,web,dev]" \
     --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
 cp ../../.env.example .env          # optional: defaults, API keys
 
-.venv/bin/terjemahin-worker fetch-weights      # optional: ~1 GB of ONNX/ckpt + NLLB (~2.5 GB)
+.venv/bin/terjemahin-worker fetch-weights      # optional: ~1 GB of ONNX/ckpt + M2M100 (~1.9 GB)
 .venv/bin/terjemahin-worker translate page.png -o out/page.png --debug-dir out/debug
 #   -> out/page.png, out/page.json (bubbles), out/debug/{detect,mask,inpainted,final}.png
 .venv/bin/python -m pytest -q
@@ -93,14 +93,15 @@ cp ../../.env.example .env          # optional: defaults, API keys
 
 Without `fetch-weights`, files download on first use. The CPU index installs the CPU torch
 wheel (~0.75 GB) instead of the CUDA build (several GB); drop those two flags for a GPU
-(`DEVICE=cuda`). Without the `torch` extra the default translator `nllb` is unavailable: use
+(`DEVICE=cuda`). Without the `torch` extra the default translator `m2m100` is unavailable: use
 an API translator, or `-t none` to only erase text.
 
 ## CLI by stage
 
 Every stage has a method flag and takes options as `--opt stage.key=value` (values are JSON;
 `true/false/yes/no/on/off/null` are understood; stage aliases `detect`, `mask`, `inpaint`,
-`render`, `translate`). Unknown methods or options fail before any stage runs.
+`render`, `translate`). Unknown methods and bad option values fail before any stage runs; an
+unknown option key is ignored with a warning that names it (check the log for typos).
 
 ```sh
 W=.venv/bin/terjemahin-worker

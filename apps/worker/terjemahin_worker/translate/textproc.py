@@ -375,6 +375,7 @@ class Prepared:
     terms: list[str] = field(default_factory=list)  # glossary targets the output must contain
     verbatim: str = ""  # the whole result, no model needed (a punctuation-only bubble)
     kanji: dict[str, str] = field(default_factory=dict)  # romaji -> kanji, for Chinese output
+    addressee: str = ""  # a leading name / form of address set off by a comma ("Senpai、")
 
 
 def _end_punct(text: str) -> str:
@@ -456,6 +457,62 @@ def romanize_surnames(text: str) -> tuple[str, list[str]]:
         return f" {name} "
 
     text = _SURNAME_RE.sub(sub, text)
+    text = re.sub(r"\s+([、。！？…])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip(), found
+
+
+# Hiragana first names (さくら, ゆい, けんた): MT garbles them ('Nama aku Saura', 'Sasura') or
+# translates them as words. They are romanised where the text itself marks them as names:
+# before an honorific (ゆいちゃん), or after 名前は / 名は (私の名前はさくらです).
+_KANA_HON = ("ちゃん", "くん", "さん", "さま", "せんぱい", "先輩", "君", "様")
+_KANA_HON_RE = re.compile(
+    rf"(?:(?<=[^ぁ-ゖ])|^|(?<=[はがをにともへの]))([ぁ-ゖ]{{2,4}})({'|'.join(_KANA_HON)})"
+)
+_KANA_NAME_IS = re.compile(r"(名前は|名は)([ぁ-ゖ]{2,5}?)(です|だよ|だ|って|でーす|と申し|。|！|!|、|$)")
+# hiragana words that take an honorific and are no names (おかあさん, みなさん, かみさま...)
+KANA_HONORIFIC_NOUNS = frozenset(_words(
+    "かあ とう にい ねえ ばあ じい おば おじ みな みんな あか ぼっ ぼう おきゃく きゃく かみ "
+    "ほとけ おまわり おいしゃ おひめ ひめ おうじ じょう おじょう せんせい おくさ おくさん だんな "
+    "おやぶん ぼうや おぼっ おとう おかあ おにい おねえ おばあ おじい あね あに おっちゃ "
+    "おばちゃ ばっちゃ じっちゃ かっちゃ ねぇ にぃ おにぃ おねぇ みなさ いもうと おとうと"
+))
+
+
+# 先輩 / 先生 said to someone ("先輩、好きです！") are forms of address, which scanlations keep:
+# m2m100 made "Tuanku" (my lord) and nllb dropped it. As a subject or object (先生に怒られた)
+# they stay words for the models to translate.
+_VOCATIVE = re.compile(r"^(先輩|せんぱい|センパイ|先生|せんせい)(?=[、，,！!？?…]|$)")
+_VOCATIVE_WORD = {"先輩": "Senpai", "せんぱい": "Senpai", "センパイ": "Senpai", "先生": "Sensei",
+                  "せんせい": "Sensei"}
+
+
+def romanize_vocative(text: str) -> tuple[str, list[str]]:
+    m = _VOCATIVE.match(text)
+    if not m:
+        return text, []
+    word = _VOCATIVE_WORD[m.group(1)]
+    return word + text[m.end():], [word]
+
+
+def romanize_kana_names(text: str) -> tuple[str, list[str]]:
+    """'ゆいちゃん' -> 'Yui-chan', '私の名前はさくらです' -> '私の名前はSakuraです'."""
+    found: list[str] = []
+
+    def hon(m: re.Match[str]) -> str:
+        word = m.group(1)
+        if word in KANA_HONORIFIC_NOUNS or word.startswith("お") or word[-1] in "はがをにもへの":
+            return m.group()
+        name = kana_to_romaji(word).capitalize()
+        found.append(name)
+        return f" {name}-{HONORIFICS[m.group(2)]} "
+
+    def named(m: re.Match[str]) -> str:
+        name = kana_to_romaji(m.group(2)).capitalize()
+        found.append(name)
+        return f"{m.group(1)} {name} {m.group(3)}"
+
+    text = _KANA_NAME_IS.sub(named, text)
+    text = _KANA_HON_RE.sub(hon, text)
     text = re.sub(r"\s+([、。！？…])", r"\1", text)
     return re.sub(r"\s{2,}", " ", text).strip(), found
 
@@ -729,10 +786,13 @@ def prepare(
     if names:
         before = text
         text, found = romanize_surnames(text)
+        text, kana = romanize_kana_names(text)
+        text, voc = romanize_vocative(text)
+        kana += voc
         if target in HAN_TARGETS:  # written back in kanji by finish(), wherever MT kept it
             kanji = surname_kanji(before, found)
         if target not in CJK_LANGS:  # Latin output must keep the name; Hangul/Han need not
-            terms += found
+            terms += found + kana
     text = map_honorifics(text)
 
     lead: list[str] = []
@@ -757,8 +817,11 @@ def prepare(
         text = "".join(segs)
     if hedge and text and HEDGES.get(target):
         trail.insert(0, f", {HEDGES[target]}")
+    m = re.match(r"([A-Z][A-Za-z']*(?:-[a-z]+)?)\s*[、，,]", text.strip())
+    addressee = m.group(1) if m and m.group(1).split("-")[0] in terms else ""
     return Prepared(
         text=text.strip(),
+        addressee=addressee,
         lead=" ".join(lead),
         trail=" ".join(trail),
         stutter=stutter,
@@ -899,7 +962,8 @@ def _set_end(text: str, end: str) -> str:
 # MT defaults to formal Indonesian (Saya/Anda); manga dialogue is casual (aku/kamu).
 CASUAL: dict[str, list[tuple[str, str]]] = {
     "id": [(r"\bAnda\b", "kamu"), (r"\banda\b", "kamu"), (r"\bSaya\b", "Aku"), (r"\bsaya\b", "aku"),
-           (r"\bKalian semua\b", "Kalian"), (r"\btidak apa-apa\b", "nggak apa-apa")],
+           (r"\bKalian semua\b", "Kalian"), (r"\btidak apa-apa\b", "nggak apa-apa"),
+           (r"\b([Nn])ama aku\b", r"\1amaku")],  # "Nama aku Sakura" -> "Namaku Sakura"
 }
 
 
@@ -962,8 +1026,13 @@ def _finish(prep: Prepared, output: str, target: str, casual: bool) -> str:
         out = restore_terms(out, prep.terms)
     if out and casual:
         out = apply_dict(out, CASUAL.get(iso(target)))
+    if out and prep.addressee and target not in CJK_LANGS:
+        # "Senpai、好きです！" -> "Senpai aku suka!": the vocative keeps its comma
+        out = re.sub(rf"^({re.escape(prep.addressee)}(?:-[a-z]+)?)(?=\s+[^\W\d_])", r"\1,", out)
     if prep.text and out and prep.lead:
         out = _decap(out, prep.terms)
+    if out and prep.trail and re.search(r"[、，,]\s*$", prep.text) and not re.search(r"[,.!?…]$", out):
+        out += ","  # "Yui-chan、" + "おはよう！" -> "Yui-chan, Selamat pagi!"
     if out and prep.trail.startswith(","):
         out = re.sub(r"\.+$", "", out)  # "lucu., gitu" -> "lucu, gitu"
     parts = [p for p in (prep.lead, out, prep.trail) if p]

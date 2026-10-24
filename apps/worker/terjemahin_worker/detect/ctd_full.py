@@ -53,14 +53,33 @@ def make_session(path: Path, heads: tuple[str, ...] = HEADS, threads: int = 0):
 MAX_UPSCALE = 2.0
 
 
+SPREAD_ASPECT = 1.2  # width / height from which a page is read as a two-page spread
+SPREAD_OVERLAP = 0.08  # share of the width each half reaches past the middle
+
+
 def plan_tiles(
-    w: int, h: int, size: int, tile_aspect: float, tile_shape: float = 1.5, overlap: float = 0.2
+    w: int,
+    h: int,
+    size: int,
+    tile_aspect: float,
+    tile_shape: float = 1.5,
+    overlap: float = 0.2,
+    spread: float = SPREAD_ASPECT,
 ) -> tuple[float, list[tuple[int, int, int, int]]]:
     """(ratio, tiles as x0, y0, x1, y1). Pages up to `tile_aspect` run in one letterboxed pass;
     taller (webtoon) or wider strips are cut into overlapping tiles of `tile_shape` (long/short,
-    about a manga page) along the long axis so text keeps the resolution of a normal page."""
+    about a manga page) along the long axis so text keeps the resolution of a normal page.
+
+    A landscape page from `spread` (w/h) up to `tile_aspect` is a two-page scan: one pass over
+    the whole of it shrinks its text by the spread's width (a 1654x1170 Manga109 spread to
+    62%, where 14 px glyphs fall below what the detector finds: on ARMS_015 three ドクン
+    balloons were missed or cut). It runs as two overlapping halves, each at about the scale
+    of a single page. `spread=0` turns this off."""
     long, short = max(w, h), min(w, h)
     if long <= tile_aspect * short:
+        if spread and w >= spread * h and w > size:
+            half = min(w, math.ceil(w / 2 + SPREAD_OVERLAP * w))
+            return size / max(half, h), [(0, 0, half, h), (w - half, 0, w, h)]
         return size / long, [(0, 0, w, h)]
     # never upscale a tile more than MAX_UPSCALE: an 8 px wide strip made 1024/12 = 85x tiles,
     # ~32 forward passes for a 300 px image (and a 100x12000 strip about 100)
@@ -96,6 +115,7 @@ class CtdFullDetector:
         tile_aspect: float = 2.5,
         mask_scope: str = "blocks",
         session=None,
+        spread: float = SPREAD_ASPECT,
     ) -> None:
         if mask_scope not in ("blocks", "page"):
             raise ValueError("mask_scope must be 'blocks' or 'page'")
@@ -112,6 +132,7 @@ class CtdFullDetector:
         split_gap = as_float(split_gap, "detector split_gap", 0.1)
         keep_scattered = as_bool(keep_scattered, "detector keep_scattered")
         tile_aspect = as_float(tile_aspect, "detector tile_aspect", 1.0)
+        self.spread = as_float(spread, "detector spread", 0.0)
         threads = as_int(threads, "detector threads", 0, 1024)
         self.session = session or make_session(weights, self.heads, threads)
         self.size = 1024
@@ -148,7 +169,19 @@ class CtdFullDetector:
         elif image_bgr.shape[2] == 4:
             image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_BGRA2BGR)
         H, W = image_bgr.shape[:2]
-        ratio, tiles = plan_tiles(W, H, self.size, self.tile_aspect)
+        ratio, tiles = plan_tiles(W, H, self.size, self.tile_aspect, spread=self.spread)
+        found = self._detect(image_bgr, ratio, tiles)
+        if len(tiles) == 2 and W >= self.spread * H and W <= self.tile_aspect * H:
+            # a spread read as two halves: one pass over the whole page as well, for the text
+            # the closer look misses (a small balloon pressed against another: ARMS_015)
+            whole = self._detect(image_bgr, self.size / max(W, H), [(0, 0, W, H)])
+            found = union_detections(found, whole)
+        return found
+
+    def _detect(
+        self, image_bgr: np.ndarray, ratio: float, tiles: list[tuple[int, int, int, int]]
+    ) -> Detection:
+        H, W = image_bgr.shape[:2]
         ww, wh = max(1, round(W * ratio)), max(1, round(H * ratio))
         seg = np.zeros((wh, ww), np.float32) if "seg" in self.heads else None
         det = np.zeros((wh, ww), np.float32) if "det" in self.heads else None
@@ -237,6 +270,52 @@ class CtdFullDetector:
         )
 
 
+def union_detections(main: Detection, extra: Detection, cover: float = 0.3) -> Detection:
+    """`main` plus what only `extra` found: each of extra's text lines that no main region
+    covers (overlap over the smaller box < `cover`), grouped by the extra region it came
+    from; for a region without lines, the region itself when no main region covers it.
+    The glyph masks are combined by maximum."""
+    from .postprocess import _qbox
+
+    def covered(b: BBox) -> bool:
+        return any(_overlap_small(b, r.bbox) >= cover for r in main.regions)
+
+    added: list[TextRegion] = []
+    for r in extra.regions:
+        if not r.lines:
+            if not covered(r.bbox):
+                added.append(r)
+            continue
+        free = []
+        for q in r.lines:
+            x1, y1, x2, y2 = _qbox(q)
+            if not covered(BBox(x1=x1, y1=y1, x2=x2 + 1, y2=y2 + 1)):
+                free.append(q)
+        if not free:
+            continue
+        boxes = [_qbox(q) for q in free]
+        bb = BBox(
+            x1=min(b[0] for b in boxes), y1=min(b[1] for b in boxes),
+            x2=max(b[2] for b in boxes) + 1, y2=max(b[3] for b in boxes) + 1,
+        )
+        added.append(r.model_copy(update={"bbox": bb, "lines": free}))
+    mask = main.mask
+    if mask is not None and extra.mask is not None and extra.mask.shape == mask.shape:
+        mask = np.maximum(mask, extra.mask)
+    regions = [*main.regions, *added]
+    if added:
+        log.info("spread: %d region(s) found only by the whole-page pass", len(added))
+    return Detection([r.model_copy(update={"id": i}) for i, r in enumerate(regions)], mask)
+
+
+def _overlap_small(a: BBox, b: BBox) -> float:
+    iw = min(a.x2, b.x2) - max(a.x1, b.x1)
+    ih = min(a.y2, b.y2) - max(a.y1, b.y1)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    return iw * ih / max(1, min(a.w * a.h, b.w * b.h))
+
+
 def merge_tile_blocks(
     xyxy: np.ndarray, scores: np.ndarray, at_cut: np.ndarray, iou: float
 ) -> np.ndarray:
@@ -321,6 +400,7 @@ def _build(
     tile_aspect: float = 2.5,
     mask_scope: str = "blocks",
     weights: str | None = None,
+    spread: float = SPREAD_ASPECT,
     **extra,
 ):
     warn_unknown("detector 'ctd'", extra)
@@ -339,4 +419,5 @@ def _build(
         threads=threads,
         tile_aspect=tile_aspect,
         mask_scope=mask_scope,
+        spread=spread,
     )

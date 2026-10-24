@@ -1,0 +1,41 @@
+# ja	id_ref	note
+# Held-out manga-style lines with hand-written Indonesian references. Lines 0-23 are the
+# held-out set judge 2 used (none of them was used to tune textproc); 24-31 add passives,
+# roles and negation; 32-35 test hiragana first names (used while fixing name romanisation,
+# so they are NOT held out for that fix).
+お前、何してんだよ！	Kamu lagi ngapain sih!	
+別に、あんたのためじゃないんだからね！	Ini bukan buat kamu, tahu!	
+遅刻だ遅刻！	Telat, telat!	
+このままじゃ負けちまう…	Kalau begini terus, kita bakal kalah...	
+絶対に許さない！	Nggak akan pernah kumaafkan!	
+腹減ったー	Aduh, lapar...	
+待たせたな	Maaf ya, aku bikin kamu nunggu lama.	
+嘘でしょ？	Bercanda, kan?	
+先輩、好きです！	Senpai, aku suka kamu!	
+何度言ったらわかるんだ	Harus berapa kali kubilang baru kamu ngerti?	
+今日の放課後、屋上に来て	Nanti pulang sekolah, datang ke atap ya.	
+俺はもう逃げない	Aku nggak akan lari lagi.	
+あいつ、いつも一人で弁当食べてるよな	Dia selalu makan bekal sendirian, ya.	
+まさか、お前が犯人だったとは…	Jadi kamu pelakunya... Sulit dipercaya.	
+手伝ってくれてありがとう、助かったよ	Makasih sudah membantu, sangat menolong.	
+ちょっと、どこ見てんのよ！	Hei, kamu lihat ke mana sih!	
+それって、デートってこと？	Maksudnya, itu kencan?	
+心配すんな、俺に任せとけ	Jangan khawatir, serahkan padaku.	
+宿題やった？	Kamu sudah mengerjakan PR?	
+田中くんって、意外と優しいんだね	Tanaka-kun ternyata baik juga, ya.	
+うるさいなぁ、もう寝かせてよ	Berisik ah, biarin aku tidur dong.	
+行ってきます！	Aku berangkat dulu!	
+君の笑顔が見たいんだ	Aku ingin melihat senyummu.	
+一体どういうつもりだ？	Sebenarnya apa maksudmu?	
+先生に怒られた	Aku dimarahi guru.	
+あいつに嫌われてるかも	Mungkin dia membenciku.	
+一緒に帰ろうよ	Ayo pulang bareng.	
+わかった、行くよ	Oke, aku pergi.	
+もう二度と会えないの？	Kita nggak bisa ketemu lagi?	
+そんなこと言ってないよ	Aku nggak bilang begitu.	
+彼に助けられた	Aku diselamatkan olehnya.	
+泣かないで	Jangan menangis.	
+私の名前はさくらです	Namaku Sakura.	names
+ゆいちゃん、おはよう！	Pagi, Yui-chan!	names
+けんたくんはどこ？	Kenta-kun di mana?	names
+めいは坂本のことどう思う？	Mei, menurutmu Sakamoto itu gimana?	names
