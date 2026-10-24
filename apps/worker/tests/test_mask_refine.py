@@ -9,9 +9,11 @@ from terjemahin_worker.mask import MASK_REFINERS
 from terjemahin_worker.mask.refine import (
     DilateMask,
     GlyphMask,
+    color_distance,
     crossing_lines,
     find_paper,
     font_size,
+    line_colors,
     make_crop,
 )
 from terjemahin_worker.models import BBox, TextRegion
@@ -613,3 +615,96 @@ def test_box_only_keeps_neighbour_glyph_outside_box(cls):
     assert not m[dot > 0].any()
     text = (img[182:230, 195:355, 0] < 128).astype(np.float32)
     assert covered(m[182:230, 195:355].astype(np.uint8) * 255, text, 0.5) == 1.0
+
+
+JP_FONT = Path("/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf")
+
+
+def jp_page(text, size, vert, xy, bg, lines, line_bgr, pad):
+    """Page-sized flat paper, Japanese text (IPAGothic, strokes thickened to about the art
+    lines' width) drawn over art lines that run through it and far past the box. Returns
+    image, box-only region, glyph alpha and line alpha."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    H, W = 600, 800
+    pil = Image.new("L", (W, H))
+    draw, font = ImageDraw.Draw(pil), ImageFont.truetype(str(JP_FONT), size)
+    for k, ch in enumerate(text if vert else [text]):
+        draw.text((xy[0], xy[1] + k * size), ch, font=font, fill=255)
+    glyphs = cv2.dilate(np.array(pil), np.ones((size // 14, size // 14), np.uint8))
+    art = np.zeros((H, W), np.uint8)
+    for x1, y1, x2, y2, t in lines:
+        cv2.line(art, (x1, y1), (x2, y2), 255, t, cv2.LINE_AA)
+    img = blend(blend(np.full((H, W, 3), bg, np.uint8), art, line_bgr), glyphs, (5, 5, 5))
+    ys, xs = np.nonzero(glyphs > 30)
+    box = BBox(
+        x1=int(xs.min()) - pad,
+        y1=int(ys.min()) - pad,
+        x2=int(xs.max()) + 1 + pad,
+        y2=int(ys.max()) + 1 + pad,
+    )
+    return img, TextRegion(id=0, bbox=box), glyphs, art
+
+
+JP_CROSSED = [  # whole kana / kanji were left on flat paper before; lines of another colour
+    ("ガタン", 36, True, (246, 180), (144, 229, 129), [(1129, -251, -619, 717, 5)], (22, 66, 33), 24),
+    ("好き", 48, False, (281, 241), (141, 229, 159),
+     [(-541, -184, 1241, 722, 5), (-568, -165, 1230, 707, 5)], (72, 106, 95), 22),
+    ("もじもじ", 37, False, (298, 159), (242, 157, 219),
+     [(452, -809, 185, 1171, 5), (1418, 156, -580, 229, 5)], (43, 86, 30), 4),
+    ("ガタン", 46, True, (324, 151), (171, 161, 243), [(318, -811, 389, 1187, 3)], (30, 55, 126), 1),
+]  # fmt: skip
+JP_SAME = [  # lines as black as the text
+    ("すっ", 38, True, (228, 208), (199, 152, 246), [(-697, -77, 1173, 629, 3)], (8, 8, 8), 16),
+    ("ふふっ", 40, False, (227, 249), (147, 202, 193),
+     [(884, -517, -364, 1043, 3), (-461, -343, 1131, 867, 5)], (8, 8, 8), 10),
+    ("バン！", 39, True, (321, 166), (236, 232, 226), [(-642, 227, 1356, 244, 5)], (8, 8, 8), 14),
+]  # fmt: skip
+
+
+def off_line(glyphs: np.ndarray, art: np.ndarray, px: int = 4) -> np.ndarray:
+    return (glyphs > 128) & ~(cv2.dilate(art, np.ones((2 * px + 1,) * 2, np.uint8)) > 0)
+
+
+@pytest.mark.skipif(not JP_FONT.exists(), reason="IPAGothic missing")
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize("case", range(len(JP_CROSSED)))
+def test_box_only_jp_glyphs_crossed_by_contrasting_line(cls, case):
+    """A glyph an art line of another colour runs through is erased whole on flat paper,
+    its pixels on the line too; the line away from the text stays."""
+    img, region, glyphs, art = jp_page(*JP_CROSSED[case])
+    m = cls().refine(img, [region], None) > 0
+    assert m[glyphs > 128].mean() > 0.92
+    assert m[off_line(glyphs, art)].mean() > 0.97
+    far = far_from(glyphs, art, region)
+    assert far.any() and m[far].mean() < 0.005
+
+
+@pytest.mark.skipif(not JP_FONT.exists(), reason="IPAGothic missing")
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize("case", range(len(JP_SAME)))
+def test_box_only_jp_glyphs_beside_line_of_text_colour(cls, case):
+    """A line as dark as the text cannot be told from it by colour, but a glyph lying beside
+    it (not carrying it on, as the rest of a cut balloon outline does) is erased all but the
+    pixels on the line, and the line goes on through: the dilation stops at it."""
+    img, region, glyphs, art = jp_page(*JP_SAME[case])
+    m = cls().refine(img, [region], None) > 0
+    assert m[off_line(glyphs, art)].mean() > 0.99
+    assert m[(art > 200) & (glyphs == 0)].mean() < 0.05
+    assert not m[far_from(glyphs, art, region)].any()
+
+
+@pytest.mark.skipif(not JP_FONT.exists(), reason="IPAGothic missing")
+def test_line_colour_is_sampled_clear_of_the_text():
+    """Near the text the line mask holds glyph strokes too: the line's colour is taken where
+    it runs clear of the box, not from them."""
+    img, region, glyphs, _ = jp_page(*JP_CROSSED[0])
+    c = make_crop(region, img, 0.5)
+    crop = img[c.sl]
+    _, dist, _, cn = find_paper(crop, c, 40.0)
+    lines = crossing_lines(dist > 40, cn, cn.font)
+    lab, colors = line_colors(crop, lines, dist, cn)
+    main = np.bincount(lab[lines]).argmax()
+    near = lab == main
+    assert (near & (glyphs[c.sl] > 128)).sum() > 20  # the case this is about
+    assert color_distance(colors[main][None, None], np.float32((22, 66, 33)))[0, 0] < 12

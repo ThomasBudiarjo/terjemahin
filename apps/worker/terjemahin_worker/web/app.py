@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import secrets
+import shutil
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -31,8 +32,9 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from ..config import Settings, get_settings
+from ..imageio import ImageError, decode_image
 from ..models import Bubble, PageContext, PageResult, PipelineConfig
-from ..pipeline import Pipeline
+from ..pipeline import Pipeline, lang_code
 from ..registry import REGISTRIES, STAGES, load_all
 
 log = logging.getLogger(__name__)
@@ -94,6 +96,14 @@ class WebPipeline(Pipeline):
         inst = super().stage(stage, cfg)
         return _MaskTap(inst) if stage == "detector" else inst
 
+    def check(self, cfg: PipelineConfig, stages: tuple[str, ...] = STAGES) -> None:
+        sink = getattr(_progress, "job", None)
+        _progress.job = None  # building the stages up front is not running them
+        try:
+            super().check(cfg, stages)
+        finally:
+            _progress.job = sink
+
 
 class _MaskTap:
     def __init__(self, inner: Any) -> None:
@@ -110,11 +120,7 @@ class _MaskTap:
 
 def erase_key(bubbles: list[Bubble], cfg: PipelineConfig) -> str:
     """Identity of a mask+inpaint result: if unchanged, re-typesetting only re-renders."""
-    erase = [
-        b.region.model_dump(include={"bbox", "lines"})
-        for b in bubbles
-        if b.source_text.strip() or b.target_text.strip()
-    ]
+    erase = [b.region.model_dump(include={"bbox", "lines"}) for b in bubbles if b.erases()]
     parts = [erase] + [[getattr(cfg, s), cfg.options.get(s, {})] for s in COMPOSE_STAGES[:2]]
     return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -163,6 +169,34 @@ class JobStore:
             tmp.write_text(job.model_dump_json())
             tmp.replace(d / "job.json")
 
+    def prune(self, keep: int) -> list[str]:
+        """Delete the oldest finished jobs beyond `keep` (each holds ~5 full-size PNGs)."""
+        if keep <= 0 or not self.root.exists():
+            return []
+        dirs = [d for d in self.root.iterdir() if d.is_dir() and JOB_ID.match(d.name)]
+        if len(dirs) <= keep:
+            return []
+
+        def mtime(d: Path) -> float:
+            try:
+                return (d / "job.json").stat().st_mtime
+            except OSError:
+                return d.stat().st_mtime
+
+        dirs.sort(key=mtime)
+        removed = []
+        for d in dirs[: len(dirs) - keep]:
+            with self.lock:
+                live = self.jobs.get(d.name)
+                if live is not None and live.status in ("queued", "running"):
+                    continue
+                self.jobs.pop(d.name, None)
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(d.name)
+        if removed:
+            log.info("removed %d old web jobs (keeping %d)", len(removed), keep)
+        return removed
+
     def get(self, job_id: str) -> Job:
         if not JOB_ID.match(job_id):
             raise HTTPException(404, "job not found")
@@ -173,6 +207,12 @@ class JobStore:
             if not f.exists():
                 raise HTTPException(404, "job not found")
             job = Job.model_validate_json(f.read_text())
+            if job.status in ("queued", "running"):
+                # only this process runs jobs: one on disk but not in memory was cut short by a
+                # restart and would otherwise poll as "running" forever
+                job.status, job.stage = "failed", None
+                job.error = "interrupted: the server stopped before the job finished; run it again"
+                self.save(job)
             with self.lock:
                 self.jobs[job_id] = job
         return job
@@ -267,7 +307,8 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         if key == job.erase_key and (d / "inpainted.png").exists():
             inpainted = cv2.imread(str(d / "inpainted.png"))
             t0 = time.perf_counter()
-            render = [b for b in bubbles if b.target_text]
+            pipe.check(cfg, ("renderer",))
+            render = [b for b in pipe.sanitize(page, bubbles) if b.target_text.strip()]
             out = pipe.stage("renderer", cfg).render(inpainted, render, page)
             t["render"] = time.perf_counter() - t0
             dbg = {"final": out}
@@ -315,11 +356,19 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         data = await file.read(MAX_UPLOAD + 1)
         if len(data) > MAX_UPLOAD:
             raise HTTPException(413, "image larger than 25 MB")
-        page = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if page is None:
-            raise HTTPException(400, "file is not a readable image")
+        if not data:
+            raise HTTPException(400, "file is empty")
+        try:
+            page = decode_image(data, settings.max_pixels, name="file")
+        except ImageError as e:
+            raise HTTPException(413 if "limit" in str(e) else 400, str(e)) from None
         cfg = pipe.resolve(_json_field(pipeline, PipelineConfig, "pipeline"))
         _check_methods(cfg, settings, STAGES)
+        for what, lang in (("source_lang", cfg.source_lang), ("target_lang", cfg.target_lang)):
+            try:
+                lang_code(lang)
+            except ValueError as e:
+                raise HTTPException(400, f"{what}: {e}") from None
         job = Job(
             id=secrets.token_hex(8),
             pipeline=cfg,
@@ -328,6 +377,7 @@ def create_app(settings: Settings | None = None, pipeline: Pipeline | None = Non
         store.dir(job.id).mkdir(parents=True, exist_ok=True)
         _write_png(store.dir(job.id) / "input.png", page)
         store.save(job)
+        store.prune(settings.web_keep_jobs)
         fut = asyncio.get_running_loop().run_in_executor(executor, run_job, job)
         if (wait or "true").strip().lower() not in {"0", "false", "no", "off"}:
             await fut

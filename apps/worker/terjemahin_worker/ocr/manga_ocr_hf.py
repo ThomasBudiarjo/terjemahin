@@ -23,7 +23,10 @@ class MangaOcrHF(MangaOcrBase):
         from huggingface_hub import hf_hub_download
         from transformers import VisionEncoderDecoderModel
 
+        from ..opts import as_int
+
         super().__init__(**opts)
+        beams = as_int(beams, "ocr beams", 1, 32)
         self.torch = torch
         self.model = VisionEncoderDecoderModel.from_pretrained(repo).to(device).eval()
         local = Path(repo) / "vocab.txt"  # a training/train_ocr.py checkpoint dir

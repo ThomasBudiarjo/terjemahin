@@ -122,7 +122,13 @@ class FontMeasure:
             if not self.has_glyph(ch) and ch in ASCII_FALLBACK:
                 ch = ASCII_FALLBACK[ch]
             out.append(ch)
-        return " ".join("".join(out).split())
+        return clean_text("".join(out))
+
+
+def clean_text(text: str) -> str:
+    """Collapse spaces but keep the line breaks a user typed ('a\\n\\nb' keeps its blank line)."""
+    lines = [" ".join(ln.split()) for ln in text.replace("\r\n", "\n").split("\n")]
+    return "\n".join(lines).strip("\n ")
 
 
 @dataclass
@@ -208,7 +214,8 @@ class Line:
     x: float
     y: float  # top (ascender) anchor in shape coordinates
     width: float
-    join: Literal["space", "soft", "none", "end"] = "end"  # how it continues on the next line
+    # how it continues on the next line; "hard": a line break typed in the text
+    join: Literal["space", "soft", "none", "end", "hard"] = "end"
 
 
 @dataclass
@@ -228,6 +235,8 @@ class Layout:
                 out += ln.text.removesuffix("-")
             elif ln.join == "space":
                 out += ln.text + " "
+            elif ln.join == "hard":
+                out += ln.text + "\n"
             else:
                 out += ln.text
         return out.strip()
@@ -237,11 +246,30 @@ class Layout:
 class _Frag:
     text: str
     width: float
-    join: Literal["space", "soft", "none", "end"]  # what follows: word gap, hyphen point, ...
+    # what follows: word gap, hyphen point, nothing, end of text, a typed line break
+    join: Literal["space", "soft", "none", "end", "hard"]
 
 
 def _fragments(text: str, size: int, m: Measure, hyphenate: int) -> list[_Frag]:
-    """hyphenate: 0 never, 1 not names (capitalised mid-sentence), 2 any word."""
+    """hyphenate: 0 never, 1 not names (capitalised mid-sentence), 2 any word. A line break
+    in the text ends a line there ('hard'); an empty line stays an empty line."""
+    frags: list[_Frag] = []
+    paras = text.split("\n")
+    for i, para in enumerate(paras):
+        frags += _para_fragments(para, size, m, hyphenate)
+        if i < len(paras) - 1:
+            if frags and frags[-1].join == "space" and para.strip():
+                frags[-1].join = "hard"
+            else:  # an empty line: one empty fragment of its own
+                frags.append(_Frag("", 0.0, "hard"))
+    while frags and frags[-1].join == "hard" and not frags[-1].text:
+        frags.pop()
+    if frags:
+        frags[-1].join = "end"
+    return frags
+
+
+def _para_fragments(text: str, size: int, m: Measure, hyphenate: int) -> list[_Frag]:
     frags: list[_Frag] = []
     sentence_start = True
     for word in text.split():
@@ -255,8 +283,6 @@ def _fragments(text: str, size: int, m: Measure, hyphenate: int) -> list[_Frag]:
                 join = "soft" if k < len(subs) - 1 else ("none" if j < len(hard) - 1 else "space")
                 frags.append(_Frag(sub, m.width(sub, size), join))  # type: ignore[arg-type]
         sentence_start = word.rstrip("\"')»").endswith((".", "!", "?", "…"))
-    if frags:
-        frags[-1].join = "end"
     return frags
 
 
@@ -327,6 +353,10 @@ def _break(
             if base == INF:
                 continue
             for b in [m] if last_line else range(a + 1, m - (n - i - 1) + 1):
+                if b - 1 > a and frags[b - 2].join == "hard":
+                    break  # a typed line break inside this line
+                if last_line and any(f.join == "hard" for f in frags[a : b - 1]):
+                    break
                 w = width(a, b)
                 if w > cap:
                     break
@@ -389,7 +419,7 @@ def _try_size(
     widest = max(shape.right - shape.left)
     if widest <= 0:
         return None
-    n_min = max(1, math.ceil(total / widest))
+    n_min = max(1, math.ceil(total / widest), 1 + sum(f.join == "hard" for f in frags))
     n_max = int((shape.height - (ink_bottom - ink_top)) // pitch) + 1
     cy = shape.vertical_center()
     best: _Try | None = None
@@ -413,7 +443,9 @@ def _try_size(
             res = _break(frags, caps, space_w, hyphen_w, ladder=force_chars or hyphenate >= 2)
             if res is None:
                 continue
-            cost = res[0] / n + OFFSET_COST * abs(k)
+            # one line has nothing to balance: its raggedness would only pull it to where the
+            # balloon is narrowest (a lone '?' sat at the top of its balloon)
+            cost = (res[0] / n if n > 1 else 0.0) + OFFSET_COST * abs(k)
             if best is None or cost < best.cost:
                 best = _Try(cost, frags, res[1], top, pitch)
     return best
@@ -511,7 +543,7 @@ def fit(
     overflows, the shape is widened step by step (and over-long words broken by character) so
     the result always contains every word; `fits` is then False.
     """
-    text = " ".join(text.split())
+    text = clean_text(text)
     if not text or shape.height == 0:
         return Layout(size=min_size, fits=not text)
     max_size = max(min_size, max_size)

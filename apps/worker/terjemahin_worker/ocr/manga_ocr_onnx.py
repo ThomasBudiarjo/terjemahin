@@ -13,7 +13,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -76,12 +79,14 @@ class MangaOcrBase:
         split_aspect: float = 10.0,
         chunk_aspect: float = 4.0,
     ) -> None:
-        self.max_len = max_len
-        self.batch_size = max(1, batch_size)
-        self.no_repeat_ngram = no_repeat_ngram
-        self.pad = pad
-        self.split_aspect = split_aspect
-        self.chunk_aspect = chunk_aspect
+        from ..opts import as_float, as_int
+
+        self.max_len = as_int(max_len, "ocr max_len", 1, 512)
+        self.batch_size = as_int(batch_size, "ocr batch_size", 1, 1024)
+        self.no_repeat_ngram = as_int(no_repeat_ngram, "ocr no_repeat_ngram", 0)
+        self.pad = as_float(pad, "ocr pad", 0.0, 2.0)
+        self.split_aspect = as_float(split_aspect, "ocr split_aspect", 1.0)
+        self.chunk_aspect = as_float(chunk_aspect, "ocr chunk_aspect", 1.0)
 
     def generate(self, pixels: np.ndarray) -> list[tuple[list[int], float]]:
         """(token ids without the start token, confidence in 0..1) per image."""
@@ -115,29 +120,56 @@ class MangaOcrBase:
         return results
 
 
-class MangaOcrOnnx(MangaOcrBase):
-    def __init__(
-        self, model: str | Path, vocab: str | Path, threads: int = 0, split: bool = True, **opts
-    ) -> None:
-        import onnxruntime as ort
+_SESSIONS: OrderedDict[tuple[str, int, bool], tuple[Any, Any, list[str], Any]] = OrderedDict()
+_SESSIONS_LOCK = threading.Lock()
+MAX_SESSIONS = 2  # each set is ~1 GB; options such as batch_size do not need their own
 
-        super().__init__(**opts)
+
+def _sessions(model: str, threads: int, split: bool) -> tuple[Any, Any, list[str], Any]:
+    """(encoder, decoder, cached names, full graph) for a model file, shared by every instance
+    with the same threads/split: a new instance per option set (batch_size=2, 3, ...) used to
+    load another ~1 GB of sessions each time, growing a long-lived server without bound."""
+    import onnxruntime as ort
+
+    key = (str(model), int(threads), bool(split))
+    with _SESSIONS_LOCK:
+        if key in _SESSIONS:
+            _SESSIONS.move_to_end(key)
+            return _SESSIONS[key]
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         if threads:
             so.intra_op_num_threads = threads
         cpu = ["CPUExecutionProvider"]
-        self.vocab = load_vocab(vocab)
-        self.decoder = None
+        encoder = decoder = full = None
+        cached: list[str] = []
         if split:
             try:
-                enc, dec, self.cached = _split_graph(str(model))
-                self.encoder = ort.InferenceSession(enc, so, providers=cpu)
-                self.decoder = ort.InferenceSession(dec, so, providers=cpu)
+                enc, dec, cached = _split_graph(str(model))
+                encoder = ort.InferenceSession(enc, so, providers=cpu)
+                decoder = ort.InferenceSession(dec, so, providers=cpu)
             except Exception:
                 log.exception("could not split manga-ocr graph; decoding with the full graph")
-        if self.decoder is None:
-            self.full = ort.InferenceSession(str(model), so, providers=cpu)
+                encoder = decoder = None
+        if decoder is None:
+            full = ort.InferenceSession(str(model), so, providers=cpu)
+        _SESSIONS[key] = (encoder, decoder, cached, full)
+        while len(_SESSIONS) > MAX_SESSIONS:
+            _SESSIONS.popitem(last=False)
+        return _SESSIONS[key]
+
+
+class MangaOcrOnnx(MangaOcrBase):
+    def __init__(
+        self, model: str | Path, vocab: str | Path, threads: int = 0, split: bool = True, **opts
+    ) -> None:
+        from ..opts import as_bool, as_int
+
+        super().__init__(**opts)
+        threads = as_int(threads, "ocr threads", 0, 1024)
+        split = as_bool(split, "ocr split")
+        self.vocab = load_vocab(vocab)
+        self.encoder, self.decoder, self.cached, self.full = _sessions(str(model), threads, split)
 
     def generate(self, pixels: np.ndarray) -> list[tuple[list[int], float]]:
         """Batched greedy decoding with HF's no-repeat-ngram rule; finished rows leave the batch."""

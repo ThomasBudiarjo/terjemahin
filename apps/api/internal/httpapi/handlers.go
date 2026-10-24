@@ -59,6 +59,51 @@ type pipelineConfig struct {
 	SourceLang  *string                   `json:"source_lang"`
 	TargetLang  *string                   `json:"target_lang"`
 	Options     map[string]map[string]any `json:"options"`
+	// MinOCRConfidence: OCR reads below it are left untouched (worker Settings default).
+	MinOCRConfidence *float64 `json:"min_ocr_confidence"`
+}
+
+// pageContext mirrors the worker's PageContext. The worker rejects a message whose context
+// does not validate, and it cannot always report that back, so the job would stay "queued"
+// forever: the API checks the shape here and answers 400 instead.
+type pageContext struct {
+	SeriesTitle   *string          `json:"series_title"`
+	SeriesSummary *string          `json:"series_summary"`
+	Glossary      *[]glossaryEntry `json:"glossary"`
+	PreviousPages *[][]string      `json:"previous_pages"`
+	StyleNotes    *string          `json:"style_notes"`
+}
+
+type glossaryEntry struct {
+	Source *string `json:"source"`
+	Target *string `json:"target"`
+	Note   *string `json:"note"`
+}
+
+func validateContext(raw []byte) error {
+	var probe any
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return errors.New("context must be JSON")
+	}
+	if _, ok := probe.(map[string]any); !ok {
+		return errors.New("context must be a JSON object")
+	}
+	var c pageContext
+	if err := json.Unmarshal(raw, &c); err != nil {
+		var te *json.UnmarshalTypeError
+		if errors.As(err, &te) {
+			return fmt.Errorf("context: %s must be %s, not %s", te.Field, te.Type, te.Value)
+		}
+		return fmt.Errorf("context: %v", err)
+	}
+	if c.Glossary != nil {
+		for i, g := range *c.Glossary {
+			if g.Source == nil || g.Target == nil {
+				return fmt.Errorf("context: glossary[%d] needs source and target", i)
+			}
+		}
+	}
+	return nil
 }
 
 var pipelineStages = map[string]bool{
@@ -76,8 +121,8 @@ type jobOptions struct {
 func parseJobOptions(r *http.Request) (jobOptions, error) {
 	var o jobOptions
 	if c := strings.TrimSpace(r.FormValue("context")); c != "" {
-		if !json.Valid([]byte(c)) {
-			return o, errors.New("context must be JSON")
+		if err := validateContext([]byte(c)); err != nil {
+			return o, err
 		}
 		o.Context = json.RawMessage(c)
 	}
@@ -170,11 +215,18 @@ func (s *server) createPage(w http.ResponseWriter, r *http.Request) {
 	if opts.Debug {
 		job.DebugDir = filepath.Join(rel, "debug")
 	}
+	// stored before it is published: a worker that fails fast can report back before Publish
+	// returns, and a result for a job the store does not know yet was dropped (queued forever)
+	s.store.Put(job)
 	if err := s.q.Publish(r.Context(), job); err != nil {
+		job.Status, job.Error, job.UpdatedAt = jobs.StatusFailed, "queue unavailable", time.Now()
+		s.store.Put(job)
 		httpError(w, http.StatusServiceUnavailable, "queue unavailable")
 		return
 	}
-	s.store.Put(job)
+	if cur, ok := s.store.Get(job.JobID); ok && cur.Status != jobs.StatusQueued {
+		job = cur // the worker already answered
+	}
 	writeJSON(w, http.StatusAccepted, job)
 }
 

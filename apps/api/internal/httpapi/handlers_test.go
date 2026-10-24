@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -182,4 +183,68 @@ func jsonEqual(a, b any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return bytes.Equal(x, y)
+}
+
+func TestCreatePageRejectsContextTheWorkerCannotRead(t *testing.T) {
+	h, _, q, _ := newTestServer(t)
+	for _, c := range []string{`123`, `"x"`, `[1]`, `{"glossary":"oops"}`, `{"glossary":[{"source":"a"}]}`,
+		`{"previous_pages":[["a"], 2]}`, `{"series_title": 5}`, `{bad`} {
+		rec := post(t, h, map[string]string{"context": c})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("context %s: status %d, want 400 (%s)", c, rec.Code, rec.Body)
+		}
+	}
+	if len(q.published) != 0 {
+		t.Fatalf("published %d messages for invalid contexts", len(q.published))
+	}
+	ok := `{"series_title":"X","glossary":[{"source":"a","target":"b"}],"previous_pages":[["x"]]}`
+	if rec := post(t, h, map[string]string{"context": ok}); rec.Code != http.StatusAccepted {
+		t.Fatalf("valid context: status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// syncQueue stands in for a worker that fails before Publish returns.
+type syncQueue struct{ store *jobs.MemoryStore }
+
+func (q syncQueue) Publish(_ context.Context, j jobs.Job) error {
+	q.store.ApplyResult(jobs.Result{JobID: j.JobID, PageID: j.PageID, Status: jobs.StatusFailed, Error: "boom"})
+	return nil
+}
+
+func TestFastWorkerResultIsNotLost(t *testing.T) {
+	store := jobs.NewMemoryStore()
+	h := New(config.Config{StorageDir: t.TempDir()}, store, syncQueue{store})
+	rec := post(t, h, map[string]string{})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var j jobs.Job
+	if err := json.Unmarshal(rec.Body.Bytes(), &j); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.Get(j.JobID)
+	if got.Status != jobs.StatusFailed || got.Error != "boom" {
+		t.Fatalf("job status %q (%q), want the worker's failure", got.Status, got.Error)
+	}
+}
+
+type downQueue struct{}
+
+func (downQueue) Publish(context.Context, jobs.Job) error { return errors.New("down") }
+
+func TestPublishFailureMarksJobFailed(t *testing.T) {
+	store := jobs.NewMemoryStore()
+	h := New(config.Config{StorageDir: t.TempDir()}, store, downQueue{})
+	rec := post(t, h, map[string]string{})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if len(store.IDs()) != 1 {
+		t.Fatalf("stored %d jobs, want 1", len(store.IDs()))
+	}
+	for _, id := range store.IDs() {
+		if j, _ := store.Get(id); j.Status != jobs.StatusFailed {
+			t.Fatalf("job %s left %q", id, j.Status)
+		}
+	}
 }

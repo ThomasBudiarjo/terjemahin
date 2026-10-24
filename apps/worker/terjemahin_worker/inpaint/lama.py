@@ -219,13 +219,39 @@ class LamaInpainter:
         dst[:] = (res * a + dst * (1.0 - a)).round().astype(np.uint8)
 
 
-def _opts(settings, **o: Any) -> dict[str, Any]:
-    ints = ("size", "merge", "batch", "feather", "dilate", "threads")
-    floats = ("margin", "max_down", "flat_tol")
+# name: (kind, lowest, highest). max_down below 1 shrank the tile cell to 16 px: page01 then
+# planned 1086 model calls (~3 s each) instead of 13.
+_RANGES: dict[str, tuple[type, float, float | None]] = {
+    "size": (int, 64, 4096), "merge": (int, 0, 1000), "batch": (int, 1, 64),
+    "feather": (int, 0, 64), "dilate": (int, 0, 64), "threads": (int, 0, 1024),
+    "margin": (float, 1.0, 16.0), "max_down": (float, 1.0, 16.0), "flat_tol": (float, 0.0, 255.0),
+}
+
+
+def _opts(settings, name: str = "lama", **o: Any) -> dict[str, Any]:
+    from ..opts import as_float, as_int, warn_unknown
+
+    warn_unknown(f"inpainter '{name}'", {k: v for k, v in o.items() if k not in _RANGES and k != "weights"})
     out: dict[str, Any] = {"device": settings.device}
-    out.update({k: int(v) for k, v in o.items() if k in ints})
-    out.update({k: float(v) for k, v in o.items() if k in floats})
+    for k, v in o.items():
+        if k in _RANGES:
+            kind, lo, hi = _RANGES[k]
+            out[k] = (as_int if kind is int else as_float)(v, f"inpainter {k}", lo, hi)
     return out
+
+
+def _check_size(path: Path, opts: dict[str, Any], given: bool) -> None:
+    """The ONNX graphs have a static input size (512 for both shipped ones). A different
+    `size` only failed inside onnxruntime once a hole reached the model, i.e. on some pages
+    only; the graph is opened here when the size or the graph is not the default."""
+    size = opts.get("size", 512)
+    if size == 512 and not given:
+        return
+    sess = _session(path, opts.get("threads", 0), opts.get("device", "cpu"))
+    shape = next((i.shape for i in sess.get_inputs() if i.name == "image"), None)
+    fixed = [d for d in (shape or [])[2:] if isinstance(d, int)]
+    if fixed and any(d != size for d in fixed):
+        raise ValueError(f"inpainter size must be {fixed[0]} for {path.name} (its input is fixed), not {size}")
 
 
 def _graph(settings, key: str, weights: Any = None) -> Path:
@@ -247,7 +273,9 @@ def _graph(settings, key: str, weights: Any = None) -> Path:
 )
 def _build_manga(settings, **opts: Any) -> LamaInpainter:
     path = _graph(settings, "lama_manga", opts.get("weights"))
-    return LamaInpainter(path, out_scale=1.0, **_opts(settings, **opts))
+    o = _opts(settings, "lama_manga", **opts)
+    _check_size(path, o, bool(opts.get("weights")))
+    return LamaInpainter(path, out_scale=1.0, **o)
 
 
 @INPAINTERS.register(
@@ -259,4 +287,6 @@ def _build_manga(settings, **opts: Any) -> LamaInpainter:
 )
 def _build_big(settings, **opts: Any) -> LamaInpainter:
     path = _graph(settings, "lama", opts.get("weights"))
-    return LamaInpainter(path, out_scale=255.0, **_opts(settings, **opts))
+    o = _opts(settings, "lama", **opts)
+    _check_size(path, o, bool(opts.get("weights")))
+    return LamaInpainter(path, out_scale=255.0, **o)

@@ -44,10 +44,12 @@ class YoloDetector:
     description="YOLO11n fine-tuned on Manga109 / pseudo-labels (training/train.py). Boxes only.",
 )
 def _build(settings, conf: float | None = None, iou: float | None = None, weights=None):
+    from ..opts import as_float
+
     return YoloDetector(
         Path(weights or settings.yolo_weights),
-        settings.detect_conf if conf is None else conf,
-        settings.detect_iou if iou is None else iou,
+        as_float(settings.detect_conf if conf is None else conf, "detector conf", 0.0, 1.0),
+        as_float(settings.detect_iou if iou is None else iou, "detector iou", 0.0, 1.0),
     )
 
 

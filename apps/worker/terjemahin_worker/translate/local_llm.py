@@ -64,6 +64,7 @@ class _Loaded:
 
 _MODELS: dict[tuple[str, str, str], _Loaded] = {}
 _MODELS_LOCK = threading.Lock()
+MAX_MODELS = 1  # a ~6.5 GB chat model; a second one would not fit next to it on 15 GB
 
 
 def _dtype(name: str) -> Any:
@@ -85,6 +86,13 @@ def load_causal(repo: str, device: str = "cpu", dtype: str = "bfloat16") -> _Loa
     with _MODELS_LOCK:
         if key in _MODELS:
             return _MODELS[key]
+        while len(_MODELS) >= MAX_MODELS:
+            old = next(iter(_MODELS))
+            del _MODELS[old]
+            log.info("local_llm: unloading %s to make room for %s", old[0], repo)
+            import gc
+
+            gc.collect()
         os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -328,7 +336,11 @@ class LocalLLMTranslator:
         return targets
 
     def translate(self, req: TranslationRequest) -> list[TranslationItem]:
-        source = tp.detect_lang(req.sources) if req.source_lang == "auto" else req.source_lang
+        if req.source_lang == "auto":  # the page's most common script, not 'any kana anywhere'
+            langs = tp.detect_langs(req.sources)
+            source = max(set(langs), key=langs.count) if langs else "en"
+        else:
+            source = req.source_lang
         if not self.pivot or tp.iso(self.pivot) == tp.iso(req.target_lang):
             prepared = [self.prepare(s, source, req.context) for s in req.sources]
             targets = self._llm_page(req, prepared, source, req.target_lang)
@@ -492,8 +504,11 @@ def _build(settings, **opts: Any) -> LocalLLMTranslator:
     )
     core.setdefault("max_tokens", backend.max_new_tokens)
 
+    if pivot is not None:
+        TRANSLATORS.get(pivot_translator)  # a typo fails now, not after a minute of generation
     fb = None
     if fallback_name and str(fallback_name).lower() not in ("none", "null", ""):
+        TRANSLATORS.get(str(fallback_name))
         holder: list[Any] = []
 
         def fb(sub: TranslationRequest) -> list[TranslationItem]:

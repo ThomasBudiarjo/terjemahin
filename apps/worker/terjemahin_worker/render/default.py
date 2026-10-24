@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from ..models import RGB, BBox, Bubble
+from ..opts import as_bool, as_color, as_float, as_int, optional
 from ..registry import RENDERERS
 from .balloon import Balloon, find_balloon, split_shared
 from .layout import Align, FontMeasure, Layout, Shape, fit
@@ -35,6 +36,15 @@ MAX_SCALE = 1.0  # max Latin font size relative to the source glyph size
 MARGIN = 0.08  # interior inset as a fraction of the balloon's smaller side
 PADDING = 0.1  # clearance between glyphs and the interior edge, x font size
 OVERFLOW_SHRINK = 0.65  # how far below the page minimum a size may go before text overflows
+PAGE_ASPECT = 1.6  # long/short side of a page; a taller strip (webtoon) is many pages
+
+
+def page_min_size(W: int, H: int) -> int:
+    """Smallest font size the page should use: about 1/200 of width + height, with the long
+    side counted at most as a page's (an 800x12000 webtoon strip asked for 64 px, more than
+    any of its balloons could hold, so every fit collapsed to one size and overflowed)."""
+    short, long = min(W, H), max(W, H)
+    return max(10, round((short + min(long, PAGE_ASPECT * short)) / 200))
 
 
 def luminance(c: RGB) -> float:
@@ -58,6 +68,7 @@ class Plan:
     vertical: bool
     text: str
     layout: Any = None  # Layout | VLayout
+    measure: Any = None  # FontMeasure the text is set in (the CJK font for CJK text)
     angle: float = 0.0  # text tilt (CCW degrees); the shape frame is then the de-rotated interior
     frame: tuple[int, int] = (0, 0)  # (w, h) of the shape frame, for tilted drawing
 
@@ -86,22 +97,30 @@ class DefaultRenderer:
             raise ValueError(f"alignment must be center, left or right, not {alignment!r}")
         if direction not in ("auto", "h", "v"):
             raise ValueError(f"direction must be auto, h or v, not {direction!r}")
+        for name, path in (("font_path", font_path), ("cjk_font_path", cjk_font_path)):
+            if path and not Path(path).is_file():
+                raise ValueError(f"renderer {name}: no such font file: {path}")
         self.measure = FontMeasure(font_path)
         self.cjk_font_path = cjk_font_path
         self._cjk: Any = None
-        self.font_size_offset = font_size_offset
-        self.min_font_size = min_font_size
-        self.max_font_size = max_font_size
-        self.uppercase = uppercase
+        self.font_size_offset = as_int(font_size_offset, "renderer font_size_offset", -200, 200)
+        self.min_font_size = optional(as_int, min_font_size, "renderer min_font_size", 1, 1000)
+        self.max_font_size = optional(as_int, max_font_size, "renderer max_font_size", 1, 1000)
+        if self.min_font_size and self.max_font_size and self.min_font_size > self.max_font_size:
+            raise ValueError(
+                f"renderer min_font_size ({self.min_font_size}) is larger than max_font_size "
+                f"({self.max_font_size})"
+            )
+        self.uppercase = as_bool(uppercase, "renderer uppercase")
         self.alignment = alignment
-        self.line_spacing = line_spacing
-        self.stroke_width = stroke_width
-        self.hyphenate = hyphenate
-        self.normalize = normalize
-        self.normalize_tol = normalize_tol
+        self.line_spacing = as_float(line_spacing, "renderer line_spacing", 0.5, 5.0)
+        self.stroke_width = optional(as_float, stroke_width, "renderer stroke_width", 0.0, 1.0)
+        self.hyphenate = as_bool(hyphenate, "renderer hyphenate")
+        self.normalize = as_bool(normalize, "renderer normalize")
+        self.normalize_tol = as_float(normalize_tol, "renderer normalize_tol", 0.0)
         self.direction = direction
-        self.fg_color = tuple(fg_color) if fg_color else None
-        self.debug = debug
+        self.fg_color = optional(as_color, fg_color, "renderer fg_color") if fg_color else None
+        self.debug = as_bool(debug, "renderer debug")
         self.plans: list[Plan] = []  # last page, for tests and debugging
 
     # -- planning ---------------------------------------------------------------------------
@@ -168,7 +187,12 @@ class DefaultRenderer:
             vertical = self.direction == "v" or (
                 self.direction == "auto" and b.region.direction == "v" and is_cjk(text)
             )
+            if vertical and self.direction == "v" and text and not is_cjk(text):
+                log.warning("bubble %s: vertical layout of non-CJK text %r stacks single "
+                            "letters (use the default renderer, direction=auto)", b.region.id, text)
             m = self._cjk_measure() if vertical else self.measure
+            if not vertical and CJK.search(text) and not all(map(m.has_glyph, CJK.findall(text))):
+                m = self._cjk_measure()  # Chinese/Korean set horizontally: not in tofu boxes
             text = m.normalize(text) if not vertical else " ".join(text.split())
             if self.uppercase and not vertical:
                 text = text.upper()
@@ -176,6 +200,8 @@ class DefaultRenderer:
             angle = a if 3 < abs(a) < 60 and not vertical else 0.0
             shape, ox, oy, fw, fh = self._shape(bal, b.region.bbox, W, H, vertical, angle)
             src = b.region.font_size
+            if src and not re.search(r"[^\W\d_]", text):
+                src = None  # '...' / '!!': a box of punctuation says nothing about glyph size
             short_side = min(shape.height, shape.width)
             max_size = self.max_font_size or (
                 round(src * MAX_SCALE) if src else max(12, round(short_side * 0.3))
@@ -194,6 +220,7 @@ class DefaultRenderer:
                     text,
                     angle=angle,
                     frame=(int(fw), int(fh)),
+                    measure=m,
                 )
             )
         return plans
@@ -213,7 +240,7 @@ class DefaultRenderer:
         return fit(
             p.text,
             p.shape,
-            self.measure,
+            p.measure or self.measure,
             min_size=min_size,
             max_size=max_size,
             line_spacing=self.line_spacing,
@@ -232,12 +259,16 @@ class DefaultRenderer:
         bubbles = [b for b in (_on_page(b, W, H) for b in bubbles if b.target_text.strip()) if b]
         if not bubbles:
             return inpainted_bgr.copy()
-        min_size = self.min_font_size or max(10, round((W + H) / 200))
+        min_size = self.min_font_size or page_min_size(W, H)
         plans = self._plan(inpainted_bgr, original_bgr, bubbles)
         for p in plans:
-            p.layout = self._fit(p, min(min_size, p.max_size), p.max_size)
-            if not p.layout.fits:  # rather a bit smaller than spilling out of the balloon
-                smaller = self._fit(p, max(8, round(min_size * OVERFLOW_SHRINK)), p.max_size)
+            lo = min(min_size, p.max_size)
+            p.layout = self._fit(p, lo, p.max_size)
+            shrink = max(8, round(min_size * OVERFLOW_SHRINK))
+            if shrink >= lo:  # a balloon smaller than the page minimum: shrink from its own
+                shrink = max(8, round(lo * OVERFLOW_SHRINK))
+            if not p.layout.fits and shrink < lo:  # rather smaller than spilling out of the balloon
+                smaller = self._fit(p, shrink, p.max_size)
                 if smaller.fits:
                     p.layout = smaller
             if self.font_size_offset < 0 and p.layout.fits:
@@ -294,7 +325,7 @@ class DefaultRenderer:
 
             draw_vertical(pil, lay, self._cjk_measure(), p.ox, p.oy, fg, sc, sw)
             return
-        font = self.measure.font(lay.size)
+        font = (p.measure or self.measure).font(lay.size)
         if not p.angle:
             draw = ImageDraw.Draw(pil)
             for ln in lay.lines:

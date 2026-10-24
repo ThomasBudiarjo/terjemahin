@@ -87,6 +87,20 @@ def detect_lang(texts: Iterable[str]) -> str:
     return "en"
 
 
+def detect_langs(texts: list[str]) -> list[str]:
+    """source_lang='auto' per bubble: one stray kana in an OCR misread no longer makes a whole
+    English page 'ja' (every English bubble then passed through untranslated). A bubble without
+    letters ('...', '!?') takes the page's most common language."""
+    own = [detect_lang([t]) if _LETTER.search(t) else None for t in texts]
+    counts = Counter(x for x in own if x)
+    page = counts.most_common(1)[0][0] if counts else "en"
+    return [x or page for x in own]
+
+
+CJK_LANGS = ("ja", "zh", "zh-hant", "ko")
+HAN_TARGETS = ("zh", "zh-hant")  # write Japanese names in kanji themselves
+
+
 def has_source_script(text: str, lang: str) -> bool:
     """True if `text` still contains something to translate from a CJK source."""
     if iso(lang) in ("ja", "zh", "zh-hant", "ko"):
@@ -359,6 +373,7 @@ class Prepared:
     stutter_on: str = ""  # the source char stuttered on ("私"), to find the matching word
     end: str = ""  # terminal punctuation of the source: "?", "!", "?!", "...", ""
     terms: list[str] = field(default_factory=list)  # glossary targets the output must contain
+    verbatim: str = ""  # the whole result, no model needed (a punctuation-only bubble)
 
 
 def _end_punct(text: str) -> str:
@@ -463,6 +478,21 @@ def apply_glossary(text: str, glossary: Iterable[GlossaryEntry]) -> tuple[str, l
     return re.sub(r"\s{2,}", " ", text).strip(), terms
 
 
+_PUNCT_CHARS = re.compile(r"[\s!?.・･。、,~〜～ー\-―—]+")
+
+
+def punctuation_only(text: str) -> str | None:
+    """'？' -> '?', '……' / '・・・' -> '...', '！！' -> '!!', '！？' -> '!?': a bubble of
+    punctuation alone is kept as punctuation. Translated, it came back empty, and the bubble was
+    erased and left blank. None when the text has letters, digits or other symbols."""
+    s = unicodedata.normalize("NFKC", text).strip()
+    if not s or not _PUNCT_CHARS.fullmatch(s) or not re.search(r"[!?.・･。]", s):
+        return None
+    s = re.sub(r"[\s、,~〜～ー\-―—]+", "", s)
+    s = re.sub(r"[・･。]", ".", s)
+    return re.sub(r"\.{2,}", "...", s)
+
+
 def prepare(
     text: str,
     source: str,
@@ -474,6 +504,9 @@ def prepare(
 ) -> Prepared:
     source, target = iso(source), iso(target)
     raw = text.strip()
+    punct = punctuation_only(raw)
+    if punct is not None:
+        return Prepared(text="", verbatim=punct, end=_end_punct(punct))
     if source != "ja":
         out, terms = apply_glossary(unicodedata.normalize("NFKC", raw), glossary)
         return Prepared(text=out, end=_end_punct(out), terms=terms)
@@ -490,9 +523,10 @@ def prepare(
     if stutter:
         text = _STUTTER.sub("", text)
     text, terms = apply_glossary(text, glossary)
-    if names:
+    if names and target not in HAN_TARGETS:  # Chinese keeps 坂本 (romaji came back as 萨卡莫托)
         text, found = romanize_surnames(text)
-        terms += found
+        if target not in CJK_LANGS:  # a Hangul transliteration is right, not a missing term
+            terms += found
     text = map_honorifics(text)
 
     lead: list[str] = []
@@ -612,6 +646,8 @@ def is_bad(source: str, output: str, target: str) -> bool:
     """Post-translation check: empty, looping, still in the source script, or absurd length."""
     if not output.strip():
         return bool(source.strip())
+    if _LETTER.search(source) and not _LETTER.search(output):
+        return True  # punctuation for words ('うんうん' -> ',.'): finish() would leave nothing
     if is_repetitive(output) or foreign_ratio(output, target) > 0.2:
         return True
     return len(output) > 12 * max(len(source), 4)
@@ -690,8 +726,28 @@ def restore_terms(text: str, terms: Iterable[str], cutoff: float = 0.7) -> str:
     return text
 
 
+_TO_HAN_PUNCT = [(r"\.\.\.", "……"), (r"(?<![0-9A-Za-z]),\s*", "，"), (r"\?", "？"),
+                  (r"!", "！"), (r"(?<![0-9A-Za-z.])\.$", "。")]
+
+
+def han_punct(text: str) -> str:
+    """Chinese text takes fullwidth punctuation ('你好?' -> '你好？')."""
+    if not _HAN.search(text):
+        return text
+    for pat, repl in _TO_HAN_PUNCT:
+        text = re.sub(pat, repl, text)
+    return re.sub(r"\s*([，。？！])\s*", r"\1", text).replace("…… ", "……")
+
+
 def finish(prep: Prepared, output: str, target: str, casual: bool = True) -> str:
     """Re-attach deterministic parts, enforce glossary spelling, fix punctuation and casing."""
+    if prep.verbatim:
+        return prep.verbatim
+    text = _finish(prep, output, target, casual)
+    return han_punct(text) if iso(target) in HAN_TARGETS else text
+
+
+def _finish(prep: Prepared, output: str, target: str, casual: bool) -> str:
     out = clean_output(output) if output else ""
     if out and prep.terms:
         out = restore_terms(out, prep.terms)
@@ -718,6 +774,11 @@ def stutter(text: str, target: str, pronoun: bool = False) -> str:
     words = list(_WORD.finditer(text))
     if not words:
         return text
+    if iso(target) in CJK_LANGS and _CJK.match(words[0].group()):
+        # no Latin 'X-X' in Chinese/Korean: '我、我不是' / '나, 나는'
+        m = words[0]
+        sep = ", " if iso(target) == "ko" else "、"
+        return f"{text[: m.start()]}{m.group()[0]}{sep}{text[m.start():]}"
     m = words[0]
     if pronoun:
         names = PRONOUNS.get(iso(target), ())

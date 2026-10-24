@@ -114,9 +114,9 @@ tr.off textarea { opacity: .45; }
   main { flex: 1; min-height: 0; }
   aside { overflow-y: auto; }
   section.work { overflow: hidden; min-height: 0; }
-  #viewcard { flex: 1 1 60%; min-height: 260px; display: flex; flex-direction: column; }
+  #viewcard { flex: 1 1 70%; min-height: 260px; display: flex; flex-direction: column; }
   #viewer { flex: 1; height: auto; min-height: 0; }
-  #bubbles { flex: 0 1 40%; min-height: 150px; display: flex; flex-direction: column; }
+  #bubbles { flex: 0 1 30%; min-height: 150px; display: flex; flex-direction: column; }
   #bubbles[hidden] { display: none; }
   #bubbles .tablewrap { overflow: auto; flex: 1; min-height: 0; }
   #bubbles thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
@@ -156,6 +156,8 @@ tr.off textarea { opacity: .45; }
     <option value="vi">Vietnamese</option><option value="th">Thai</option><option value="es">Spanish</option>
     <option value="fr">French</option><option value="de">German</option><option value="pt">Portuguese</option>
   </datalist>
+  <!-- right under the page and languages: visible without scrolling the sidebar -->
+  <button id="go" class="primary" disabled>Translate page</button>
 
   <h2>Methods</h2>
   <div id="stages"><div class="hint">Loading methods...</div></div>
@@ -167,8 +169,6 @@ tr.off textarea { opacity: .45; }
   <textarea id="glossary" rows="4" class="mono" placeholder="先輩 = Senpai&#10;魔王 = Raja Iblis"></textarea>
   <label for="style">Style notes</label>
   <textarea id="style" rows="2" placeholder="e.g. casual tone, keep honorifics"></textarea>
-
-  <button id="go" class="primary" disabled>Translate page</button>
 </aside>
 
 <section class="work">
@@ -245,8 +245,13 @@ function el(tag, attrs = {}, ...kids) {
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail || body));
+  const text = await r.text().catch(() => "");
+  let body = {};
+  try { body = text ? JSON.parse(text) : {}; } catch { body = { detail: text.trim().slice(0, 300) }; }
+  if (!r.ok) {
+    const d = body.detail;
+    throw new Error(typeof d === "string" && d ? d : d ? JSON.stringify(d) : "HTTP " + r.status + " " + r.statusText);
+  }
   return body;
 }
 
@@ -272,6 +277,7 @@ async function loadMethods() {
     const desc = el("p", { class: "desc" });
     const showDesc = () => { desc.textContent = sel.selectedOptions[0]?.dataset.desc || ""; };
     sel.onchange = () => { showDesc(); persist(); };
+    sel.addEventListener("change-desc", showDesc);  // set from a job: shown, not persisted
     opts.oninput = () => { opts.classList.toggle("bad", !parseOpts(opts.value).ok); persist(); };
     showDesc();
     box.append(el("label", { for: sel.id, text: LABELS[stage] }), el("div", { class: "stage-row" }, sel, opts), desc);
@@ -319,7 +325,11 @@ function pageContext() {
 
 /* ---------- file input ---------- */
 function setFile(f) {
-  if (!f || !f.type.startsWith("image/")) { setMsg("That is not an image.", true); return; }
+  if (!f || !f.type.startsWith("image/")) {
+    // forget the previous file too: Translate must not run on a page the user replaced
+    file = null; $("file").value = ""; $("dropview").replaceChildren(); updateGo();
+    setMsg("That is not an image.", true); return;
+  }
   file = f;
   const url = URL.createObjectURL(f);
   $("dropview").replaceChildren(el("img", { src: url, alt: "" }), el("div", { text: f.name + " · " + (f.size / 1024).toFixed(0) + " KB" }));
@@ -352,33 +362,71 @@ function setDownload(url) {
 async function translate() {
   let cfg;
   try { cfg = pipelineConfig(); } catch (e) { setMsg(e.message, true); return; }
-  busy = true; updateGo(); setSteps("detector"); setMsg("Uploading..."); setTimings(null);
+  busy = true; updateGo(); setSteps(null); setMsg("Uploading..."); setTimings(null);
   const fd = new FormData();
   fd.append("file", file);
   fd.append("pipeline", JSON.stringify(cfg));
   fd.append("context", JSON.stringify(pageContext()));
   fd.append("wait", "false");
-  const t0 = performance.now();
   try {
-    let j = await api("/api/translate", { method: "POST", body: fd });
-    while (j.status === "queued" || j.status === "running") {
-      setSteps(j.stage || "detector");
-      const secs = ((performance.now() - t0) / 1000).toFixed(0);
-      setMsg((j.status === "queued" ? "Waiting for the worker" : "Running " + (LABELS[j.stage] || "...")) + " · " + secs + "s (first run loads models)");
-      await new Promise((r) => setTimeout(r, 600));
-      j = await api("/api/jobs/" + j.id);
-    }
-    if (j.status === "failed") { setSteps(null); throw new Error(j.error || "job failed"); }
-    showJob(j);
-    setMsg("Done in " + j.elapsed.toFixed(1) + "s — " + j.result.bubbles.length + " bubbles. Job " + j.id);
+    const j = await api("/api/translate", { method: "POST", body: fd });
+    await follow(j, performance.now());
   } catch (e) {
-    setMsg("Failed: " + e.message, true);
+    setSteps(null); setMsg("Failed: " + e.message, true);
   } finally { busy = false; updateGo(); }
+}
+
+/* poll a job until it ends; the #job= link is set at once, so a reload or a pasted link
+   picks a running job up again instead of losing it */
+async function follow(j, t0) {
+  history.replaceState(null, "", "#job=" + j.id);
+  following = j.id;
+  while (j.status === "queued" || j.status === "running") {
+    setSteps(j.status === "queued" ? null : (j.stage || "detector"));
+    const secs = ((performance.now() - t0) / 1000).toFixed(0);
+    setMsg((j.status === "queued" ? "Waiting for the worker (another page is running)" : "Running " + (LABELS[j.stage] || "...")) + " · " + secs + "s (first run loads models)");
+    await new Promise((r) => setTimeout(r, 600));
+    if (following !== j.id) return;  // another job was opened meanwhile
+    j = await api("/api/jobs/" + j.id);
+  }
+  if (j.status === "failed") { setSteps(null); throw new Error(j.error || "job failed"); }
+  showJob(j);
+  const wall = (performance.now() - t0) / 1000;
+  setMsg("Done: worker " + j.elapsed.toFixed(1) + "s" + (wall > j.elapsed + 2 ? ", " + wall.toFixed(0) + "s with the wait" : "") + " — " + j.result.bubbles.length + " bubbles. Job " + j.id);
+}
+let following = null;
+
+/* the method pickers show what the job ran with, so Re-typeset keeps its methods */
+function applyPipeline(p) {
+  if (!p) return;
+  for (const s of STAGES) {
+    const sel = $("m-" + s);
+    if (!sel || !p[s] || ![...sel.options].some((o) => o.value === p[s])) continue;
+    sel.value = p[s];
+    sel.dispatchEvent(new Event("change-desc"));
+    const o = (p.options || {})[s];
+    $("o-" + s).value = o && Object.keys(o).length ? JSON.stringify(o) : "";
+  }
+  if (p.source_lang) $("src").value = p.source_lang;
+  if (p.target_lang) $("tgt").value = p.target_lang;
+}
+
+async function openHash() {
+  const m = location.hash.match(/^#job=([0-9a-f]{16})$/);
+  if (!m || (job && job.id === m[1]) || following === m[1]) return;
+  try {
+    const j = await api("/api/jobs/" + m[1]);
+    if (j.status === "done") { showJob(j); setMsg("Loaded job " + j.id); }
+    else if (j.status === "failed") { following = null; setSteps(null); setMsg("Job " + j.id + " failed: " + (j.error || "unknown error"), true); }
+    else { busy = true; updateGo(); try { await follow(j, performance.now()); } finally { busy = false; updateGo(); } }
+  } catch (e) { setMsg("Cannot load job " + m[1] + ": " + e.message, true); }
 }
 
 function showJob(j) {
   job = withDropped(j);
+  following = null;
   history.replaceState(null, "", "#job=" + j.id);
+  applyPipeline(j.pipeline);
   updateGo();
   setSteps(null, true);
   setTimings(j.result.timings);
@@ -558,9 +606,9 @@ function init() {
   sync($("paneL"), $("paneR")); sync($("paneR"), $("paneL"));
   window.addEventListener("resize", () => { if (zoom == null) applyZoom(); });
   setSteps(null);
-  loadMethods().catch((e) => setMsg("Cannot load methods: " + e.message, true));
-  const m = location.hash.match(/^#job=([0-9a-f]{16})$/);
-  if (m) api("/api/jobs/" + m[1]).then((j) => { if (j.status === "done") { showJob(j); setMsg("Loaded job " + j.id); } }).catch(() => {});
+  // the job link is opened once the method pickers exist, so they can show its methods
+  loadMethods().catch((e) => setMsg("Cannot load methods: " + e.message, true)).finally(openHash);
+  window.addEventListener("hashchange", openHash);
 }
 init();
 </script>

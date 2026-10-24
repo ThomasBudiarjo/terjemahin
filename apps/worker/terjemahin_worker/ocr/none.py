@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..models import TextRegion
+from ..opts import warn_unknown
 from ..registry import OCRS
 from .base import OcrResult
 
@@ -15,5 +16,6 @@ class NoOcr:
 
 
 @OCRS.register("none", description="No OCR; a vision-capable translator reads the crops itself.")
-def _build(settings, **_):
+def _build(settings, **extra):
+    warn_unknown("ocr 'none'", extra)
     return NoOcr()

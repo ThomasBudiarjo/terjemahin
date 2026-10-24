@@ -232,15 +232,50 @@ def crossing_lines(ink: np.ndarray, c: Crop, font: int, angles: int = 16) -> np.
     # the font of a bare box is a guess that glyphs fused with a line make too small
     x1, y1, x2, y2 = c.box
     length = int(np.clip(round(0.4 * max(font, min(x2 - x1, y2 - y1))), 9, 61)) | 1
+    runs = []  # (ys, xs, clear of the box) of each run that goes on past the box
+    every = np.zeros(ink.shape, bool)
     for i in range(angles):
         run = cv2.morphologyEx(src, cv2.MORPH_OPEN, line_kernel(length, np.pi * i / angles))
-        if not run.any():
+        ys, xs = np.nonzero(run)
+        if not ys.size:
             continue
-        nn, lab = cv2.connectedComponents(run, connectivity=8)
-        touch = np.bincount(lab[(run > 0) & beyond], minlength=nn) > 0
-        touch[0] = False
-        out |= touch[lab]
+        lab = cv2.connectedComponents(run, connectivity=8)[1][ys, xs]
+        clear = beyond[ys, xs]
+        for j in np.flatnonzero(np.bincount(lab[clear])):
+            if j:
+                sel = lab == j
+                runs.append((ys[sel], xs[sel], clear[sel]))
+                every[ys[sel & clear], xs[sel & clear]] = True
+    fy, fx = np.nonzero(every)
+    for ys, xs, clear in runs:
+        keep = straight_part(ys, xs, clear, fy, fx)
+        out[ys[keep], xs[keep]] = True
     return out
+
+
+def fit_line(ys: np.ndarray, xs: np.ndarray):
+    """Distance to the line fitted through the given pixels, as a function of (y, x)."""
+    step = max(1, ys.size // 1000)  # a thousand pixels fix a straight line well enough
+    pts = np.stack([xs[::step], ys[::step]], axis=1).astype(np.float32)
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+    return lambda yy, xx: np.abs((xx - x0) * vy - (yy - y0) * vx)
+
+
+def straight_part(
+    ys: np.ndarray, xs: np.ndarray, clear: np.ndarray, fy: np.ndarray, fx: np.ndarray
+) -> np.ndarray:
+    """Which pixels of a straight run (`ys, xs`) lie within the width its line has clear of
+    the box (`clear`; `fy, fx`: the runs of every direction there): next to the text, the
+    strokes of a glyph touching the line fit the line kernel too. A kernel a little off the
+    line's angle cuts the band short, so the line is fitted again on all the runs near the
+    first fit."""
+    if clear.sum() < 8:
+        return np.ones(ys.shape, bool)
+    perp = fit_line(ys[clear], xs[clear])
+    band = perp(fy, fx) <= np.percentile(perp(ys[clear], xs[clear]), 98) + 3
+    perp = fit_line(fy[band], fx[band])
+    half = float(np.percentile(perp(fy[band], fx[band]), 98)) + 3
+    return perp(ys, xs) <= half
 
 
 def hysteresis(
@@ -700,6 +735,47 @@ def stuck_fill(stuck: np.ndarray, erased: np.ndarray, c: Crop) -> np.ndarray:
 
 
 def leftover_glyphs(
+    page: np.ndarray,
+    c: Crop,
+    bg: np.ndarray,
+    fg: np.ndarray,
+    spread: float,
+    erased: np.ndarray,
+    font: int,
+    grow: int,
+) -> np.ndarray:
+    """Glyphs of a bare box that the passes above left, dilated by `grow`; typically ones
+    fused with an art line (together they are one long structure, which no pass may erase):
+    components of the text colour once the art lines running through the box are cut out of
+    the ink (crossing_lines). A component counts when it lies in the box, is no speck, no
+    long thin curve and no ring round a big hole (a balloon outline), is not erased yet in
+    good part, stays clear of the window edge and has flat paper round it (bar the cut
+    lines); and when it touched a cut line, that line is art, not a balloon outline cut where
+    it runs straight (as dark as its text, the outline's pieces pass every test above): it
+    has another colour than the glyph (measured clear of the text), or the glyph lies beside
+    it (see beside). A line of the glyph's colour may still be an outline: the dilation
+    stops at it. Where a glyph crosses a line of another colour, its pixels on the line go
+    too.
+
+    Lines are told by how they run on clear of the box, so this pass looks at a window of
+    its own, as wide as the widest refiner's (`erased` and the result are in `c`'s)."""
+    if c.has_lines:
+        return np.zeros(c.near.shape, bool)
+    if c.reach >= 0.5:
+        return _leftover(page[c.sl], c, bg, fg, spread, erased, font, grow)
+    x1, y1, x2, y2 = c.box
+    region = TextRegion(id=0, bbox=BBox(x1=c.x1 + x1, y1=c.y1 + y1, x2=c.x1 + x2, y2=c.y1 + y2))
+    wide = make_crop(region, page, max(c.reach, 0.5))
+    if wide is None:
+        return np.zeros(c.near.shape, bool)
+    oy, ox = c.y1 - wide.y1, c.x1 - wide.x1
+    inner = (slice(oy, oy + c.near.shape[0]), slice(ox, ox + c.near.shape[1]))
+    done = np.zeros(wide.near.shape, bool)
+    done[inner] = erased
+    return _leftover(page[wide.sl], wide, bg, fg, spread, done, font, grow)[inner]
+
+
+def _leftover(
     crop: np.ndarray,
     c: Crop,
     bg: np.ndarray,
@@ -707,19 +783,9 @@ def leftover_glyphs(
     spread: float,
     erased: np.ndarray,
     font: int,
+    grow: int,
 ) -> np.ndarray:
-    """Glyphs of a bare box that the passes above left, typically ones fused with an art line
-    (together they are one long structure, which no pass may erase): components of the text
-    colour once the art lines running through the box are cut out of the ink (crossing_lines).
-    A component counts when it lies in the box, is no speck, no long thin curve and no ring
-    round a big hole (a balloon outline), is not erased yet in good part, stays clear of the
-    window edge and has flat paper round it (bar the cut lines); and when it touched a cut
-    line, that line is art, not a balloon outline cut where it runs straight (as dark as its
-    text, the outline's pieces pass every test above): it has another colour than the glyph
-    (measured clear of the text), or the glyph lies beside it (see beside)."""
     out = np.zeros(crop.shape[:2], bool)
-    if c.has_lines:
-        return out
     ink = blend_ink(crop, bg, fg, 0.5)
     dist = color_distance(crop, bg)
     lines = crossing_lines((dist > 40) | ink, c, font)
@@ -743,11 +809,16 @@ def leftover_glyphs(
     cand[0] = False
     flat_tol = max(12.0, 3 * spread)
 
+    stop = np.zeros_like(out)  # lines of the text colour: the dilation does not cross them
+
     def art_line(j: int, comp: np.ndarray, own: np.ndarray) -> bool:
         col = line_color[j]
         if col is not None and color_distance(col[None, None], own)[0, 0] >= 25:
             return True
-        return beside(line_lab == j, comp, font)
+        if beside(line_lab == j, comp, font, line_lab > 0):
+            stop[line_lab == j] = True
+            return True
+        return False
 
     for i in np.flatnonzero(cand):
         p = 9
@@ -770,7 +841,28 @@ def leftover_glyphs(
             if not all(art_line(j, labels == i, own) for j in hit):
                 continue
         out[sy, sx] |= k > 0
-    return out
+    # where the text crosses a line of another colour, its pixels lie in the cut
+    other = [
+        j
+        for j, col in enumerate(line_color)
+        if col is not None and color_distance(col[None, None], fg)[0, 0] >= 25
+    ]
+    if other:
+        on = cv2.dilate(np.isin(line_lab, other).astype(np.uint8), ellipse(3)) > 0
+        on &= box_zone(c) & (color_distance(crop, fg) < 30)
+        on &= nearest(crop, [fg, bg, *(line_color[j] for j in other)]) == 0
+        text = (out | (erased & ink)).astype(np.uint8)
+        out |= on & (cv2.dilate(text, ellipse(17)) > 0)
+    if not out.any():
+        return out
+    grown = cv2.dilate(out.astype(np.uint8), ellipse(grow)) > 0
+    if stop.any():
+        wall = cv2.dilate(stop.astype(np.uint8), ellipse(3)) > 0
+        n, lab = cv2.connectedComponents((grown & ~wall).astype(np.uint8), connectivity=8)
+        seed = np.bincount(lab[out & ~wall], minlength=n) > 0
+        seed[0] = False
+        grown = seed[lab] | out
+    return grown
 
 
 def core_color(px: np.ndarray, d: np.ndarray) -> np.ndarray:
@@ -796,10 +888,11 @@ def line_colors(
     return lab, out
 
 
-def beside(line: np.ndarray, comp: np.ndarray, font: int) -> bool:
+def beside(line: np.ndarray, comp: np.ndarray, font: int, lines: np.ndarray) -> bool:
     """Whether `comp` lies beside the straight `line`, as a glyph touching a line that runs
     past it does, rather than carrying it on: a balloon outline cut where it runs straight
-    leaves its curved rest, which goes on from the end of the cut run."""
+    leaves its curved rest, which goes on from the end of the cut run. The run's extent is
+    that of all the `lines` in line with it: a glyph fused with the line may break it."""
     ys, xs = np.nonzero(comp)
     pad = font
     y1, y2 = max(0, ys.min() - pad), ys.max() + pad + 1
@@ -809,8 +902,9 @@ def beside(line: np.ndarray, comp: np.ndarray, font: int) -> bool:
         return False
     pts = np.stack([lx, ly], axis=1).astype(np.float32)
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
-    run = np.abs((lx - x0) * vy - (ly - y0) * vx) <= max(3.0, 0.1 * font)
-    t = (lx[run] - x0) * vx + (ly[run] - y0) * vy
+    ay, ax = np.nonzero(lines[y1:y2, x1:x2])
+    run = np.abs((ax - x0) * vy - (ay - y0) * vx) <= max(3.0, 0.1 * font)
+    t = (ax[run] - x0) * vx + (ay[run] - y0) * vy
     if t.size < 8:
         return False
     tc = (xs - x1 - x0) * vx + (ys - y1 - y0) * vy
@@ -871,19 +965,19 @@ class GlyphMask:
             crop = img[c.sl]
             seg = raw[c.sl] if raw is not None else None
             if seg is not None and seg.max() >= self.strong * 255:
-                m = self._from_seg(crop, seg, c)
+                m = self._from_seg(crop, seg, c, img)
             elif self.method == "seg":
                 m = np.zeros(crop.shape[:2], np.uint8)
             else:
-                m = self._from_pixels(crop, c)
+                m = self._from_pixels(crop, c, img)
             out[c.sl] |= m
         return out
 
-    def _from_seg(self, crop: np.ndarray, seg: np.ndarray, c: Crop) -> np.ndarray:
+    def _from_seg(self, crop: np.ndarray, seg: np.ndarray, c: Crop, page: np.ndarray) -> np.ndarray:
         sure = seg >= self.strong * 255
         core = hysteresis(seg >= self.threshold * 255, sure, c, retry=(sure,))
         if not core.any():
-            return self._from_pixels(crop, c)
+            return self._from_pixels(crop, c, page)
         # paper = the few pixels right around the glyphs; glyph colour = confident seg pixels
         bg = ring_median(crop, core, 5, max(9, c.font // 3))
         if bg is None:
@@ -892,7 +986,7 @@ class GlyphMask:
         fg = np.median(crop[body if body.sum() >= 8 else core], axis=0)
         return self._complete(core, blend_ink(crop, bg, fg, self.ink), c, sure)
 
-    def _from_pixels(self, crop: np.ndarray, c: Crop) -> np.ndarray:
+    def _from_pixels(self, crop: np.ndarray, c: Crop, page: np.ndarray) -> np.ndarray:
         found = find_paper(crop, c, self.flat_spread)
         if found is None:
             return busy_box(c)
@@ -914,10 +1008,11 @@ class GlyphMask:
             m = self._complete(core, blend_ink(crop, bg, fg, self.ink), cn, extra=extra)
         if stuck is not None and stuck.any():
             m |= stuck_fill(stuck, m > 0, c)
-        font = max(c.font, cn.font)
-        if self.glyphs and (left := leftover_glyphs(crop, c, bg, fg, spread, m > 0, font)).any():
+        if self.glyphs:
+            font = max(c.font, cn.font)
             d = max(self.min_dilate, round(font * self.dilation) * 2 + 1)
-            m |= cv2.dilate(left.astype(np.uint8), ellipse(d)) * 255
+            left = leftover_glyphs(page, c, bg, fg, spread, m > 0, font, d)
+            m |= left.astype(np.uint8) * 255
         return m
 
     def _complete(
@@ -989,7 +1084,7 @@ class DilateMask:
             c = make_crop(r, img, self.reach)
             if c is None:
                 continue
-            box = None
+            box = left = None
             if raw is not None:
                 m = raw[c.sl] >= self.threshold * 255
                 m &= c.near
@@ -1012,10 +1107,14 @@ class DilateMask:
                         box = stuck_fill(stuck, m | extra, c)
                     m |= extra
                     erased = m if box is None else m | (box > 0)
-                    m |= leftover_glyphs(crop, c, bg, fg, spread, erased, max(c.font, cn.font))
+                    font = max(c.font, cn.font)
+                    d = max(self.min_dilate, round(cn.font * self.dilation) * 2 + 1)
+                    left = leftover_glyphs(img, c, bg, fg, spread, erased, font, d)
                 c = cn
             d = max(self.min_dilate, round(c.font * self.dilation) * 2 + 1)
             out[c.sl] |= (cv2.dilate(m.astype(np.uint8), ellipse(d)) > 0).astype(np.uint8) * 255
+            if left is not None:
+                out[c.sl] |= left.astype(np.uint8) * 255
             if box is not None:
                 out[c.sl] |= box
         return out

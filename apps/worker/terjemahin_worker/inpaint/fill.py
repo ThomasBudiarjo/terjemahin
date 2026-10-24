@@ -27,5 +27,8 @@ class FillInpainter:
 
 
 @INPAINTERS.register("fill", description="Flat fill with the surrounding median colour (fast).")
-def _build(settings, ring: int = 3, **_):
-    return FillInpainter(ring)
+def _build(settings, ring: int = 3, **extra):
+    from ..opts import as_int, warn_unknown
+
+    warn_unknown("inpainter 'fill'", extra)
+    return FillInpainter(as_int(ring, "inpainter ring", 1, 100))

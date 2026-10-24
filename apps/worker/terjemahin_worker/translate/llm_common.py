@@ -122,6 +122,9 @@ class Backend(Protocol):
 
 # --- HTTP ------------------------------------------------------------------------------------
 
+CONNECT_RETRIES = 1  # connection refused / connect timeout: retried once, not max_retries times
+
+
 class Http:
     """One httpx client plus the retry policy every provider shares."""
 
@@ -157,7 +160,7 @@ class Http:
 
     def post(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
         last: LLMError | None = None
-        read_timeouts = 0
+        read_timeouts = connect_fails = 0
         for attempt in range(self.max_retries + 1):
             retry_after = None
             try:
@@ -167,6 +170,15 @@ class Http:
                 last = LLMError(f"no answer within {self.client.timeout.read}s (timeout option): {e}",
                                 retryable=True)
                 if read_timeouts > self.timeout_retries:
+                    raise last from e
+            except (self.httpx.UnsupportedProtocol, self.httpx.InvalidURL) as e:
+                raise LLMError(f"bad URL {url!r} (check base_url): {e}") from e
+            except (self.httpx.ConnectError, self.httpx.ConnectTimeout) as e:
+                # a server that is not running stays down for the next 30 s of backoff too
+                connect_fails += 1
+                last = LLMError(f"cannot connect to {url}: {e} (is the server running and "
+                                f"base_url right?)", retryable=True)
+                if connect_fails > CONNECT_RETRIES:
                     raise last from e
             except self.httpx.TimeoutException as e:
                 last = LLMError(f"timeout: {e}", retryable=True)
@@ -832,6 +844,7 @@ def make_translator(backend: Backend, settings: Any, core: dict[str, Any], fallb
     if fallback:
         from ..registry import TRANSLATORS
 
+        TRANSLATORS.get(fallback)  # a typo fails at build, not after the primary has failed
         holder: list[Any] = []
 
         def fb(sub: TranslationRequest) -> list[TranslationItem]:

@@ -12,12 +12,14 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from ..models import GlossaryEntry
+from ..opts import as_bool, as_float, as_int, optional
 from ..registry import TRANSLATORS
 from . import textproc as tp
 from .base import TranslationItem, TranslationRequest
@@ -48,8 +50,12 @@ class _Loaded:
     lock: threading.Lock
 
 
-_MODELS: dict[tuple[str, str, bool], _Loaded] = {}
+_MODELS: OrderedDict[tuple[str, str, bool], _Loaded] = OrderedDict()
 _MODELS_LOCK = threading.Lock()
+# models kept loaded at once (a chain such as m2m100:en,nllb needs two); the least recently
+# used beyond that is dropped, so switching translators in a long-lived server does not keep
+# every model ever used (each 1.5-5 GB) in memory
+MAX_MODELS = int(os.environ.get("SEQ2SEQ_MAX_MODELS", "2"))
 
 
 def load_model(repo: str, device: str = "cpu", quantize: bool = False) -> _Loaded:
@@ -57,7 +63,14 @@ def load_model(repo: str, device: str = "cpu", quantize: bool = False) -> _Loade
     key = (repo, device, quantize)
     with _MODELS_LOCK:
         if key in _MODELS:
+            _MODELS.move_to_end(key)
             return _MODELS[key]
+        while len(_MODELS) >= max(1, MAX_MODELS):
+            old, _ = _MODELS.popitem(last=False)
+            log.info("unloading %s to make room for %s", old[0], repo)
+            import gc
+
+            gc.collect()
         # transformers would otherwise phone the hub on every load to offer a safetensors PR
         os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
         import torch
@@ -158,20 +171,31 @@ class Seq2SeqTranslator:
     ) -> None:
         if family not in ("nllb", "m2m100"):
             raise ValueError(f"unknown model family '{family}'")
+        other = "m2m100" if family == "nllb" else "nllb"
+        if other in str(repo).lower():
+            raise ValueError(f"model {repo!r} is a {other} checkpoint; use translator '{other}' "
+                             f"(this one speaks {family} language codes)")
         self.repo, self.family, self.device = repo, family, device
-        self.num_beams, self.batch_size = max(1, int(num_beams)), max(1, int(batch_size))
-        self.threads = threads
-        self.max_ratio, self.max_tokens = float(max_ratio), int(max_tokens)
-        self.no_repeat_ngram_size = int(no_repeat_ngram_size)
-        self.repetition_penalty = float(repetition_penalty)
-        self.length_penalty = float(length_penalty)
-        self.retries = int(retries)
-        self.interjections, self.use_glossary, self.quantize = interjections, glossary, quantize
-        self.casual, self.names = casual, names
-        self.standardize = standardize  # colloquial ja -> standard forms (textproc.standardize_ja)
-        self.split = split  # translate multi-sentence bubbles sentence by sentence
+        self.num_beams = as_int(num_beams, "translator num_beams", 1, 64)
+        self.batch_size = as_int(batch_size, "translator batch_size", 1, 1024)
+        self.threads = optional(as_int, threads, "translator threads", 0, 1024) or None
+        self.max_ratio = as_float(max_ratio, "translator max_ratio", 0.1)
+        self.max_tokens = as_int(max_tokens, "translator max_tokens", 1, 4096)
+        self.no_repeat_ngram_size = as_int(no_repeat_ngram_size, "translator no_repeat_ngram_size", 0)
+        self.repetition_penalty = as_float(repetition_penalty, "translator repetition_penalty", 0.01)
+        self.length_penalty = as_float(length_penalty, "translator length_penalty")
+        self.retries = as_int(retries, "translator retries", 0, 10)
+        self.interjections = as_bool(interjections, "translator interjections")
+        self.use_glossary = as_bool(glossary, "translator glossary")
+        self.quantize = as_bool(quantize, "translator quantize")
+        self.casual, self.names = as_bool(casual, "translator casual"), as_bool(names, "translator names")
+        # colloquial ja -> standard forms (textproc.standardize_ja)
+        self.standardize = as_bool(standardize, "translator standardize")
+        self.split = as_bool(split, "translator split")  # multi-sentence bubbles one by one
         self._auto_threads: tuple[float, int] | None = None  # threads=None: (when, idle cores)
-        self.pre_dict, self.post_dict = pre_dict or {}, post_dict or {}
+        self.pre_dict = _rules(pre_dict, "translator pre_dict")
+        self.post_dict = _rules(post_dict, "translator post_dict")
+        self._warned: set[str] = set()
 
     def _auto(self) -> int:
         now = time.monotonic()
@@ -180,6 +204,10 @@ class Seq2SeqTranslator:
         return self._auto_threads[1]
 
     def code(self, lang: str) -> str:
+        if self.family == "m2m100" and tp.iso(lang) == "zh-hant" and lang not in self._warned:
+            self._warned.add(lang)
+            log.warning("m2m100 has no Traditional Chinese: '%s' is translated as Simplified "
+                        "Chinese (use nllb for zh-hant)", lang)
         return tp.nllb_code(lang) if self.family == "nllb" else tp.m2m_code(lang)
 
     def _loaded(self) -> _Loaded:
@@ -254,7 +282,16 @@ class Seq2SeqTranslator:
         glossary: Iterable[GlossaryEntry] = (),
     ) -> list[str]:
         if source == "auto":
-            source = tp.detect_lang(texts)
+            langs = tp.detect_langs(texts)
+            if len(set(langs)) > 1:  # a mixed page: each language on its own
+                out = [""] * len(texts)
+                for lang in dict.fromkeys(langs):
+                    idx = [i for i, x in enumerate(langs) if x == lang]
+                    part = self.translate_texts([texts[i] for i in idx], lang, target, glossary)
+                    for i, t in zip(idx, part):
+                        out[i] = t
+                return out
+            source = langs[0] if langs else "en"
         if tp.iso(source) == tp.iso(target):
             return list(texts)
         gl = list(glossary) if self.use_glossary else []
@@ -299,6 +336,28 @@ class Seq2SeqTranslator:
             req.sources, req.source_lang, req.target_lang, req.context.glossary
         )
         return [TranslationItem(source=s, target=t) for s, t in zip(req.sources, targets)]
+
+
+def _rules(v: Any, name: str) -> dict[str, str]:
+    """{regex: replacement} or its JSON string; checked here so a bad one fails at build."""
+    import json
+    import re
+
+    if v is None or v == "":
+        return {}
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except json.JSONDecodeError:
+            raise ValueError(f"{name} must be a JSON object {{regex: replacement}}") from None
+    if not isinstance(v, dict) or not all(isinstance(k, str) and isinstance(r, str) for k, r in v.items()):
+        raise ValueError(f"{name} must be an object of {{regex: replacement}} strings, not {v!r}")
+    for pat in v:
+        try:
+            re.compile(pat)
+        except re.error as e:
+            raise ValueError(f"{name}: bad regex {pat!r}: {e}") from None
+    return dict(v)
 
 
 _KNOWN = {

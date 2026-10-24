@@ -324,8 +324,14 @@ class Mit48pxOCR:
     ) -> None:
         import torch
 
+        from ..opts import as_float, as_int, optional
         from ._mit48px_model import OCR48px
 
+        beams = as_int(beams, "ocr beams", 1, 32)
+        batch = as_int(batch, "ocr batch", 1, 1024)
+        min_line_conf = as_float(min_line_conf, "ocr min_line_conf", 0.0, 1.0)
+        margin = as_float(margin, "ocr margin", 0.0, 1.0)
+        threads = optional(as_int, threads, "ocr threads", 0, 1024)
         self.threads = int(threads) if threads else default_threads()
         with open(alphabet_path, encoding="utf-8") as f:
             self.alphabet = [s.rstrip("\n") for s in f]

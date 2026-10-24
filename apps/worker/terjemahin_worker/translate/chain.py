@@ -20,14 +20,25 @@ def parse_steps(steps: Any) -> list[dict[str, Any]]:
     if isinstance(steps, str):
         s = steps.strip()
         if s.startswith("["):
-            steps = json.loads(s)
+            try:
+                steps = json.loads(s)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"chain steps: invalid JSON: {e}") from None
         else:
             steps = [
                 dict(zip(("translator", "to"), part.split(":", 1)))
                 for part in s.split(",") if part.strip()
             ]
+    if not isinstance(steps, (list, tuple)):
+        raise ValueError(  # noqa: TRY004 - callers expect ValueError for bad options
+            f"chain steps must be a list of steps or 'm2m100:en,nllb', not {steps!r}"
+        )
     out: list[dict[str, Any]] = []
     for step in steps or []:
+        if not isinstance(step, dict):
+            raise ValueError(  # noqa: TRY004 - callers expect ValueError for bad options
+                f"chain step must be {{'translator': name, 'to': lang}}, not {step!r}"
+            )
         step = dict(step)
         name = step.pop("translator", None) or step.pop("name", None)
         if not name:
@@ -35,6 +46,8 @@ def parse_steps(steps: Any) -> list[dict[str, Any]]:
         if name == "chain":
             raise ValueError("a chain cannot contain itself")
         to = step.pop("to", None)
+        if to:
+            tp.iso(str(to).strip())  # unsupported language: ValueError now, not after OCR
         opts = {**step.pop("opts", {}), **step}
         out.append({"translator": str(name).strip(), "to": to and str(to).strip(), "opts": opts})
     if not out:
@@ -76,7 +89,11 @@ class ChainTranslator:
         return hops
 
     def translate(self, req: TranslationRequest) -> list[TranslationItem]:
-        source = tp.detect_lang(req.sources) if req.source_lang == "auto" else req.source_lang
+        if req.source_lang == "auto":  # the page's most common script, not 'any kana anywhere'
+            langs = tp.detect_langs(req.sources)
+            source = max(set(langs), key=langs.count) if langs else "en"
+        else:
+            source = req.source_lang
         source = tp.iso(source)
         if self.threads:  # torch's pool is process-wide, so one setting covers every hop
             import torch
@@ -135,4 +152,9 @@ def _build(
     casual: bool = True,
     threads: int | None = None,
 ):
-    return ChainTranslator(settings, steps, prepare, casual, threads)
+    from ..opts import as_bool, as_int, optional
+
+    return ChainTranslator(
+        settings, steps, as_bool(prepare, "translator prepare"), as_bool(casual, "translator casual"),
+        optional(as_int, threads, "translator threads", 0),
+    )

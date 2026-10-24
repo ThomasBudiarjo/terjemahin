@@ -71,6 +71,13 @@ class Bubble(BaseModel):
     target_text: str = ""
     speaker: str | None = None
     ocr_confidence: float | None = None
+    erase: bool | None = None
+    """Whether the original text under the box is erased. None (a bubble added by hand):
+    erased when it has source_text. The pipeline sets it on every bubble it produces; it is
+    False when a translation came back empty, so the original text stays instead of a blank."""
+
+    def erases(self) -> bool:
+        return bool(self.source_text.strip()) if self.erase is None else self.erase
 
 
 class GlossaryEntry(BaseModel):
@@ -108,6 +115,8 @@ class PipelineConfig(BaseModel):
     source_lang: str = "ja"
     target_lang: str = "id"
     options: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    min_ocr_confidence: float | None = None
+    """Bubbles whose OCR confidence is below this are left untouched (Settings default)."""
 
 
 class PageResult(BaseModel):

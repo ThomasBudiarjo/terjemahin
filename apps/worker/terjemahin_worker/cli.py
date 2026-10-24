@@ -9,7 +9,9 @@ import cv2
 import typer
 
 from .config import get_settings
+from .imageio import ImageError, read_image
 from .models import PageContext, PageResult, PipelineConfig
+from .registry import STAGES
 
 app = typer.Typer(no_args_is_help=True, help="terjemahin worker")
 
@@ -31,20 +33,57 @@ def _setup(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
     )
 
 
+# --opt stage names as the method flags spell them (--mask, -i/--inpainter, -r/--renderer)
+STAGE_ALIASES = {
+    "mask": "mask_refiner", "refiner": "mask_refiner", "inpaint": "inpainter",
+    "render": "renderer", "detect": "detector", "translate": "translator", "tr": "translator",
+}
+_WORDS = {"true": True, "false": False, "yes": True, "no": False, "on": True, "off": False,
+          "none": None, "null": None}
+
+
 def _parse_opts(opts: list[str]) -> dict[str, dict[str, Any]]:
-    """`--opt inpainter.size=1024 --opt detector.conf=0.3` -> {"inpainter": {"size": 1024}, ...}"""
+    """`--opt inpainter.merge=32 --opt detector.conf=0.3` -> {"inpainter": {"merge": 32}, ...}
+
+    Values are JSON (numbers, [lists], {objects}); True/False, yes/no, on/off (any case) are
+    booleans and None/null is null, so `renderer.uppercase=False` really is false. The stage
+    is a registry stage or the name of its flag (mask, inpaint, render ...); anything else is
+    an error, not an option silently ignored."""
     out: dict[str, dict[str, Any]] = {}
     for o in opts:
         key, _, raw = o.partition("=")
-        stage, _, name = key.partition(".")
+        stage, _, name = key.strip().partition(".")
         if not name or not raw:
             raise typer.BadParameter(f"--opt expects stage.key=value, got {o!r}")
-        try:
-            val: Any = json.loads(raw)
-        except json.JSONDecodeError:
-            val = raw
+        stage = STAGE_ALIASES.get(stage, stage)
+        if stage not in STAGES:
+            raise typer.BadParameter(
+                f"--opt {o!r}: unknown stage {stage!r}, choose from: {', '.join(STAGES)} "
+                f"(or {', '.join(STAGE_ALIASES)})"
+            )
+        word = raw.strip().lower()
+        if word in _WORDS:
+            val: Any = _WORDS[word]
+        else:
+            try:
+                val = json.loads(raw)
+            except json.JSONDecodeError:
+                val = raw
         out.setdefault(stage, {})[name] = val
     return out
+
+
+def _read(image: Path):
+    try:
+        return read_image(image, get_settings().max_pixels)
+    except ImageError as e:
+        raise typer.BadParameter(str(e)) from None
+
+
+def _fail(e: Exception) -> typer.Exit:
+    """A configuration error found before the pipeline ran: one line, not a traceback."""
+    typer.echo(f"error: {e}", err=True)
+    return typer.Exit(2)
 
 
 def _config(
@@ -90,13 +129,17 @@ def translate(
     from .pipeline import Pipeline
 
     ctx = PageContext.model_validate_json(context.read_text()) if context else PageContext()
-    page = cv2.imread(str(image))
-    if page is None:
-        raise typer.BadParameter(f"cannot read {image}")
+    page = _read(image)
     cfg = _config(
         detector, ocr, translator, mask_refiner, inpainter, renderer, opt, source_lang, target_lang
     )
-    res = Pipeline(get_settings()).run(page, ctx, cfg, debug=debug_dir is not None)
+    pipe = Pipeline(get_settings())
+    cfg = pipe.resolve(cfg)
+    try:
+        pipe.check(cfg)  # unknown methods, bad options or languages: before any stage runs
+    except (ValueError, FileNotFoundError) as e:
+        raise _fail(e) from None
+    res = pipe.run(page, ctx, cfg, debug=debug_dir is not None)
     out.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out), res.image)
     if dump:
@@ -119,8 +162,13 @@ def compose(
     """Re-typeset from an edited PageResult without calling the detector, OCR or translator."""
     from .pipeline import Pipeline
 
-    page = cv2.imread(str(image))
+    page = _read(image)
     res = PageResult.model_validate_json(result.read_text())
+    if (res.width, res.height) != (page.shape[1], page.shape[0]):
+        raise typer.BadParameter(
+            f"{result} is for a {res.width}x{res.height} page, {image} is "
+            f"{page.shape[1]}x{page.shape[0]}: the boxes would land in the wrong places"
+        )
     base = res.pipeline or PipelineConfig()
     cfg = base.model_copy(
         update={
@@ -132,8 +180,14 @@ def compose(
         }
     )
     cfg.options.update(_parse_opts(opt))
+    pipe = Pipeline(get_settings())
+    cfg = pipe.resolve(cfg)
+    try:
+        pipe.check(cfg, ("mask_refiner", "inpainter", "renderer"))
+    except (ValueError, FileNotFoundError) as e:
+        raise _fail(e) from None
     out.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out), Pipeline(get_settings()).compose(page, res.bubbles, cfg))
+    cv2.imwrite(str(out), pipe.compose(page, res.bubbles, cfg))
     typer.echo(f"wrote {out}")
 
 
@@ -150,14 +204,36 @@ def detect(
 
     pipe = Pipeline(get_settings())
     cfg = pipe.resolve(PipelineConfig(detector=detector, options=_parse_opts(opt)))
-    page = cv2.imread(str(image))
+    page = _read(image)
+    try:
+        pipe.check(cfg, ("detector",))
+    except (ValueError, FileNotFoundError) as e:
+        raise _fail(e) from None
     det = pipe.stage("detector", cfg).detect(page)
-    regions = sort_reading_order(det.regions)
+    regions = sort_reading_order(det.regions, image=page)  # the ids translate assigns
     out.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out), draw_regions(page, regions))
     if det.mask is not None:
         cv2.imwrite(str(out.with_name(out.stem + "-mask.png")), det.mask)
     typer.echo(json.dumps([r.model_dump() for r in regions], indent=2))
+
+
+def _factory_options(factory: Any) -> dict[str, Any]:
+    """Named options of a method factory with their defaults (methods taking **opts list
+    only what their signature names; see the method's docs for the rest)."""
+    import inspect
+
+    try:
+        params = list(inspect.signature(factory).parameters.values())[1:]  # after settings
+    except (TypeError, ValueError):
+        return {}
+    out: dict[str, Any] = {}
+    for p in params:
+        if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
+            continue
+        d = None if p.default is p.empty else p.default
+        out[p.name] = d if isinstance(d, (bool, int, float, str, type(None))) else repr(d)
+    return out
 
 
 @app.command()
@@ -180,6 +256,7 @@ def methods(as_json: bool = typer.Option(False, "--json")) -> None:
                     "offline": info.offline,
                     "description": info.description,
                     "default": getattr(settings, stage) == name,
+                    "options": _factory_options(info.factory),
                 }
             )
     if as_json:

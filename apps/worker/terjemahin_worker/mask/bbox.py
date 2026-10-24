@@ -22,5 +22,8 @@ class BoxMask:
 
 
 @MASK_REFINERS.register("bbox", description="Erase the whole padded text box.")
-def _build(settings, pad: int = 3, **_):
-    return BoxMask(pad)
+def _build(settings, pad: int = 3, **extra):
+    from ..opts import as_float, warn_unknown
+
+    warn_unknown("mask_refiner 'bbox'", extra)
+    return BoxMask(round(as_float(pad, "mask_refiner pad", 0, 1000)))

@@ -9,12 +9,14 @@ outputs on page01, so all heads stay on by default.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from ..models import BBox, TextRegion
+from ..opts import as_bool, as_float, as_int, optional, warn_unknown
 from ..registry import DETECTORS
 from ..weights import ensure
 from .base import Detection
@@ -48,6 +50,9 @@ def make_session(path: Path, heads: tuple[str, ...] = HEADS, threads: int = 0):
     return ort.InferenceSession(model, so, providers=["CPUExecutionProvider"])
 
 
+MAX_UPSCALE = 2.0
+
+
 def plan_tiles(
     w: int, h: int, size: int, tile_aspect: float, tile_shape: float = 1.5, overlap: float = 0.2
 ) -> tuple[float, list[tuple[int, int, int, int]]]:
@@ -57,7 +62,11 @@ def plan_tiles(
     long, short = max(w, h), min(w, h)
     if long <= tile_aspect * short:
         return size / long, [(0, 0, w, h)]
-    tile = round(tile_shape * short)
+    # never upscale a tile more than MAX_UPSCALE: an 8 px wide strip made 1024/12 = 85x tiles,
+    # ~32 forward passes for a 300 px image (and a 100x12000 strip about 100)
+    tile = max(round(tile_shape * short), min(long, math.ceil(size / MAX_UPSCALE)))
+    if tile >= long:
+        return size / long, [(0, 0, w, h)]
     step = max(1, int(tile * (1 - overlap)))
     starts = list(range(0, long - tile, step)) + [long - tile]
     if h >= w:
@@ -93,6 +102,17 @@ class CtdFullDetector:
         if "blk" not in heads and "det" not in heads:
             raise ValueError("ctd needs the 'blk' or 'det' head to find text")
         self.heads = tuple(h for h in HEADS if h in heads)
+        conf = as_float(conf, "detector conf", 0.0, 1.0)
+        iou = as_float(iou, "detector iou", 0.0, 1.0)
+        line_thresh = as_float(line_thresh, "detector line_thresh", 0.0, 1.0)
+        line_box_thresh = as_float(line_box_thresh, "detector line_box_thresh", 0.0, 1.0)
+        unclip = as_float(unclip, "detector unclip", 0.1, 10.0)
+        mask_thresh = optional(as_float, mask_thresh, "detector mask_thresh", 0.0, 1.0)
+        box_padding = as_int(box_padding, "detector box_padding", 0, 500)
+        split_gap = as_float(split_gap, "detector split_gap", 0.1)
+        keep_scattered = as_bool(keep_scattered, "detector keep_scattered")
+        tile_aspect = as_float(tile_aspect, "detector tile_aspect", 1.0)
+        threads = as_int(threads, "detector threads", 0, 1024)
         self.session = session or make_session(weights, self.heads, threads)
         self.size = 1024
         self.conf, self.iou = conf, iou
@@ -301,8 +321,9 @@ def _build(
     tile_aspect: float = 2.5,
     mask_scope: str = "blocks",
     weights: str | None = None,
-    **_,
+    **extra,
 ):
+    warn_unknown("detector 'ctd'", extra)
     return CtdFullDetector(
         Path(weights) if weights else ensure("ctd", settings),
         conf=settings.detect_conf if conf is None else conf,

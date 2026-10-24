@@ -53,8 +53,11 @@ def _build(
     weights=None,
     threads: int = 0,
     tile_aspect: float = 2.5,
-    **_,
+    **extra,
 ):
+    from ..opts import warn_unknown
+
+    warn_unknown("detector 'ctd_blk'", extra)
     return CtdDetector(
         Path(weights or settings.ctd_weights),
         settings.detect_conf if conf is None else conf,

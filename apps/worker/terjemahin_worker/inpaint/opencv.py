@@ -35,15 +35,23 @@ class CvInpainter:
         return out
 
 
-def _opts(o: dict[str, Any]) -> dict[str, Any]:
-    return {k: int(v) for k, v in o.items() if k in ("radius", "merge")}
+def _opts(o: dict[str, Any], name: str = "") -> dict[str, Any]:
+    from ..opts import as_int, warn_unknown
+
+    warn_unknown(f"inpainter '{name}'", {k: v for k, v in o.items() if k not in ("radius", "merge")})
+    out = {}
+    if "radius" in o:
+        out["radius"] = as_int(o["radius"], "inpainter radius", 1, 100)
+    if "merge" in o:
+        out["merge"] = as_int(o["merge"], "inpainter merge", 0, 1000)
+    return out
 
 
 @INPAINTERS.register("telea", description="OpenCV Telea fast-marching inpaint (no weights, fast).")
 def _build_telea(settings, **opts: Any) -> CvInpainter:
-    return CvInpainter(cv2.INPAINT_TELEA, **_opts(opts))
+    return CvInpainter(cv2.INPAINT_TELEA, **_opts(opts, "telea"))
 
 
 @INPAINTERS.register("ns", description="OpenCV Navier-Stokes inpaint (no weights, fast).")
 def _build_ns(settings, **opts: Any) -> CvInpainter:
-    return CvInpainter(cv2.INPAINT_NS, **_opts(opts))
+    return CvInpainter(cv2.INPAINT_NS, **_opts(opts, "ns"))

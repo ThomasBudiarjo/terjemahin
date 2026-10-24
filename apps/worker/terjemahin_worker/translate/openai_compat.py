@@ -158,6 +158,8 @@ def _build(
             raise ValueError(f"unknown provider '{preset}', choose from: {', '.join(PRESETS)}")
         base_url = PRESETS[preset]
     base_url = rest.pop("base_url", None) or base_url
+    if not str(base_url).lower().startswith(("http://", "https://")):
+        raise ValueError(f"translator base_url must start with http:// or https://, not {base_url!r}")
     model = rest.pop("model", None) or model
     api_key = rest.pop("api_key", None) or api_key
     vision = rest.pop("vision", vision)

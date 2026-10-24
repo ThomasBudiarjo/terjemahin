@@ -137,12 +137,10 @@ def _extract(
     cover = float((region[box > 0] > 0).mean())
     chroma = float(np.hypot(ref[1] - 128, ref[2] - 128))
     art = ART_L[0] < ref[0] < ART_L[1] and chroma > ART_CHROMA
-    closed = (
-        not touches
-        and not art
-        and area <= MAX_AREA_RATIO * max(1, bbox.w * bbox.h)
-        and cover >= MIN_COVER
-    )
+    # a thin box ('...', a column of '!!') is judged as if it were a quarter of a square
+    # around it: its own area is tiny next to any balloon
+    ref_area = max(1, bbox.w * bbox.h, max(bbox.w, bbox.h) ** 2 // 4)
+    closed = not touches and not art and area <= MAX_AREA_RATIO * ref_area and cover >= MIN_COVER
     return Balloon(region, win.x1, win.y1, closed, color), touches  # type: ignore[arg-type]
 
 

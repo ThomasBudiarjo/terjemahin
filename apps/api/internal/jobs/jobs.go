@@ -61,6 +61,17 @@ func (s *MemoryStore) Put(j Job) {
 	s.jobs[j.JobID] = j
 }
 
+// IDs lists the stored job ids (tests and diagnostics).
+func (s *MemoryStore) IDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.jobs))
+	for id := range s.jobs {
+		out = append(out, id)
+	}
+	return out
+}
+
 func (s *MemoryStore) Get(id string) (Job, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

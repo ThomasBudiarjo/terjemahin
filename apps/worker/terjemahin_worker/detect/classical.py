@@ -62,12 +62,14 @@ class ClassicalDetector:
         min_solidity: float = 0.8,
         min_font: int = 8,  # px at a 1500 px wide page
     ) -> None:
-        self.bright = bright
-        self.dark = dark
-        self.min_balloon = min_balloon
-        self.max_balloon = max_balloon
-        self.min_solidity = min_solidity
-        self.min_font = min_font
+        from ..opts import as_float, as_int
+
+        self.bright = as_int(bright, "detector bright", 0, 255)
+        self.dark = as_int(dark, "detector dark", 0, 255)
+        self.min_balloon = as_float(min_balloon, "detector min_balloon", 0.0, 1.0)
+        self.max_balloon = as_float(max_balloon, "detector max_balloon", 0.0, 1.0)
+        self.min_solidity = as_float(min_solidity, "detector min_solidity", 0.0, 1.0)
+        self.min_font = as_int(min_font, "detector min_font", 1)
 
     def balloons(self, gray: np.ndarray) -> list[Balloon]:
         h, w = gray.shape
