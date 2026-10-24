@@ -400,3 +400,121 @@ def test_box_partly_off_page(cls):
     r = TextRegion(id=0, bbox=BBox(x1=-30, y1=b.y1 - 5, x2=b.x2 - dx + 5, y2=b.y2 + 5))
     m = cls().refine(shifted, [r], None)
     assert covered(m, g, 0.3) > 0.99
+
+
+def lettering_page(
+    outline: int = 0, two_tone: bool = False, cross: bool = False, thin: bool = False
+):
+    """Text touching an art line that runs off the page window, on flat lavender paper; with an
+    outline ring (black SFX lettering with a white edge), half the page a darker background,
+    another art line crossing behind the text, or strokes as thin as the art lines.
+
+    Returns image, box-only region, glyph alpha, ring alpha (glyph + outline) and the lines."""
+    H, W = 240, 320
+    img = np.full((H, W, 3), (172, 148, 158), np.uint8)
+    if two_tone:
+        img[:, 170:] = (63, 51, 51)
+    lines = np.zeros((H, W), np.uint8)
+    cv2.line(lines, (60, 0), (70, H), 255, 4, cv2.LINE_AA)
+    if cross:
+        cv2.line(lines, (0, 95), (W, 115), 255, 3, cv2.LINE_AA)
+    glyphs = np.zeros((H, W), np.uint8)
+    cv2.putText(glyphs, "AWB", (52, 140), cv2.FONT_HERSHEY_SIMPLEX, 2.0, 255, 7, cv2.LINE_AA)
+    if thin:  # OpenCV 5's putText ignores the thickness
+        glyphs = cv2.erode(glyphs, np.ones((3, 3), np.uint8), iterations=2)
+    img = blend(img, lines, (40, 30, 90))
+    ring = glyphs
+    if outline:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * outline + 1, 2 * outline + 1))
+        ring = cv2.dilate(glyphs, k)
+        img = blend(img, ring, (255, 255, 255))
+    img = blend(img, glyphs, (5, 5, 5))
+    ys, xs = np.nonzero(ring)
+    box = BBox(
+        x1=int(xs.min()) - 16, y1=int(ys.min()) - 16, x2=int(xs.max()) + 17, y2=int(ys.max()) + 17
+    )
+    return img, TextRegion(id=0, bbox=box), glyphs, ring, lines
+
+
+def far_from(alpha: np.ndarray, lines: np.ndarray, region: TextRegion, px: int = 24) -> np.ndarray:
+    """Art line pixels more than `px` from the glyphs and outside the (slightly grown) box."""
+    k = np.ones((2 * px + 1, 2 * px + 1), np.uint8)
+    out = (lines > 200) & ~(cv2.dilate((alpha > 0).astype(np.uint8), k) > 0)
+    b = region.bbox.pad(4)
+    out[max(0, b.y1) : b.y2, max(0, b.x1) : b.x2] = False
+    return out
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {},  # plain glyph fused with the art line
+        {"outline": 3},
+        {"outline": 3, "two_tone": True},  # the paper detection can only take one background
+        {"outline": 3, "two_tone": True, "cross": True},
+        {"cross": True},
+    ],
+)
+def test_box_only_glyphs_touching_art(cls, kw):
+    """Without a detector mask, glyphs fused with an art line are split from it by stroke
+    width, outlined lettering comes with its outline ring whatever background it is on, and
+    the art away from the glyphs stays."""
+    img, region, glyphs, ring, lines = lettering_page(**kw)
+    m = cls().refine(img, [region], None) > 0
+    assert m[glyphs > 30].all()
+    assert m[ring > 30].all()
+    far = far_from(ring, lines, region)
+    if cls is GlyphMask:
+        assert not (m & far).any()
+    b = region.bbox
+    assert m[b.y1 : b.y2, b.x1 : b.x2].mean() < 0.9  # glyph-shaped, not the box
+
+
+def test_box_only_unsplittable_text_is_box_erased():
+    """Strokes as thin as the art lines they are fused with cannot be split off: erase the box
+    instead of leaving half erased glyphs."""
+    img, region, glyphs, _, _ = lettering_page(cross=True, thin=True)
+    for cls in (GlyphMask, DilateMask):
+        m = cls().refine(img, [region], None) > 0
+        assert m[glyphs > 30].all(), cls.__name__
+
+
+def test_glyphs_option_off_keeps_first_pass_only():
+    img, region, _, ring, _ = lettering_page(outline=3, two_tone=True)
+    assert covered(GlyphMask(glyphs=False).refine(img, [region], None), ring / 255.0, 0.1) < 0.9
+    s = Settings()
+    assert not MASK_REFINERS.build("default", s, glyphs="false").glyphs
+    assert not MASK_REFINERS.build("dilate", s, glyphs="0").glyphs
+
+
+PAGE01_SFX = {"ごろん": (728, 1190, 934, 1300), "もじ…": (1226, 1872, 1330, 1974)}
+
+
+def sfx_truth(img: np.ndarray, box: tuple[int, int, int, int]):
+    """White outline, the black fill it encloses, and dark art / background away from both."""
+    x1, y1, x2, y2 = box
+    g = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    white = (g > 200).astype(np.uint8)
+    reach = np.pad(white, 1)
+    cv2.floodFill(reach, None, (0, 0), 2)
+    fill = (reach[1:-1, 1:-1] == 0) & (g < 100)
+    art = (g < 60) & ~(cv2.dilate(white, np.ones((21, 21), np.uint8)) > 0)
+    return white > 0, fill, art
+
+
+@pytest.mark.skipif(not PAGE.exists(), reason="page01 missing")
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize("pad", [0, 12, 30])
+def test_page01_outlined_sfx_without_detector_mask(cls, pad):
+    """Black SFX with a white edge over art (ごろん crosses two backgrounds and art lines; も of
+    もじ… touches the arm line): fill and outline erased from a bare box, art kept."""
+    img = cv2.imread(str(PAGE))
+    for name, (x1, y1, x2, y2) in PAGE01_SFX.items():
+        r = TextRegion(id=0, bbox=BBox(x1=x1 - pad, y1=y1 - pad, x2=x2 + pad, y2=y2 + pad))
+        m = cls().refine(img, [r], None)[y1:y2, x1:x2] > 0
+        white, fill, art = sfx_truth(img, (x1, y1, x2, y2))
+        assert white.sum() > 500 and fill.sum() > 400
+        assert m[white].mean() > 0.995 and m[fill].mean() > 0.995, (name, pad)
+        if cls is GlyphMask:
+            assert m[art].mean() < 0.01, (name, pad)

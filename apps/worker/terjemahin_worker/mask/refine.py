@@ -380,6 +380,256 @@ def find_paper(
     return None if not c.has_lines else balloon_paper(crop, c)
 
 
+def stroke_width(m: np.ndarray) -> float:
+    """Typical stroke thickness of a binary shape: 2 x area / boundary length (exact for long
+    strokes, half the diameter for a dot)."""
+    m8 = np.pad(m.astype(np.uint8), 1)
+    contours, _ = cv2.findContours(m8, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    length = sum(cv2.arcLength(k, True) for k in contours)
+    return max(1.0, 2.0 * float(m8.sum()) / length) if length > 0 else 1.0
+
+
+def nearest(px: np.ndarray, colors: list[np.ndarray]) -> np.ndarray:
+    """Index of the closest of `colors` for every pixel."""
+    return np.argmin(np.stack([color_distance(px, k) for k in colors]), axis=0)
+
+
+def segment_distance(px: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Distance of each pixel colour (N x 3) to the nearest mix of colours `a` and `b`."""
+    ab = (b - a).astype(np.float32)
+    d = px.astype(np.float32) - a.astype(np.float32)
+    t = np.clip((d @ ab) / max(float(ab @ ab), 1.0), 0.0, 1.0)
+    off = d - t[:, None] * ab
+    return np.sqrt((off * off).sum(axis=1) / 3.0)
+
+
+def flat_surround(px: np.ndarray, fg: np.ndarray, tol: float = 30.0) -> float:
+    """Share of `px` that is one colour, or two (paper and an outline ring, or two papers),
+    or their anti-aliased mixes with each other or the glyph: a glyph's surround. Art with
+    its shading and lines rarely is."""
+    o1 = dominant(px)
+    close = color_distance(px[None], o1)[0] < tol
+    if close.all() or (~close).sum() < 8:
+        return float(close.mean())
+    o2 = dominant(px[~close])
+    d = np.minimum.reduce([segment_distance(px, a, b) for a, b in ((o1, o2), (o1, fg), (o2, fg))])
+    return float((d < tol).mean())
+
+
+def glyph_candidates(
+    ink: np.ndarray,
+    zone: np.ndarray,
+    c: Crop,
+    font: int,
+    speck: int,
+    split: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(labels, stats, glyph-like, fused) per label. Glyph-like: in the zone, glyph-sized,
+    no speck; strokes `split` off an art line may be several touching glyphs. Fused: ink with
+    a fair share in the zone that is not glyph-like, as text fused with a line."""
+    n, labels, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    flat = labels.ravel()
+    inside = np.bincount(flat[zone.ravel()], minlength=n)
+    leaves = np.bincount(flat[c.cut.ravel()], minlength=n) > 0
+    area = st[:, cv2.CC_STAT_AREA]
+    # a bare box's font size is a guess (lettering sizes vary): any glyph up to its short side
+    x1, y1, x2, y2 = c.box
+    size = 1.5 * font if c.has_lines else max(1.5 * font, min(x2 - x1, y2 - y1))
+    small = np.maximum(st[:, cv2.CC_STAT_WIDTH], st[:, cv2.CC_STAT_HEIGHT]) <= size
+    if split is not None:
+        small |= np.bincount(flat[split.ravel()], minlength=n) >= 0.9 * area
+    ok = (inside >= 0.9 * area) & ~leaves & small & (area >= speck)
+    fused = ~ok & (inside >= 4 * speck)
+    ok[0] = fused[0] = False
+    return labels, st, ok, fused
+
+
+STUCK = 2.0  # stroke area per line width and extent: one line crossing the zone stays below
+
+
+def split_fused(comp: np.ndarray, zone: np.ndarray) -> tuple[np.ndarray | None, bool]:
+    """Text strokes fused with an art line or outline that runs through the text zone, split
+    off by stroke width: an opening just wider than the line (measured where it runs outside
+    the zone) removes the line and keeps the thicker glyph strokes, which then grow back over
+    their own edges. Returns (strokes or None, whether the zone part looks like text that
+    could not be split: far more stroke than one line crossing the zone would have)."""
+    line, inner = comp & ~zone, comp & zone
+    if line.sum() < 20:
+        return None, False
+    lw = stroke_width(line)
+    k = int(np.ceil(lw)) + 2
+    body = cv2.morphologyEx(inner.astype(np.uint8), cv2.MORPH_OPEN, ellipse(k)) > 0
+    # strokes clearly thicker than the line, not just the knots where lines cross or bend
+    if body.sum() >= 0.25 * inner.sum() and stroke_width(body) >= 1.4 * lw:
+        return inner & (cv2.dilate(body.astype(np.uint8), ellipse(k)) > 0), False
+    ys, xs = np.nonzero(inner)
+    span = max(int(xs.max() - xs.min()), int(ys.max() - ys.min())) + 1
+    return None, float(inner.sum()) >= STUCK * lw * span
+
+
+def outlined_glyphs(
+    crop: np.ndarray,
+    c: Crop,
+    bg: np.ndarray,
+    fg: np.ndarray,
+    font: int,
+    outlined_only: bool = False,
+    alpha: float = 0.6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Glyphs found one by one, whatever the paper detection made of the text zone: solid
+    components of the text colour that fit a glyph, lie in the text zone and sit on a flat
+    surround (paper, or an outline ring on anything; art around an eye or a hair strand is
+    neither). A glyph with an outline ring (black SFX with a white edge) comes with its ring,
+    and when most of the text is outlined, ink without a ring is art showing between glyphs.
+    Glyphs fused with an art line are split from it by stroke width.
+    This finds the glyphs of text on two backgrounds (only one can be the paper) or touching
+    an art line (the paper contour dents around them), which the paper area leaves out.
+    Returns (glyphs with rings, text-like ink fused with art that could not be split)."""
+    out = np.zeros(crop.shape[:2], bool)
+    stuck = np.zeros_like(out)
+    ink = blend_ink(crop, bg, fg, alpha)
+    if not ink.any():
+        return out, stuck
+    margin = max(2, round(0.1 * font))
+    zone = cv2.dilate(c.lines.astype(np.uint8), ellipse(2 * margin + 1)) > 0
+    speck = max(6, round(0.04 * font) ** 2)
+    labels, st, ok, fused = glyph_candidates(ink, zone, c, font, speck)
+    if fused.any():
+        body = np.zeros_like(out)
+        deep = cv2.erode(zone.astype(np.uint8), ellipse(2 * round(0.25 * font) + 1)) > 0
+        for i in np.flatnonzero(fused):
+            x, y, w, h = st[i, :4]
+            comp = labels[y : y + h, x : x + w] == i
+            part, text = split_fused(comp, zone[y : y + h, x : x + w])
+            if part is not None:
+                body[y : y + h, x : x + w] |= part
+            elif text:
+                inner = comp & zone[y : y + h, x : x + w]
+                # text in the middle of the box, on flat paper: not a balloon outline that a
+                # loose box cuts at its edge
+                if (inner & deep[y : y + h, x : x + w]).sum() >= 0.5 * inner.sum() and on_paper(
+                    crop[y : y + h, x : x + w], inner, bg
+                ):
+                    stuck[y : y + h, x : x + w] |= inner
+        if body.any():
+            parts = (ink & ~fused[labels]) | body
+            labels, st, ok, _ = glyph_candidates(parts, zone, c, font, speck, split=body)
+    x, y, bw, bh = st[:, :4].T
+    soft = blend_ink(crop, bg, fg, 0.35)
+    H, W = ink.shape
+    found = []  # (window, glyph, ring or None)
+    tone = max(40.0, 0.3 * float(color_distance(fg[None, None], bg)[0, 0]))
+    for i in np.flatnonzero(ok):
+        g = labels[y[i] : y[i] + bh[i], x[i] : x[i] + bw[i]] == i
+        sw, extent = stroke_width(g), max(bw[i], bh[i])
+        if sw > 0.3 * extent and extent > 0.4 * font:
+            continue  # a solid blob bigger than a dot: a shadow, not strokes
+        gx = crop[y[i] : y[i] + bh[i], x[i] : x[i] + bw[i]][g]
+        if color_distance(np.median(gx, axis=0)[None, None], fg)[0, 0] > tone:
+            continue  # merely darker than the paper (shading), not the text colour
+        r = int(np.clip(round(0.5 * sw), 3, max(3, round(0.15 * font))))
+        ro = r + max(3, round(0.4 * sw))  # outline search radius
+        p = ro + 6
+        sy = slice(max(0, y[i] - p), min(H, y[i] + bh[i] + p))
+        sx = slice(max(0, x[i] - p), min(W, x[i] + bw[i] + p))
+        k = (labels[sy, sx] == i).astype(np.uint8)
+        sub = crop[sy, sx]
+        rim = (cv2.dilate(k, ellipse(5)) > 0) & (k == 0)
+        near_ring = (cv2.dilate(k, ellipse(2 * r + 3)) > 0) & ~rim & (k == 0)
+        if near_ring.sum() < 8 or soft[sy, sx][near_ring].mean() > 0.25:
+            continue  # more ink around it: art, not a glyph
+        if flat_surround(sub[near_ring], fg) < 0.8:
+            continue
+        do = cv2.dilate(k, ellipse(2 * ro + 1)) > 0
+        far = (cv2.dilate(k, ellipse(2 * ro + 11)) > 0) & ~do
+        ring = None
+        if far.sum() >= 8:
+            # outline = what hugs the glyph and is neither paper nor a glyph/paper blend
+            paper = dominant(sub[far])
+            odd = (color_distance(sub, paper) > 40) & ~blend_ink(sub, paper, fg, 0.1)
+            if odd[rim].mean() >= 0.4:
+                o = np.median(sub[rim & odd], axis=0)
+                ring = do & (k == 0) & (nearest(sub, [o, paper, fg]) == 0)
+                nn, lab = cv2.connectedComponents(ring.astype(np.uint8), connectivity=8)
+                touch = np.bincount(lab[rim & ring], minlength=nn) > 0
+                touch[0] = False
+                ring = touch[lab]
+        found.append(((sy, sx), k > 0, ring))
+    lettered = sum(int(g.sum()) for _, g, ring in found if ring is not None)
+    outlined = lettered >= 0.5 * sum(int(g.sum()) for _, g, _ in found)
+    if outlined_only and not outlined:
+        return out, stuck
+    for (sy, sx), g, ring in found:
+        if ring is not None:
+            out[sy, sx] |= g | ring
+        elif not outlined and not outlined_only:
+            out[sy, sx] |= g
+    return out, stuck
+
+
+def text_color(crop: np.ndarray, c: Crop, bg: np.ndarray) -> np.ndarray:
+    """Glyph colour when no pixel is surely text: the text zone's pixels farthest from paper."""
+    px = crop[c.lines] if c.lines.any() else crop.reshape(-1, 3)
+    d = color_distance(px[None], bg)[0]
+    return np.median(px[d >= np.percentile(d, 95)], axis=0)
+
+
+def extremes(crop: np.ndarray, c: Crop) -> list[np.ndarray]:
+    """Darkest and lightest colours of the text zone: fill and edge of outlined lettering,
+    whichever of them the paper detection took for text."""
+    px = crop[c.lines] if c.lines.any() else crop.reshape(-1, 3)
+    lum = px.astype(np.float32) @ np.float32([0.114, 0.587, 0.299])
+    lo, hi = np.percentile(lum, (2, 98))
+    return [np.median(px[lum <= lo], axis=0), np.median(px[lum >= hi], axis=0)]
+
+
+def lettering(
+    crop: np.ndarray, c: Crop, bg: np.ndarray, fg: np.ndarray, font: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Glyphs found one by one in the text colour, plus outlined lettering in the zone's
+    darkest or lightest colour (the paper detection may have taken the outline, or another
+    background, for the text); and the text-like ink fused with art that no stroke width
+    could split. A text colour that is no extreme of the zone is a mix of fill, outline and
+    background: only outlined lettering is looked for then."""
+    ext = extremes(crop, c)
+    dist = [float(color_distance(e[None, None], fg)[0, 0]) for e in ext]
+    if min(dist) < 60:
+        extra, stuck = outlined_glyphs(crop, c, bg, fg, font)
+    else:
+        extra = stuck = np.zeros(crop.shape[:2], bool)
+    for alt, d_fg in zip(ext, dist, strict=True):
+        # not the text colour again, nor the paper (a light balloon's lightest colour)
+        if d_fg > 40 and color_distance(alt[None, None], bg)[0, 0] > 30:
+            more, fused = outlined_glyphs(crop, c, bg, alt, font, outlined_only=True)
+            extra, stuck = extra | more, stuck | fused
+    return extra, stuck & ~extra
+
+
+def on_paper(crop: np.ndarray, comp: np.ndarray, bg: np.ndarray, tol: float = 30.0) -> bool:
+    """Ink with paper all around it (a line crossing text on flat paper), unlike a balloon
+    outline, which has the balloon on one side and the art on the other."""
+    k = comp.astype(np.uint8)
+    ring = (cv2.dilate(k, ellipse(9)) > 0) & ~(cv2.dilate(k, ellipse(3)) > 0)
+    ring[[0, -1], :] = ring[:, [0, -1]] = False  # the window edge cuts the ring short
+    if ring.sum() < 16:
+        return False
+    return float((color_distance(crop, bg)[ring] < tol).mean()) >= 0.85
+
+
+def stuck_fill(stuck: np.ndarray, erased: np.ndarray, c: Crop) -> np.ndarray:
+    """Box erase, within the text zone, of each blob of text that stays fused with an art
+    line and is not erased already: half erased strokes are worse than an inpainted patch."""
+    out = np.zeros(stuck.shape, np.uint8)
+    pad = max(2, round(0.1 * c.font))
+    n, labels, st, _ = cv2.connectedComponentsWithStats(stuck.astype(np.uint8), connectivity=8)
+    done = np.bincount(labels[erased & stuck], minlength=n)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if area >= max(16, round(0.1 * c.font) ** 2) and done[i] < 0.9 * area:
+            cv2.rectangle(out, (x - pad, y - pad), (x + w + pad - 1, y + h + pad - 1), 255, -1)
+    return out & busy_box(c)
+
+
 def busy_box(c: Crop) -> np.ndarray:
     """Text over art: glyphs cannot be told from art by colour, so erase the text lines with
     a small margin rather than leave half-erased strokes."""
@@ -409,6 +659,7 @@ class GlyphMask:
         protect: bool = True,
         flat_spread: float = 40.0,
         method: str = "auto",
+        glyphs: bool = True,
     ) -> None:
         if method not in METHODS:
             raise ValueError(f"mask method must be one of {METHODS}, got {method!r}")
@@ -417,6 +668,7 @@ class GlyphMask:
         self.reach, self.grow = reach, grow
         self.dilation, self.min_dilate = dilation, min_dilate
         self.ink, self.protect, self.flat_spread = ink, protect, flat_spread
+        self.glyphs = glyphs
 
     def refine(
         self, image_bgr: np.ndarray, regions: list[TextRegion], raw_mask: np.ndarray | None
@@ -457,34 +709,54 @@ class GlyphMask:
         found = find_paper(crop, c, self.flat_spread)
         if found is None:
             return busy_box(c)
-        bg, dist, spread, c = found
-        zone = dist[c.near] if c.near.any() else dist.ravel()
+        bg, dist, spread, cn = found
+        zone = dist[cn.near] if cn.near.any() else dist.ravel()
         otsu, _ = cv2.threshold(
             zone.astype(np.uint8).reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
         t = float(np.clip(otsu, max(30.0, 2 * spread), 160.0))
-        sure = (dist > t) & c.near
-        core = hysteresis(dist > 0.6 * t, sure, c, retry=tuple(dist > k * t for k in (1, 2, 3)))
-        if not core.any():
-            return np.zeros(crop.shape[:2], np.uint8)
-        fg = np.median(crop[sure], axis=0)
-        return self._complete(core, blend_ink(crop, bg, fg, self.ink), c)
+        sure = (dist > t) & cn.near
+        core = hysteresis(dist > 0.6 * t, sure, cn, retry=tuple(dist > k * t for k in (1, 2, 3)))
+        fg = np.median(crop[sure], axis=0) if sure.any() else text_color(crop, c, bg)
+        extra = stuck = None
+        if self.glyphs:
+            extra, stuck = lettering(crop, c, bg, fg, max(c.font, cn.font))
+        if not core.any() and (extra is None or not extra.any()):
+            m = np.zeros(crop.shape[:2], np.uint8)
+        else:
+            m = self._complete(core, blend_ink(crop, bg, fg, self.ink), cn, extra=extra)
+        if stuck is not None and stuck.any():
+            m |= stuck_fill(stuck, m > 0, c)
+        return m
 
     def _complete(
-        self, core: np.ndarray, ink: np.ndarray, c: Crop, sure: np.ndarray | None = None
+        self,
+        core: np.ndarray,
+        ink: np.ndarray,
+        c: Crop,
+        sure: np.ndarray | None = None,
+        extra: np.ndarray | None = None,
     ) -> np.ndarray:
         """Grow the core into touching ink (fringe, thin strokes, dots), dilate by font size,
         and cut out balloon outlines / art lines that the dilation reached. `sure` = pixels the
-        detector calls text; colour alone cannot tell a glyph from the outline it touches."""
+        detector calls text; colour alone cannot tell a glyph from the outline it touches.
+        `extra` = glyphs (and their outline rings) found one by one: no structure."""
         zone = cv2.dilate(core.astype(np.uint8), ellipse(2 * round(c.font * self.grow) + 1)) > 0
         cand = (ink & zone) | core
         n, labels = cv2.connectedComponents(cand.astype(np.uint8), connectivity=8)
         touch = np.bincount(labels[core], minlength=n) > 0
         touch[0] = False
         m = touch[labels]
+        if extra is not None:  # complete already; `ink` may be the wrong colour for them
+            m |= extra
         guard = None
         if self.protect:
-            guard = structure(ink, c)
+            # a glyph found on its own is no structure, nor is its fringe; an art line that
+            # touched it through the fringe still is
+            free = ink
+            if extra is not None:
+                free = ink & ~(cv2.dilate(extra.astype(np.uint8), ellipse(5)) > 0)
+            guard = structure(free, c)
             if c.has_lines and sure is not None:
                 # confident text pixels on a real text line still go: a glyph touching the outline
                 k = ellipse(2 * (c.font // 10) + 1)
@@ -509,10 +781,11 @@ class DilateMask:
         dilation: float = 0.15,
         min_dilate: int = 3,
         flat_spread: float = 40.0,
+        glyphs: bool = True,
     ) -> None:
         self.threshold, self.reach = threshold, reach
         self.dilation, self.min_dilate = dilation, min_dilate
-        self.flat_spread = flat_spread
+        self.flat_spread, self.glyphs = flat_spread, glyphs
 
     def refine(
         self, image_bgr: np.ndarray, regions: list[TextRegion], raw_mask: np.ndarray | None
@@ -525,28 +798,41 @@ class DilateMask:
             c = make_crop(r, img, self.reach)
             if c is None:
                 continue
+            box = None
             if raw is not None:
                 m = raw[c.sl] >= self.threshold * 255
+                m &= c.near
             else:
-                found = find_paper(img[c.sl], c, self.flat_spread)
+                crop = img[c.sl]
+                found = find_paper(crop, c, self.flat_spread)
                 if found is None:
                     out[c.sl] |= busy_box(c)
                     continue
-                _, dist, spread, c = found
+                bg, dist, spread, cn = found
                 t = max(40.0, 2 * spread)
                 # ink that runs out of the window is art or a balloon outline, not text
-                m = hysteresis(dist > t, c.near, c, retry=(dist > 2 * t,))
-            m &= c.near
+                m = hysteresis(dist > t, cn.near, cn, retry=(dist > 2 * t,))
+                m &= cn.near
+                if self.glyphs:  # see GlyphMask._from_pixels
+                    sure = m & (dist > t)
+                    fg = np.median(crop[sure], axis=0) if sure.any() else text_color(crop, c, bg)
+                    extra, stuck = lettering(crop, c, bg, fg, max(c.font, cn.font))
+                    if stuck.any():
+                        box = stuck_fill(stuck, m | extra, c)
+                    m |= extra
+                c = cn
             d = max(self.min_dilate, round(c.font * self.dilation) * 2 + 1)
             out[c.sl] |= (cv2.dilate(m.astype(np.uint8), ellipse(d)) > 0).astype(np.uint8) * 255
+            if box is not None:
+                out[c.sl] |= box
         return out
 
 
 DEFAULT_OPTS = (
     "threshold", "strong", "reach", "grow", "dilation", "min_dilate", "ink", "protect",
-    "flat_spread", "method",
+    "flat_spread", "method", "glyphs",
 )  # fmt: skip
-DILATE_OPTS = ("threshold", "reach", "dilation", "min_dilate", "flat_spread")
+DILATE_OPTS = ("threshold", "reach", "dilation", "min_dilate", "flat_spread", "glyphs")
 
 
 def _unknown(method: str, extra: dict, known: tuple[str, ...]) -> None:
@@ -574,6 +860,7 @@ def _build_default(
     protect: bool = True,
     flat_spread: float = 40.0,
     method: str = "auto",
+    glyphs: bool = True,
     **extra,
 ):
     _unknown("default", extra, DEFAULT_OPTS)
@@ -588,6 +875,7 @@ def _build_default(
         _bool(protect),
         float(flat_spread),
         str(method),
+        _bool(glyphs),
     )
 
 
@@ -601,11 +889,17 @@ def _build_dilate(
     dilation: float = 0.15,
     min_dilate: int = 3,
     flat_spread: float = 40.0,
+    glyphs: bool = True,
     **extra,
 ):
     _unknown("dilate", extra, DILATE_OPTS)
     return DilateMask(
-        float(threshold), float(reach), float(dilation), int(min_dilate), float(flat_spread)
+        float(threshold),
+        float(reach),
+        float(dilation),
+        int(min_dilate),
+        float(flat_spread),
+        _bool(glyphs),
     )
 
 
