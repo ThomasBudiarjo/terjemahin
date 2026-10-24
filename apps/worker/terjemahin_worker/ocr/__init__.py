@@ -3,4 +3,4 @@ from .base import OCR, OcrResult
 
 load_plugins(__name__, __path__)
 
-__all__ = ["OCRS", "OCR", "OcrResult"]
+__all__ = ["OCR", "OCRS", "OcrResult"]

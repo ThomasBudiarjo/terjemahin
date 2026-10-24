@@ -1,0 +1,111 @@
+{
+ "image": "tall_strip.png",
+ "note": "page01 + synth 000002 + synth 000007 stacked at width 1487 (webtoon-like strip)",
+ "bubbles": [
+  {
+   "ja": "ねえねえ、めいは坂本のことどう思う？",
+   "id_ref": "Hei, hei, Mei, menurutmu Sakamoto itu gimana?"
+  },
+  {
+   "ja": "坂本くん？",
+   "id_ref": "Sakamoto-kun?"
+  },
+  {
+   "ja": "うーんそうだなぁ・・優しいよね",
+   "id_ref": "Hmm, gimana ya... dia baik, kan?"
+  },
+  {
+   "ja": "えー、それだけー？",
+   "id_ref": "Eh, cuma itu?"
+  },
+  {
+   "ja": "じゃあメシアはどうなの？",
+   "id_ref": "Kalau gitu, Mesia sendiri gimana?"
+  },
+  {
+   "ja": "え？",
+   "id_ref": "Eh?"
+  },
+  {
+   "ja": "わ、私はー・・・別にそんな・・・",
+   "id_ref": "A-aku sih... nggak gimana-gimana..."
+  },
+  {
+   "ja": "反応がいちいち面白いなーとか",
+   "id_ref": "Reaksinya selalu lucu, gitu deh"
+  },
+  {
+   "ja": "うんうん",
+   "id_ref": "Iya, iya"
+  },
+  {
+   "ja": "店の店員さんとかにも敬語使ってて偉いなーとか",
+   "id_ref": "Dia sopan pakai bahasa halus bahkan ke pelayan toko, keren gitu"
+  },
+  {
+   "ja": "わあ、いいね！",
+   "id_ref": "Wah, bagus dong!"
+  },
+  {
+   "ja": "あっ、あとこないだね、髪型変えたらすぐに気付いてくれてっ・・",
+   "id_ref": "Ah, terus kemarin itu, waktu aku ganti gaya rambut, dia langsung sadar..."
+  },
+  {
+   "ja": "ふふっ、他には？",
+   "id_ref": "Fufu, terus apa lagi?"
+  },
+  {
+   "ja": "一緒に帰ろうよ",
+   "id_ref": "Ayo pulang bareng"
+  },
+  {
+   "ja": "今日は本当にありがとう",
+   "id_ref": "Terima kasih banyak untuk hari ini"
+  },
+  {
+   "ja": "私の名前はさくらです",
+   "id_ref": "Namaku Sakura"
+  },
+  {
+   "ja": "あの時の約束、覚えてる？",
+   "id_ref": "Kamu ingat janji waktu itu?"
+  },
+  {
+   "ja": "わかった、行くよ誰かいるの？",
+   "id_ref": "Baiklah, aku pergi Ada orang di sana?"
+  },
+  {
+   "ja": "一緒に帰ろうよ",
+   "id_ref": "Ayo pulang bareng"
+  },
+  {
+   "ja": "先生に怒られちゃった",
+   "id_ref": "Aku dimarahi guru"
+  },
+  {
+   "ja": "わかった、行くよ",
+   "id_ref": "Baiklah, aku pergi"
+  },
+  {
+   "ja": "この本、すごく面白いね",
+   "id_ref": "Buku ini seru banget ya"
+  },
+  {
+   "ja": "大丈夫？ケガはない？私の名前はさくらです先生に怒られちゃった",
+   "id_ref": "Kamu nggak apa-apa? Nggak terluka? Namaku Sakura Aku dimarahi guru"
+  },
+  {
+   "ja": "静かにして！",
+   "id_ref": "Diam!"
+  },
+  {
+   "ja": "もう行かなきゃ……",
+   "id_ref": "Aku harus pergi sekarang..."
+  }
+ ],
+ "sfx": [
+  "あとね",
+  "ごろん",
+  "もじ…"
+ ]
+}

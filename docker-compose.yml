@@ -33,6 +33,7 @@ services:
 
   worker:
     build: ./apps/worker
+    image: terjemahin-worker:local
     env_file: .env
     environment:
       AMQP_URL: amqp://guest:guest@lavinmq:5672/
@@ -40,6 +41,23 @@ services:
     volumes:
       - shared-data:/data
     depends_on: [lavinmq]
+
+  # standalone web UI + JSON API of the worker (no queue needed):
+  #   docker compose --profile web up web   ->  http://localhost:8000
+  web:
+    profiles: [web]
+    build: ./apps/worker
+    image: terjemahin-worker:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      STORAGE_DIR: /data
+    command: ["terjemahin-worker", "web", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - shared-data:/data
 
 volumes:
   lavinmq-data:

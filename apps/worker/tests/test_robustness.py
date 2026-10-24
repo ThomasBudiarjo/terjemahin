@@ -74,8 +74,8 @@ def _register() -> None:
 
 
 _register()
-CHEAP = dict(detector="_rb_fake", ocr="_rb_fake", translator="original", mask_refiner="bbox",
-             inpainter="fill", renderer="basic")
+CHEAP = {"detector": "_rb_fake", "ocr": "_rb_fake", "translator": "original",
+         "mask_refiner": "bbox", "inpainter": "fill", "renderer": "basic"}
 
 
 def _page() -> np.ndarray:
@@ -317,6 +317,28 @@ def test_single_line_sits_in_the_middle_of_its_balloon():
     assert 40 < lay.lines[0].y + lay.size / 2 < 110  # a lone '?' sat at the top
 
 
+def test_punctuation_only_balloons_are_drawn_at_the_source_size():
+    # '?' and '……' were drawn at a third of the source marks (size from the balloon alone)
+    from terjemahin_worker.render.default import DefaultRenderer
+
+    page = np.full((400, 700, 3), 255, np.uint8)
+    cv2.ellipse(page, (150, 200), (120, 70), 0, 0, 360, (0, 0, 0), 2)
+    cv2.ellipse(page, (500, 200), (100, 70), 0, 0, 360, (0, 0, 0), 2)
+    q = Bubble(region=TextRegion(id=0, bbox=BBox(x1=480, y1=170, x2=519, y2=231), direction="v",
+                                 font_size=38), source_text="？", target_text="?")
+    dots = Bubble(region=TextRegion(id=1, bbox=BBox(x1=94, y1=195, x2=207, y2=206),
+                                    direction="h", font_size=11),
+                  source_text="．．．．．", target_text="...")
+    r = DefaultRenderer(Settings().font_path)
+    r.render(page, [q, dots], page)
+    pq, pd = r.plans
+    _, t, _, b = pq.measure.font(pq.layout.size).getbbox("?")
+    assert 0.75 * 61 <= b - t <= 1.25 * 61, pq.layout.size  # was ~20 px of ink for 61
+    assert pd.text == "..."  # three dots, not one narrow ellipsis glyph
+    l, _, rr, _ = pd.measure.font(pd.layout.size).getbbox(pd.text)
+    assert 0.75 * 113 <= rr - l <= 1.25 * 113, pd.layout.size
+
+
 # --- options: CLI parsing and validation at build time --------------------------------------
 
 def test_cli_opt_booleans_aliases_and_unknown_stages():
@@ -467,11 +489,96 @@ def test_seq2seq_model_cache_evicts_the_least_recently_used(monkeypatch):
 
 # --- translate: CJK targets, mixed pages, LLM connection errors -----------------------------
 
-def test_chinese_target_keeps_kanji_surnames():
+def test_chinese_target_writes_surnames_in_kanji(monkeypatch):
     p = tp.prepare("坂本くん？", "ja", "zh", [])
-    assert "坂本" in p.text and p.terms == []  # romaji came back as 萨卡莫托
+    assert p.terms == [] and p.kanji == {"Sakamoto": "坂本"}  # no Latin term to insist on
     assert tp.prepare("坂本くん？", "ja", "id", []).terms == ["Sakamoto"]
     assert tp.prepare("坂本のこと", "ja", "ko", []).terms == []  # Hangul output, no Latin term
+    tr = TRANSLATORS.build("m2m100", Settings())
+    monkeypatch.setattr(tr, "generate", lambda texts, *a, **k: ["你对Sakamoto有什么看法?" for _ in texts])
+    out = tr.translate_texts(["坂本くん？", "めいは坂本のことどう思う？"], "ja", "zh")
+    assert out == ["坂本君？", "你对坂本有什么看法？"]  # was Latin 'Sakamoto-kun?' on a Chinese page
+
+
+@pytest.mark.parametrize(
+    ("out", "romaji", "kanji", "src", "want"),
+    [
+        # NLLB / M2M100 transliterate the romaji they were given instead of copying it
+        ("你对萨卡莫托有什么看法?", "Sakamoto", "坂本", "めいは Sakamoto のことどう思う？",
+         "你对坂本有什么看法?"),
+        ("萨卡莫托?", "Sakamoto", "坂本", "Sakamoto-kun？", "坂本君?"),  # dropped -kun put back
+        ("萨卡莫 - 昆?", "Sakamoto", "坂本", "Sakamoto-kun？", "坂本君?"),  # last mora lost
+        ("萨卡莫托·库恩", "Sakamoto", "坂本", "Sakamoto-kun", "坂本君"),
+        ("塔纳卡-桑在哪里?", "Tanaka", "田中", "Tanaka-san はどこ？", "田中桑在哪里?"),
+        ("我喜欢太卡哈西-昆.", "Takahashi", "高橋", "", "我喜欢高橋君."),  # one mora differs
+        ("哈特里 - 桑", "Hattori", "服部", "", "服部桑"),  # small っ written
+        ("哈托里-桑", "Hattori", "服部", "", "服部桑"),  # ... or not
+        ("孔多桑说", "Kondo", "近藤", "", "近藤桑说"),  # mora + n in one character
+        ("亚马莫托先生", "Yamamoto", "山本", "Yamamoto-sensei", "山本先生"),  # Chinese honorific
+        ("你對薩卡莫托有什麼看法?", "Sakamoto", "坂本", "", "你對坂本有什麼看法?"),  # Traditional
+        ("您对Sakamoto有什么看法?", "Sakamoto", "坂本", "", "您对坂本有什么看法?"),  # kept Latin
+        # nothing that spells the name: left alone
+        ("刚刚说:", "Kondo", "近藤", "", "刚刚说:"),
+        ("他去了阿拉伯。", "Arai", "新井", "", "他去了阿拉伯。"),
+    ],
+)
+def test_chinese_output_transliterated_surnames_become_kanji(out, romaji, kanji, src, want):
+    assert tp.restore_kanji(out, {romaji: kanji}, src) == want
+
+
+def test_surname_transliteration_does_not_match_ordinary_chinese():
+    text = ("你对这个有什么看法？我们今天去吃饭吧。别担心，一切都会好起来的。他说他明天会来。"
+            "这是我第一次来日本。快跑！这里撑不住了！真的吗？太好了！老师来了，大家安静。"
+            "今天天气很好，我们去公园散步吧。对不起，我迟到了。那个女孩是谁？谢谢你帮我。"
+            "我叫萨拉，来自加拿大。克里斯蒂娜和玛丽亚在巴黎。莫斯科很冷。泰国菜很辣。")
+    hits = {r: s for r in set(tp.SURNAMES.values()) if (s := tp.find_transliteration(text, r))}
+    assert hits == {}
+    assert tp.restore_kanji("你對薩卡莫托?", {"Sakamoto": "坂本"}, "Sakamoto-chan?", hant=True) \
+        == "你對坂本醬?"
+
+
+class _ZhTranslit:
+    """A pivot hop that transliterates romaji the way NLLB en->zh does."""
+
+    vision = False
+
+    def translate(self, req):
+        return [TranslationItem(source=s, target="萨卡莫托?" if s.startswith("Sakamoto-kun")
+                                else "你对萨卡莫托有什么看法?") for s in req.sources]
+
+
+class _Echo:
+    vision = False
+
+    def translate(self, req):
+        return [TranslationItem(source=s, target=s) for s in req.sources]
+
+
+def test_chinese_target_surnames_in_kanji_through_seq2seq_and_chain(monkeypatch):
+    # the verifier's repro: nllb --to zh gave '你对萨卡莫托有什么看法？', chain m2m100:en,nllb
+    # gave '萨卡莫托？' for 坂本くん？
+    tr = TRANSLATORS.build("m2m100", Settings())
+    monkeypatch.setattr(tr, "generate", lambda texts, *a, **k: ["你对萨卡莫托有什么看法?" for _ in texts])
+    assert tr.translate_texts(["めいは坂本のことどう思う？"], "ja", "zh") == ["你对坂本有什么看法？"]
+    for name, cls in (("_rb_echo", _Echo), ("_rb_zh_translit", _ZhTranslit)):
+        if name not in TRANSLATORS.methods:
+            TRANSLATORS.register(name, description="test fake")(lambda s, cls=cls, **_: cls())
+    chain = TRANSLATORS.build("chain", Settings(), steps="_rb_echo:en,_rb_zh_translit")
+    out = chain.translate_texts(["坂本くん？", "めいは坂本のことどう思う？"], "ja", "zh")
+    assert out == ["坂本君？", "你对坂本有什么看法？"]
+
+
+def test_chinese_output_that_lost_a_surname_is_retranslated(monkeypatch):
+    tr = TRANSLATORS.build("m2m100", Settings())
+    calls = []
+
+    def gen(texts, source, target, **overrides):
+        calls.append(overrides)
+        return ["刚刚说:" if not overrides else "孔多桑说" for _ in texts]
+
+    monkeypatch.setattr(tr, "generate", gen)
+    assert tr.translate_texts(["近藤さんが言った"], "ja", "zh") == ["近藤桑说"]
+    assert len(calls) == 2 and calls[1]  # the strict retry ran
 
 
 def test_chinese_output_punctuation_and_stutter():
@@ -562,6 +669,28 @@ def test_cli_reports_bad_configuration_without_a_traceback(tmp_path):
     assert r.exit_code == 2 and "unknown renderer 'bogus'" in r.text
     r = _cli("translate", str(page), "-o", str(tmp_path / "o.png"), "--opt", "detecter.conf=1")
     assert r.exit_code == 2 and "unknown stage" in r.text
+
+
+class _LLMDown:
+    vision = False
+
+    def translate(self, req):
+        from terjemahin_worker.translate.llm_common import LLMError
+
+        raise LLMError("cannot connect to http://127.0.0.1:9/v1/chat/completions: [Errno 111] "
+                       "Connection refused (is the server running and base_url right?)")
+
+
+def test_cli_llm_connection_failure_is_one_line(tmp_path):
+    if "_rb_llm_down" not in TRANSLATORS.methods:
+        TRANSLATORS.register("_rb_llm_down", description="test fake")(lambda s, **_: _LLMDown())
+    page = tmp_path / "p.png"
+    cv2.imwrite(str(page), _page())
+    r = _cli("translate", str(page), "-o", str(tmp_path / "o.png"), "-d", "_rb_fake",
+             "--ocr", "_rb_fake", "-t", "_rb_llm_down", "--mask", "bbox", "-i", "fill",
+             "-r", "basic")
+    assert r.exit_code == 2 and "error: cannot connect to http://127.0.0.1:9" in r.output
+    assert "Traceback" not in r.output
 
 
 # --- consumer -------------------------------------------------------------------------------

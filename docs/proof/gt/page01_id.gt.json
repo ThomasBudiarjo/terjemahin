@@ -1,0 +1,62 @@
+{
+ "image": "page01_id.png",
+ "note": "page01 typeset in Indonesian by this pipeline (horizontal Latin text); src = the exact rendered strings; en_ref hand-written",
+ "bubbles": [
+  {
+   "src": "Hei, hei, apa yang kau pikirkan tentang Sakamoto?",
+   "en_ref": "Hey, hey, what do you think about Sakamoto?"
+  },
+  {
+   "src": "Sakamoto-kun?",
+   "en_ref": "Sakamoto-kun?"
+  },
+  {
+   "src": "Hmm, ya, baik-baik saja",
+   "en_ref": "Hmm, yeah, it's fine"
+  },
+  {
+   "src": "Eh, itu saja?",
+   "en_ref": "Eh, is that all?"
+  },
+  {
+   "src": "Kalau gitu, bagaimana dengan Mesias?",
+   "en_ref": "In that case, what about the Messiah?"
+  },
+  {
+   "src": "Eh?",
+   "en_ref": "Eh?"
+  },
+  {
+   "src": "A-aku tidak ingin...",
+   "en_ref": "I-I don't want to..."
+  },
+  {
+   "src": "Reaksi itu sangat menarik, gitu",
+   "en_ref": "That reaction is very interesting, like that"
+  },
+  {
+   "src": "Iya, iya",
+   "en_ref": "Yes, yes"
+  },
+  {
+   "src": "Dia juga menggunakan kata-kata pujian untuk pemilik toko, gitu",
+   "en_ref": "He also uses words of praise for the shop owner, like that"
+  },
+  {
+   "src": "Wah, baiklah!",
+   "en_ref": "Wow, alright!"
+  },
+  {
+   "src": "Ah, saat ini, aku baru tahu kalau rambutku berubah...",
+   "en_ref": "Ah, just now I only found out that my hair changed..."
+  },
+  {
+   "src": "Fufu, ada yang lain?",
+   "en_ref": "Fufu, is there anything else?"
+  },
+  {
+   "src": "Aku akan pergi",
+   "en_ref": "I'm going to go"
+  }
+ ]
+}

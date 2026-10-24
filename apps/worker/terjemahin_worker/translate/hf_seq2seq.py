@@ -271,6 +271,8 @@ class Seq2SeqTranslator:
     def _check(self, prep: tp.Prepared, out: str, target: str) -> bool:
         if tp.is_bad(prep.text, out, target):
             return False
+        if prep.kanji and not tp.kanji_kept(out, prep.kanji):
+            return False  # Chinese output lost a surname ('Kondo-san が言った' -> '刚刚说:')
         fixed = tp.restore_terms(out, prep.terms)
         return all(tp.has_term(fixed, t) for t in prep.terms)
 

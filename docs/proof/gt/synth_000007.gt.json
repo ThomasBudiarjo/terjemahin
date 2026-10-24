@@ -1,0 +1,75 @@
+{
+ "image": "000007.jpg",
+ "note": "synthetic page from training/synth.py --seed 7; ja exact, id_ref = hand translation of each corpus line",
+ "bubbles": [
+  {
+   "ja": "わかった、行くよ",
+   "id_ref": "Baiklah, aku pergi",
+   "bbox": [
+    41,
+    404,
+    104,
+    532
+   ],
+   "vertical": true,
+   "container": "spiky",
+   "font_size": 30
+  },
+  {
+   "ja": "この本、すごく面白いね",
+   "id_ref": "Buku ini seru banget ya",
+   "bbox": [
+    579,
+    61,
+    622,
+    149
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 17
+  },
+  {
+   "ja": "大丈夫？ケガはない？私の名前はさくらです先生に怒られちゃった",
+   "id_ref": "Kamu nggak apa-apa? Nggak terluka? Namaku Sakura Aku dimarahi guru",
+   "bbox": [
+    113,
+    168,
+    428,
+    287
+   ],
+   "vertical": false,
+   "container": "ellipse",
+   "font_size": 33
+  },
+  {
+   "ja": "静かにして！",
+   "id_ref": "Diam!",
+   "bbox": [
+    759,
+    639,
+    777,
+    744
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 18
+  },
+  {
+   "ja": "もう行かなきゃ……",
+   "id_ref": "Aku harus pergi sekarang...",
+   "bbox": [
+    451,
+    446,
+    477,
+    686
+   ],
+   "vertical": true,
+   "container": "rect",
+   "font_size": 28
+  }
+ ],
+ "sfx": [
+  "ごろん",
+  "もじ…"
+ ]
+}

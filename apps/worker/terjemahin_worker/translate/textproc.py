@@ -374,6 +374,7 @@ class Prepared:
     end: str = ""  # terminal punctuation of the source: "?", "!", "?!", "...", ""
     terms: list[str] = field(default_factory=list)  # glossary targets the output must contain
     verbatim: str = ""  # the whole result, no model needed (a punctuation-only bubble)
+    kanji: dict[str, str] = field(default_factory=dict)  # romaji -> kanji, for Chinese output
 
 
 def _end_punct(text: str) -> str:
@@ -459,6 +460,207 @@ def romanize_surnames(text: str) -> tuple[str, list[str]]:
     return re.sub(r"\s{2,}", " ", text).strip(), found
 
 
+def surname_kanji(text: str, found: list[str]) -> dict[str, str]:
+    """romaji -> the kanji it was romanised from in `text` (Ono may be 小野 or 大野)."""
+    out: dict[str, str] = {}
+    for m in _SURNAME_RE.finditer(text):
+        r = SURNAMES[m.group()]
+        if r in found:
+            out.setdefault(r, m.group())
+    return out
+
+
+# --- Chinese output: Japanese surnames back in kanji ----------------------------------------
+# Kanji surnames are romanised before MT (NLLB turns a kanji 坂本 into 山本 / 哈萨克本, 服部 into
+# 服装部长), and the models then write the romaji either in Latin ('Sakamoto') or as a phonetic
+# transliteration (萨卡莫托, 塔纳卡, 瓦塔纳贝, 苏苏基, 萨卡莫 - 昆). `restore_kanji` finds either
+# form and writes the kanji of the source instead, so 坂本 reads 坂本 on a Chinese page.
+
+# characters Chinese MT uses to transliterate each Japanese mora (Simplified; Traditional
+# forms are added below). Common words (大, 小, 山, 本, 和...) are left out on purpose: a match
+# only replaces text when a whole run of these characters spells the name's morae in order.
+_TRANSLIT_SRC = (
+    "a:阿亚安 i:伊依艾 u:乌宇 e:埃艾伊惠 o:奥欧 "
+    "ka:卡加喀嘉凯 ki:基吉奇 ku:库久古克 ke:克凯科基 ko:科克寇古可 "
+    "sa:萨沙佐莎 shi:西希什石志 su:苏斯素 se:塞赛瑟濑 so:索苏宗 "
+    "ta:塔达太多 chi:奇基吉齐智 tsu:茨津楚祖苏次 te:特泰提帖 to:托多图特德陀 "
+    "na:纳娜那奈 ni:尼妮仁 nu:努奴 ne:内涅妮尼 no:诺野努乃 "
+    "ha:哈 hi:希喜西 fu:富福弗夫 he:赫海黑 ho:霍豪保波 "
+    "ma:马玛麻真 mi:米美弥密 mu:穆姆牟武 me:梅美迈 mo:莫摩默茂 "
+    "ya:亚雅娅 yu:尤优由于裕友 yo:约尤优洋 "
+    "ra:拉腊良 ri:里利莉理 ru:鲁卢露留 re:雷勒蕾列 ro:罗洛若路 wa:瓦娃哇 wo:沃 "
+    "ga:加嘉伽贺冈 gi:吉基义 gu:古格谷 ge:格盖吉 go:戈高哥郭果 "
+    "za:扎萨札 ji:吉基治 zu:祖兹苏 ze:泽哲濑 zo:佐索藏 "
+    "da:达塔 de:德代迪 do:多德都道 "
+    "ba:巴芭波 bi:比碧毕 bu:布部武 be:贝别倍部 bo:博波坊 "
+    "pa:帕巴 pi:皮比 pu:普布 pe:佩贝 po:波坡宝 "
+    "kya:恰卡 kyu:丘久秋 kyo:乔京久恭 sha:沙夏莎 shu:修舒秀周 sho:肖秀修昭正 "
+    "cha:查恰茶 chu:丘楚秋 cho:乔秋 ja:贾嘉加 ju:朱尤久树 jo:乔卓城 "
+    "hyo:表兵 ryo:良辽廖柳龙 ryu:龙柳留 myo:妙 "
+    # a mora + syllabic n, often one character (Kondo 孔多, Honda 洪达, Kanzaki 坎扎基)
+    "an:安 kan:坎康甘菅 san:桑 tan:坦丹谭 nan:南楠 han:汉韩 man:曼满万 ran:兰 wan:万旺 "
+    "gan:甘冈 zan:赞 dan:丹 ban:班坂 pan:潘 en:恩远 ken:肯健坚 sen:森仙 ten:滕腾 nen:宁 "
+    "hen:亨 men:门 ren:伦连莲 gen:根元源 zen:曾善 den:登 ben:弁 in:因音印 kin:金钦近 "
+    "shin:新辛申信 chin:钦金 jin:金仁神 min:明民 rin:林琳凛 nin:宁忍 hin:欣品 bin:宾 "
+    "un:温云 kun:昆坤 sun:孙村 tsun:村 nun:农 hun:洪 fun:丰芬 mun:蒙 run:伦 gun:军贡 "
+    "zun:尊 bun:文 on:翁恩安 kon:孔康空昆近 son:松宋孙 ton:东通顿 non:农 hon:洪宏 "
+    "mon:蒙门 ron:隆 gon:贡冈 don:东敦 bon:邦 yon:永 "
+    # a small っ, when written at all (Hattori 哈特里 / 哈托里)
+    "Q:特克普斯茨 N:恩"
+)
+_TRAD = str.maketrans(
+    "萨纳贝苏亚马玛罗鲁卢诺库乌达兰伦莲门东顿农贡军宾钦孙丰乔辽龙坚腾宁远冈韩汉满万赞谭贺"
+    "盖泽濑迈弥娅优约里丽齐赛图内毕别宝贾凯释",
+    "薩納貝蘇亞馬瑪羅魯盧諾庫烏達蘭倫蓮門東頓農貢軍賓欽孫豐喬遼龍堅騰寧遠岡韓漢滿萬讚譚賀"
+    "蓋澤瀨邁彌婭優約裡麗齊賽圖內畢別寶賈凱釋",
+)
+_TRANSLIT: dict[str, frozenset[str]] = {
+    k: frozenset(v + v.translate(_TRAD))
+    for k, v in (pair.split(":") for pair in _words(_TRANSLIT_SRC))
+}
+_MORA = re.compile(r"(?:ky|gy|sh|ch|ts|ny|hy|my|ry|by|py|j|f|[kgsztdnhbpmyrwv])?[aiueo]")
+
+
+def _morae(romaji: str) -> list[tuple[frozenset[str], bool]]:
+    """'Hattori' -> slots [ha, (っ, optional), to, ri]: each a set of Han characters the mora
+    may be written with, and whether it may be left out. A mora + syllabic n accepts either
+    the fused character (Kon 孔) or the mora's own character, with an optional 恩 after it."""
+    s, i, slots = romaji.lower(), 0, []
+    while i < len(s):
+        if s[i] == "n" and (i + 1 == len(s) or s[i + 1] not in "aiueoy"):
+            if slots:
+                prev = slots[-1][2]
+                fused = _TRANSLIT.get(prev + "n", frozenset())
+                slots[-1] = (slots[-1][0] | fused, False, prev + "n")
+            slots.append((_TRANSLIT["N"], True, "N"))
+            i += 1
+            continue
+        if i + 1 < len(s) and s[i] == s[i + 1] and s[i] not in "aiueon" or s.startswith("tch", i):
+            slots.append((_TRANSLIT["Q"], True, "Q"))
+            i += 1
+            continue
+        m = _MORA.match(s, i)
+        if not m:
+            i += 1  # a letter Hepburn does not use: skip it
+            continue
+        slots.append((_TRANSLIT.get(m.group(), frozenset()), False, m.group()))
+        i = m.end()
+    return [(chars, opt) for chars, opt, _ in slots]
+
+
+def _match_at(run: str, start: int, slots: list[tuple[frozenset[str], bool]], misses: int,
+              trunc: bool) -> int | None:
+    """End of the longest match of `slots` in `run` from `start` (None: no match). `misses`
+    required morae may be written with another character, and with `trunc` the last required
+    mora may be missing (萨卡莫 for Sakamoto)."""
+    best: int | None = None
+
+    def go(pos: int, k: int, miss: int) -> None:
+        nonlocal best
+        if k == len(slots):
+            best = pos if best is None else max(best, pos)
+            return
+        chars, optional = slots[k]
+        if optional:
+            go(pos, k + 1, miss)
+        if pos < len(run):
+            if run[pos] in chars:
+                go(pos + 1, k + 1, miss)
+            elif not optional and miss > 0 and k > 0:  # the first character must match
+                go(pos + 1, k + 1, miss - 1)
+        if trunc and not optional and miss == misses and k == len(slots) - 1 and k > 0:
+            best = pos if best is None else max(best, pos)
+
+    go(start, 0, misses)
+    return best
+
+
+def find_transliteration(text: str, romaji: str) -> str | None:
+    """The span of `text` that transliterates the surname `romaji` into Han characters
+    ('你对萨卡莫托有什么看法?' -> '萨卡莫托'), or None. Every required mora must match in order;
+    a name of 4+ morae may have one written otherwise (太卡哈西 for Takahashi) or lose its last
+    mora (萨卡莫)."""
+    slots = _morae(romaji)
+    required = sum(1 for _, opt in slots if not opt)
+    if required < 2:
+        return None
+    misses = 1 if required >= 4 else 0
+    trunc = required >= 4  # 'Arai' would match the 阿拉 of 阿拉伯
+    best: tuple[int, int, int] | None = None  # (length, -start, start)
+    for run in re.finditer(r"[㐀-䶿一-鿿豈-﫿]+", text):
+        s = run.group()
+        for a in range(len(s)):
+            end = _match_at(s, a, slots, misses, trunc)
+            if end is not None and end - a >= 2:
+                cand = (end - a, -(run.start() + a), run.start() + a)
+                if best is None or cand > best:
+                    best = cand
+    if best is None:
+        return None
+    return text[best[2] : best[2] + best[0]]
+
+
+# honorifics as Chinese scanlations write them after a name
+HAN_HONORIFICS = {"kun": "君", "chan": "酱", "san": "桑", "sama": "大人", "senpai": "前辈",
+                  "sensei": "老师", "dono": "殿", "tan": "碳", "shi": "氏"}
+# what MT makes of a romaji honorific: Latin, transliterated (昆, 库恩, 森西), or a real
+# Chinese one (先生, 君), which is kept as written
+_HON_TRANSLIT = {"昆": "kun", "坤": "kun", "库恩": "kun", "庫恩": "kun", "森西": "sensei",
+                 "森赛": "sensei", "森派": "senpai", "森帕伊": "senpai", "仙派": "senpai",
+                 "萨马": "sama", "薩馬": "sama", "多诺": "dono", "多諾": "dono", "醬": "chan"}
+_HON_CHINESE = ("先生", "老师", "老師", "前辈", "前輩", "学长", "學長", "大人", "同学", "同學",
+                "小姐", "女士", "君", "桑", "酱", "醬", "殿", "氏", "様", "样")
+_HON_AFTER = re.compile(
+    r"[ \t\-‐–—·・]*(" + "|".join(sorted(
+        [*map(re.escape, _HON_TRANSLIT), *map(re.escape, _HON_CHINESE), *HAN_HONORIFICS],
+        key=len, reverse=True)) + r")(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_HANT_HON = str.maketrans("酱辈师", "醬輩師")
+
+
+def _honorific_key(word: str) -> str | None:
+    w = word.lower()
+    if w in HAN_HONORIFICS:
+        return w
+    return _HON_TRANSLIT.get(word)
+
+
+def restore_kanji(text: str, kanji: dict[str, str], source: str = "", hant: bool = False) -> str:
+    """Chinese output: the source's kanji for each romanised surname, whether MT kept the
+    romaji ('Sakamoto-kun?' -> '坂本君?') or transliterated it ('你对萨卡莫托有什么看法?' ->
+    '你对坂本有什么看法?', '萨卡莫 - 昆?' -> '坂本君?'). `source` is the text MT was given:
+    an honorific it had ('Sakamoto-kun') and MT dropped is put back after the kanji."""
+    for romaji, k in kanji.items():
+        latin = rf"(?<![A-Za-z]){re.escape(romaji)}(?![A-Za-z])"
+        if re.search(latin, text, re.IGNORECASE):
+            text = re.sub(latin, k, text, flags=re.IGNORECASE)
+        elif k not in text and (span := find_transliteration(text, romaji)):
+            text = text.replace(span, k)
+        if k not in text:
+            continue
+
+        def hon(m: re.Match[str], k: str = k) -> str:
+            key = _honorific_key(m.group(1))
+            word = HAN_HONORIFICS[key] if key else m.group(1)
+            return k + (word.translate(_HANT_HON) if hant else word)
+
+        text = re.sub(re.escape(k) + _HON_AFTER.pattern, hon, text, flags=re.IGNORECASE)
+        src = re.findall(rf"(?<![A-Za-z]){re.escape(romaji)}-([a-z]+)", source, re.IGNORECASE)
+        keys = {s.lower() for s in src if s.lower() in HAN_HONORIFICS}
+        if len(keys) == 1 and text.count(k) == 1 and not _HON_AFTER.match(text, text.index(k) + len(k)):
+            word = HAN_HONORIFICS[keys.pop()]
+            text = text.replace(k, k + (word.translate(_HANT_HON) if hant else word))
+    return text
+
+
+def kanji_kept(text: str, kanji: dict[str, str]) -> bool:
+    """Every romanised surname is still in the output, in any form `restore_kanji` repairs:
+    False when MT dropped a name ('Kondo-san が言った' -> '刚刚说:')."""
+    fixed = restore_kanji(text, kanji)
+    return all(k in fixed for k in kanji.values())
+
+
 def apply_glossary(text: str, glossary: Iterable[GlossaryEntry]) -> tuple[str, list[str]]:
     """Forced replacement: the source term becomes its target spelling inside the source text.
 
@@ -523,9 +725,13 @@ def prepare(
     if stutter:
         text = _STUTTER.sub("", text)
     text, terms = apply_glossary(text, glossary)
-    if names and target not in HAN_TARGETS:  # Chinese keeps 坂本 (romaji came back as 萨卡莫托)
+    kanji: dict[str, str] = {}
+    if names:
+        before = text
         text, found = romanize_surnames(text)
-        if target not in CJK_LANGS:  # a Hangul transliteration is right, not a missing term
+        if target in HAN_TARGETS:  # written back in kanji by finish(), wherever MT kept it
+            kanji = surname_kanji(before, found)
+        if target not in CJK_LANGS:  # Latin output must keep the name; Hangul/Han need not
             terms += found
     text = map_honorifics(text)
 
@@ -559,6 +765,7 @@ def prepare(
         stutter_on=stutter_on,
         end=end,
         terms=terms,
+        kanji=kanji,
     )
 
 
@@ -744,7 +951,9 @@ def finish(prep: Prepared, output: str, target: str, casual: bool = True) -> str
     if prep.verbatim:
         return prep.verbatim
     text = _finish(prep, output, target, casual)
-    return han_punct(text) if iso(target) in HAN_TARGETS else text
+    if iso(target) in HAN_TARGETS:
+        return han_punct(restore_kanji(text, prep.kanji, prep.text, iso(target) == "zh-hant"))
+    return text
 
 
 def _finish(prep: Prepared, output: str, target: str, casual: bool) -> str:

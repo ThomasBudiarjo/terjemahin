@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -201,7 +202,11 @@ class DefaultRenderer:
             shape, ox, oy, fw, fh = self._shape(bal, b.region.bbox, W, H, vertical, angle)
             src = b.region.font_size
             if src and not re.search(r"[^\W\d_]", text):
-                src = None  # '...' / '!!': a box of punctuation says nothing about glyph size
+                # '...' / '!!': a box of punctuation says nothing about glyph size, but its ink
+                # does: drawn as large as the source marks, not at a third of their size
+                if not vertical:  # three dots, not one narrow '…' glyph, span a '……' balloon
+                    text = text.replace("\u2026", "...")
+                src = None if vertical else _punct_size(m, text, b)
             short_side = min(shape.height, shape.width)
             max_size = self.max_font_size or (
                 round(src * MAX_SCALE) if src else max(12, round(short_side * 0.3))
@@ -397,6 +402,22 @@ def _on_page(b: Bubble, W: int, H: int) -> Bubble | None:
         box = BBox(x1=min(x1, W - 1), y1=min(y1, H - 1), x2=x2, y2=y2)
         b = b.model_copy(update={"region": b.region.model_copy(update={"bbox": box})})
     return b
+
+
+def _punct_size(m: Any, text: str, b: Bubble) -> int | None:
+    """Font size at which punctuation-only `text` ('?', '...', '!!') has the ink extent of the
+    source marks. A horizontal (or one-glyph) source is matched on both axes; a vertical stack
+    ('！！' in one column) on the height of one of its glyphs, since `text` is set across."""
+    l, t, r, btm = m.font(100).getbbox(text)
+    ink_w, ink_h = max(1, r - l), max(1, btm - t)
+    bb = b.region.bbox
+    src_w, src_h = max(1, bb.x2 - bb.x1), max(1, bb.y2 - bb.y1)
+    n = len("".join(unicodedata.normalize("NFKC", b.source_text).split())) or 1
+    if b.region.direction == "v" and n > 1:
+        size = 100 * (src_h / n) / ink_h
+    else:
+        size = 100 * min(src_w / ink_w, src_h / ink_h)
+    return max(12, round(size)) if size > 0 else None
 
 
 def _median(img: np.ndarray, b: BBox) -> tuple[int, int, int]:

@@ -16,15 +16,16 @@ python training/cli.py <command> --help
 | `pseudo-label`     | `pseudo_label.py`       | YOLO dataset labelled by a teacher (ctd)   | input to `detector`                                           |
 | `prepare-manga109` | `prepare_manga109.py`   | YOLO dataset from Manga109 `<text>` boxes  | input to `detector`                                           |
 | `detector`         | `train.py`              | `weights/manga-text-yolo11n.onnx`          | `-d yolo`                                                     |
-| `prune-ctd`        | `prune_ctd.py`          | box-head-only comic-text-detector ONNX     | `-d ctd` fast path                                            |
+| `prune-ctd`        | `prune_ctd.py`          | `weights/comictextdetector-blk.onnx`       | `-d ctd_blk` (boxes only; `-d ctd` needs no pruning)          |
 | `ocr`              | `train_ocr.py`          | fine-tuned manga-ocr checkpoint            | input to `export-ocr`                                         |
 | `export-ocr`       | `export_ocr_onnx.py`    | single-graph manga-ocr ONNX + vocab        | `--ocr manga_ocr --opt ocr.weights=<onnx>`                    |
 | `translator`       | `train_translator.py`   | Hugging Face seq2seq checkpoint dir        | `-t nllb --opt translator.model=<dir>` (`-t m2m100` for M2M)  |
 | `inpaint`          | `train_inpaint.py`      | AOT inpainter checkpoint (`best.pt`)       | input to `export-inpaint`                                     |
 | `export-inpaint`   | `export_inpaint_onnx.py`| ONNX with the LaMa interface               | `-i lama_manga --opt inpainter.weights=<onnx>`                |
 
-Install the extras once: `uv sync --extra torch --extra train` (torch + transformers for OCR,
-translator and inpaint; ultralytics for the YOLO detector).
+Install the extras once: `uv pip install -p .venv/bin/python -e ".[torch,train,dev]"`
+(torch + transformers for OCR, translator and inpaint; ultralytics and onnx for the detector
+and `prune-ctd`).
 
 ## Data
 

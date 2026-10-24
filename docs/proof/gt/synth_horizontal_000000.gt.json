@@ -1,0 +1,62 @@
+{
+ "image": "000000.jpg",
+ "note": "synthetic page from training/synth.py --seed 7; ja exact, id_ref = hand translation of each corpus line",
+ "bubbles": [
+  {
+   "ja": "あの時の約束、覚えてる？明日は雨が降るらしいよ",
+   "id_ref": "Kamu ingat janji waktu itu? Katanya besok bakal hujan",
+   "bbox": [
+    85,
+    350,
+    382,
+    408
+   ],
+   "vertical": false,
+   "container": "cloud",
+   "font_size": 25
+  },
+  {
+   "ja": "私の名前はさくらです",
+   "id_ref": "Namaku Sakura",
+   "bbox": [
+    86,
+    1070,
+    288,
+    1143
+   ],
+   "vertical": false,
+   "container": "ellipse",
+   "font_size": 35
+  },
+  {
+   "ja": "私の名前はさくらです今日は本当にありがとうわかった、行くよ",
+   "id_ref": "Namaku Sakura Terima kasih banyak untuk hari ini Baiklah, aku pergi",
+   "bbox": [
+    652,
+    951,
+    788,
+    1088
+   ],
+   "vertical": false,
+   "container": "none",
+   "font_size": 19
+  },
+  {
+   "ja": "誰かいるの？え？今なんて言った？静かにして！",
+   "id_ref": "Ada orang di sana? Hah? Barusan kamu bilang apa? Diam!",
+   "bbox": [
+    499,
+    529,
+    716,
+    619
+   ],
+   "vertical": false,
+   "container": "ellipse",
+   "font_size": 25
+  }
+ ],
+ "sfx": [
+  "ごろん",
+  "もじ…"
+ ]
+}
