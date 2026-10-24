@@ -16,17 +16,227 @@ artifact it left in [`docs/proof/`](proof/).
   `docs/proof/` holds downscaled JPEGs (each <= 400 KB, 5 MB in total), reports, logs, the GT files and
   the helper scripts (`docs/proof/scripts/`, run from `apps/worker/out/proof`).
 
+## 0. Final fix round (2026-10-24, 15:00 to 16:20 UTC): what the reviewers found, what changed
+
+Four independent reviews found that most of the evidence below rests on one real page (page01, the
+reference project's own demo image), and that several stages break on real B/W scans. This section
+lists every blocker/major they raised, the code change, and **fresh** evidence produced after the
+change. Sections 1 to 8 further down are the earlier run (tree `18b962b`); where this round
+supersedes a claim there, the claim is marked *(superseded, see 0.x)*.
+
+**New evidence base.** Besides page01 and the synthetic pages, five real pages with hand-made GT now
+feed the harness:
+
+| page | GT | in repo? | what is hard |
+|---|---|---|---|
+| `eval/fixtures/real/psimera_val_000002.jpg` | 3 bubbles + id refs | yes (CC BY-NC 4.0, PSImera val split; not in YOLO's training data) | 640 px resize, soft small text over dark art |
+| `eval/fixtures/real/psimera_val_000005.jpg` | 6 bubbles + id refs | yes (same) | furigana, a vertical margin disclaimer |
+| Manga109 `ARMS` p.15 (1654x1170 spread) | 12 bubbles (reviewer 1) | GT only, `eval/heldout/` (Manga109 may not be redistributed) | small text on a spread, touching balloons, truncated boxes |
+| Manga109 `Arisa` p.10 (1654x1170 spread) | 30 bubbles (reviewer 1) | GT only | furigana, short lines, open balloons |
+| Manga109 `Akuhamu` p.20 | none (reading order only) | no | two pages of 4-koma strips |
+| `eval/fixtures/lines_ja_id.tsv` | 36 lines + id refs | yes | held-out lines (24 from reviewer 2, 12 added) |
+
+Manga109 images and crops are kept out of `docs/` for the same licence reason; their outputs are in
+`apps/worker/out/final-fixer/` (scratch, not committed). Commands: [proof/scripts/run_benches_fix.sh](proof/scripts/run_benches_fix.sh)
+(harness on every page, page01 matrix, line check) and [proof/scripts/deteval.py](proof/scripts/deteval.py)
+(detect + OCR only, every detector, refinement on/off). Test suite after the round: see section 0.8.
+
+### 0.1 Detection on real scans (reviewer 1: ARMS 9/12 + 2 fp, truncated boxes, YOLO, spreads)
+
+**Changes** (`detect/postprocess.py`, new, run by `Pipeline.detect` for every detector;
+`detect/ctd_full.py`; `detect/order.py`):
+
+- *Spreads*: a landscape page (w >= 1.2 h) runs ctd as two overlapping halves, each at single-page
+  scale (a 1654 px spread had its text shrunk to 62%), plus one whole-page pass whose text lines are
+  added where no half saw them.
+- *Box over two balloons*: a region whose line quads do not run side by side (less than 30% shared
+  height for columns) is split; a region over two separately outlined balloons is split by paper.
+- *Box short of its text*: a box grows over dark ink islands wholly surrounded by the same flat
+  light paper that continue its lines (any size: ド, ？, ・・・, い, a long ー) or form a further
+  full-size column (じゃ, ……？). Smaller glyphs beside a column are furigana and stay out (they
+  only confuse OCR; the mask erases them, 0.3). Two halves of one block in one balloon are merged.
+  Textured or light-gray art (a washed-out page's furniture) is not "paper" and is left alone.
+- *Reading order*: a spread is cut at the page gap first (right page first); full-height gutters
+  backed by panel frames that cut the page into tall strips are read strip by strip (4-koma).
+
+**Evidence** ([proof/reports/fix_detection_table.txt](proof/reports/fix_detection_table.txt), GT
+bubbles found / false positives / duplicates, OCR mean CER):
+
+| detector | page01 | ARMS_015 | Arisa_010 | PSImera 2 | PSImera 5 | all 64 GT bubbles |
+|---|---|---|---|---|---|---|
+| before this round, `ctd` (reviewer 1) | 13/13 | **9/12, fp 2**, CER 0.083 | 30/30 with はー / あいつは partial, CER 0.041 | – | – | – |
+| `ctd` + spread tiling, refinement off | 13/13 | 10/12, fp 2, frag 1, CER 0.040 | 30/30, dup 1, CER 0.048 | 3/3 | 6/6 | 62/64, fp 2, dup 1 |
+| **`ctd` now (default)** | 13/13, CER 0.008 | **12/12, fp 1**, CER 0.014 | **30/30, fp 0**, CER 0.020 | 3/3, CER 0 | 6/6, CER 0 | **64/64, fp 1, 0 partial** |
+| `ctd_blk` now | 13/13 | 8/12, fp 2 | 30/30 | 3/3 | 6/6 | 60/64, fp 2 |
+| `yolo` now | 13/13 | 8/12, fp 2 | **20/30** | 3/3 | 6/6, fp 2 | 50/64, fp 4 |
+
+- The remaining ARMS false positive is the SFX ゴオオ over screentone: its ゴ lies outside the box
+  on textured sky (which the completion rightly refuses), OCR reads ナオォ, and the text-only matcher
+  cannot tie that to the listed SFX. Harness: ARMS detect still **FAIL** (fp must be 0).
+- `ctd_blk` and `yolo` have no line quads, so the split by line alignment does not apply to them
+  (an ink-island stand-in for lines was tried and made page01 worse: reverted).
+- Akuhamu_020 reading order is now 0-4 right strip of the right page, 5-13 its left strip, then
+  the left page tier by tier (`out/final-fixer/akuhamu_order.jpg`). Unit tests:
+  `tests/test_detect_postprocess.py` (10 tests, synthetic spreads, 4-koma, balloons).
+
+**YOLO (reviewer 1 major, reviewer 4 major) is not fixed by retraining.** Its method description
+now says what it is: trained on synthetic pages plus ctd pseudo-labels of PSImera `images/test`
+and of 60 augmented views of page01, so **page01 is in its training data** and its 13/13 there
+proves nothing; on Arisa it finds 20/30. Section 7's sentence "it passes every check ctd passes" was
+wrong (the fresh matrix also shows `-d yolo` failing inpaint with 1 residual region).
+
+### 0.2 Harness strictness (reviewer 1 minor, reviewer 2 major)
+
+- **Partial boxes count as not found.** A match whose OCR read is shorter than the GT and holds
+  under 75% of its characters (`metrics.coverage`) is *partial*; the detect check counts only full
+  matches. はー for はーい, クン for ドクン, あいつは for じゃあいつは……？ are partial (tests in
+  `tests/test_eval_strict.py`). On synth 000002 this now flags 緒に帰ろう for 一緒に帰ろうよ, which
+  the old harness passed.
+- **Meaning conflicts.** A bubble is adequate only with cosine >= 0.8 **and** no
+  `metrics.meaning_conflicts`: flipped negation, swapped or added participants (aku/kau/-ku/-mu/dia,
+  in order), active for passive (marah vs dimarahi). All four of reviewer 2's false ADEQUATEs except
+  the lexical one are caught ('Kau tidak akan pernah memaafkanku' roles, 'Aku marah pada guru' voice,
+  'Aku ingin kau tidur' participants); 'Wah, baiklah!' for 'Wah, bagus dong!' (0.88) still passes:
+  the check is a narrow heuristic, not a translation judge. No adequate page01 bubble of nllb,
+  m2m100, chain or local_llm is flagged.
+- **Held-out lines.** `python -m terjemahin_worker.eval lines -t nllb -t m2m100 ...` scores
+  translators on `eval/fixtures/lines_ja_id.tsv` with the same test.
+- A GT without reference translations now reports translate as n/a instead of FAIL with chrF 0.
+
+### 0.3 Translation (reviewer 2 blockers and majors, reviewer 4 major)
+
+**Changes:** default translator `nllb` -> **`m2m100`** (`config.py`, `.env.example`, README);
+hiragana first names romanised where the text marks them (`ゆいちゃん` -> Yui-chan, `名前はさくら`
+-> Sakura, `textproc.romanize_kana_names`), a vocative 先輩/先生 kept as Senpai/Sensei, the comma
+after a leading name kept, `Nama aku` -> `Namaku`. Method descriptions no longer call nllb fluent.
+
+**Evidence** (strict meaning test):
+
+| translator | page01 (harness) | held-out lines (36) | s / 36 lines |
+|---|---|---|---|
+| nllb (old default) | 8/13 **FAIL**, chrF 30.7 | 18/36 | 14 |
+| **m2m100 (new default)** | **10/13 PASS**, chrF 32.4 | 23/36 | 8 |
+| chain (m2m100 -> en -> nllb) | 9/13 FAIL | 24/36 | 15 |
+| local_llm (Qwen2.5-3B) | 10/13 PASS, chrF 38.5 | 24/36 (run before the vocative/comma change) | 119 |
+
+Reports: [fix_page01_baseline.md](proof/reports/fix_page01_baseline.md),
+[fix_page01_matrix.md](proof/reports/fix_page01_matrix.md), [fix_lines_seq2seq.md](proof/reports/fix_lines_seq2seq.md),
+[fix_lines_with_local_llm.md](proof/reports/fix_lines_with_local_llm.md). Names: さくら -> "Namaku
+Sakura" (all three; nllb gave "Nama aku Saura"), ゆいちゃん -> "Yui-chan, Selamat pagi!", けんたくん
+-> "Kenta-kun" (these 3 lines were used while writing the fix, so they are not held out for it).
+
+**Not fixed, stated plainly:**
+
+- The default passes page01 but **fails** the meaning check on both held-out real pages (PSImera 5:
+  2/6 adequate; PSImera 2: 2/3) and gets 23/36 held-out lines; m2m100 still makes role and lexical
+  errors (先輩 -> "Tuanku" before the vocative rule, 屋上 -> "langit-langit", page01 #9 "Kedai-kedai
+  ini..." and #10 "Wah, baiklah ya!", the second counted adequate). No offline model available here
+  (disk ~5 GB, no API keys) translates manga dialogue faithfully; reviewer 2's blocker 2 stands.
+- **No page context for seq2seq translators** (reviewer 2 major): m2m100/nllb translate bubble by
+  bubble, so subjects and pronouns are guessed. Only the LLM translators (`local_llm` offline, ~47 s
+  and ~9.5 GB per page; `anthropic`/`openai`/`gemini`/`deepseek` with a key, never run here) see the
+  page. This is an architectural limit, documented in README, not fixed.
+- SFX and handwritten asides are still translated like dialogue (あとね -> "Selanjutnya ya").
+
+### 0.4 Erasing: furigana, JPEG ringing, ghosts (reviewer 1 major, reviewer 3 major, reviewer 4 major)
+
+**Changes:** `mask/refine.balloon_sweep` (default mask refiner, option `sweep`): inside a closed,
+flat, light balloon, every pixel within one font of the text box that is >20 levels off the paper
+tone joins the mask, and the glyph masks are closed by 0.3 font, so furigana, cut-off glyph pieces
+and ringing go and the holes become a few round ones on clean paper. `inpaint/lama.flat_fill`
+accepts a noisy flat ring (>= 80% of it within 12 levels of its median, those uniform), so those
+holes are filled with the paper colour exactly instead of going to LaMa, which on B/W scans grew
+dotted ghosts of the furigana from the paper strips between glyph masks.
+
+**Evidence** (harness inpaint check; ghost = off-tone share of erased balloon interiors, limit 0.01):
+
+| page | before | now |
+|---|---|---|
+| page01 0.75x JPEG q75 (reviewer 3) | 20 dark specks visible | **PASS**: 0 residual, ghost 0.0023 ([crops](proof/fix/p75q75_inpaint_before_after.jpg)) |
+| page01 0.5x JPEG q40 (section 5 failure 2) | FAIL, 5 residual regions | **PASS**: 0 residual, ghost 0.0087 |
+| synth 000002 | FAIL, ghost 0.019 | **PASS**, ghost 0.0047 |
+| PSImera 5 (reviewer 4) | ghosts in every balloon | **PASS**, ghost 0.0000, inpaint 0.01 s (all flat-filled) ([before/after](proof/fix/psimera5_inpaint_before_after.jpg)) |
+| ARMS_015 | FAIL, 2 residual, ghost 0.169 | **PASS**, 0 residual, ghost 0.0000, inpaint 30 s -> 11.5 s |
+| Arisa_010 (reviewer 1: ghost 0.1685) | FAIL | still **FAIL**: ghost 0.0286, 0 residual regions, dark residue 0.0005; furigana in the closed balloons gone, ruby in two open balloons (私の答え) left |
+
+![p75q75](proof/fix/p75q75_inpaint_before_after.jpg)
+
+Tests: `tests/test_mask_sweep.py` (furigana and ringing taken, outline kept, textured balloons and
+text over art untouched, `sweep=false`), the existing mask/inpaint tests unchanged and passing.
+
+### 0.5 Typesetting (reviewer 3 majors, reviewer 4 major)
+
+**Changes** (`render/default.py`): the overflow shrink no longer goes below a legible floor
+(`legible_size`: 0.9 x the page minimum, at least 11 px; it went to 0.65x, 8 px). Text that does
+not fit at that size is set at it spilling over the balloon with an outline, logged as such, and
+**kept on the page** (`_onto_page`). A "closed balloon" whose inset interior does not hold the text
+box is not used (`_holds`: a page margin had passed as a balloon with a 1x19 px interior). A free
+text column in the page margin whose widened horizontal box would cover art (the PSImera
+disclaimer) is set down the column, read top to bottom; the harness reads such text upright.
+
+**Evidence:** 'Diamlah!' 11 px -> 13 px and 'Baiklah, aku akan pergi' 9 px -> 11 px on reviewer 3's
+synthetic pages ([crops](proof/fix/narrow_balloons_now.jpg)); page01's aside is set at 16 px inside
+the page with an outline ([crop](proof/fix/page01_sfx_now.jpg)) instead of 18 px cut by the page
+edge; the PSImera disclaimer runs down its margin
+([before/after](proof/fix/psimera5_before_after.jpg)). Tests: `tests/test_render_legible.py`.
+
+**Consequence, not hidden:** the harness render check now **FAILs page01's default run**: the
+16 px aside spills 35 ink px over its tiny balloon (worst inside share 0.944 < 0.99). Before, the
+same bubble overflowed at 18 px and was cut by the page edge, yet the check passed. Render also
+fails on PSImera 5 (4 small balloons spill at the 10 px floor of a 640 px page), page01 q40, Arisa
+(two bubbles the read-back OCR cannot read: '...' and a 13 px line) and synth 000003 (the known
+free-text duplicate). Section 3's "The page renders cleanly" is *(superseded)*.
+
+### 0.6 Harness on every page with the defaults (fresh)
+
+`ctd / manga_ocr / m2m100 / default / lama_manga / default`, `--no-warm` except page01. Reports in
+[proof/reports/](proof/reports/) (`fix_*.md`).
+
+| page | detect | OCR CER | translate | inpaint | render | total s |
+|---|---|---|---|---|---|---|
+| page01 | PASS 13/13 | 0.008 | **PASS** 10/13, chrF 32.4 | PASS | **FAIL** (aside spills) | 22.1 (9.5 warm) |
+| page01 0.75x q75 | PASS | 0.005 | PASS | **PASS** | FAIL (aside) | 21.1 |
+| page01 0.5x q40 | PASS | 0.005 | PASS | **PASS** | FAIL (1 lost, low res) | 26.4 |
+| PSImera 2 | PASS 3/3 | 0.000 | FAIL 2/3 | PASS | PASS | 16.0 |
+| PSImera 5 | PASS 6/6 | 0.000 | FAIL 2/6 | PASS | FAIL (spills at 10 px) | 9.8 |
+| ARMS_015 | FAIL (12/12, fp 1) | 0.014 | n/a (no refs) | **PASS** | **PASS** | 20.5 |
+| Arisa_010 | **PASS 30/30** | 0.020 | n/a | FAIL (ghost 0.029) | FAIL (read-back) | 43.4 |
+| synth 000002 | FAIL (1 partial) | 0.053 | FAIL 4/7 | **PASS** | PASS | 18.4 |
+| synth 000003 | FAIL (duplicate) | 0.000 | PASS 4/4 | PASS | FAIL (3 lost) | 16.6 |
+
+Full page01 matrix (258 s): every runnable method ran, 0 errors; see
+[fix_page01_matrix.md](proof/reports/fix_page01_matrix.md).
+
+![page01 now](proof/fix/page01_before_after.jpg)
+
+### 0.7 Docs and smaller items
+
+- README: m2m100 default, honest nllb and yolo descriptions, the unknown-option behaviour (an
+  unknown option key is ignored with a warning, not an error, as reviewer 4 showed), the Go
+  API/queue note made consistent with section 6.
+- Reviewer 4's training critique stands: the smoke runs show the training loop works, not that it
+  improves anything, and the shipped YOLO number on page01 is on training data (0.1).
+- Not addressed: `ollama` and `*_big` listed as available without a server or disk; bubble
+  geometry in the GT (matching is still by text, now with coverage); hyphenation of non-words;
+  round-trip hyphens.
+
+### 0.8 Test suite
+
+`.venv/bin/python -m pytest -q` at the end of this round: see the last line of
+[proof/pytest.txt](proof/pytest.txt). New test files: `test_detect_postprocess.py`,
+`test_eval_strict.py`, `test_mask_sweep.py`, `test_render_legible.py`, `test_translate_names.py`.
+
 ## Verdict at a glance
 
 | stage | works? | strongest evidence | weak spots found |
 |---|---|---|---|
-| detect | yes | page01 13/13 GT bubbles, 0 false positives (ctd, ctd_blk, yolo, classical); tall strip 25/25; synthetic pages 19/20 | two free-floating text columns over art were merged into one duplicate region (synth 000003) |
+| detect | yes | page01 13/13 GT bubbles, 0 false positives (ctd, ctd_blk, yolo, classical); tall strip 25/25; synthetic pages 19/20. *Now (0.1): ctd 64/64 on five pages incl. two real B/W spreads* | two free-floating text columns over art were merged into one duplicate region (synth 000003); *yolo 20/30 on Arisa* |
 | OCR | yes | page01 mean CER 0.008 (manga_ocr), 0.005 (48px, yolo); synthetic pages 0.000 to 0.053; Latin text via 48px 0.080 | 48px adds one false positive on page01; one Latin bubble read as `啊珈`, conf 0.24, left untouched |
-| translate | **partly** | runs with every offline method. On page01 the default `nllb` **fails** the harness's meaning check (8/13 adequate, need >= 70%). `m2m100` (10/13) and `local_llm` (10/13, chrF 38.5) pass | the default translator is the weakest stage. API translators only tested against mocks (no keys) |
+| translate | **partly** | runs with every offline method. On page01 the old default `nllb` **failed** the meaning check (8/13). *Now (0.3): default `m2m100` passes page01 (10/13) but fails both held-out real pages and gets 23/36 held-out lines* | the default translator is the weakest stage, no page context; API translators only tested against mocks (no keys) |
 | mask + inpaint | yes on clean scans | page01 0 residual text regions, 0 dark/ghost residue, all changes within 8 px of the mask | **fails on a half-resolution JPEG q40 page** (5 residual regions, 38/141 chars remain); ghost screentone 0.019 > 0.01 on synth 000002 |
 | render | yes | page01 read back from pixels by an independent OCR: CER 0.012 mean, 0 lost, all ink inside balloons | **2 bubbles lost / overlapping** where the detector produced a duplicate (synth 000003) |
 | selectable methods | yes | 32 methods (28 runnable here); the `--matrix` ran 18 non-baseline variants with 0 errors (8 skipped with reasons); methods picked from CLI flags, the web UI dropdowns and the queue API's `pipeline` JSON | 4 API translators need keys; `ollama` needs a server; `*_big` need 5 GB downloads |
-| training | yes (smoke) | fresh detector / OCR / translator / inpainter runs, each exported and loaded back into the product via `--opt`; the shipped `manga-text-yolo11n.onnx` scores 13/13 on page01 | the smoke runs are too short to improve quality (shown below). They prove the loop works, not that it helps |
+| training | yes (smoke) | fresh detector / OCR / translator / inpainter runs, each exported and loaded back into the product via `--opt` | the smoke runs are too short to improve quality (shown below). They prove the loop works, not that it helps. *The shipped yolo's 13/13 on page01 is on its own training data (0.1)* |
 
 ## 1. Test suite
 
@@ -92,7 +302,7 @@ the harness's `metrics.match_detections`. The script is inline in this session; 
   - #9 changes the meaning: "praise words for the shop owner" instead of "polite to the shop clerk".
   - #11 loses "he noticed right away".
   - The handwritten あとね ("and also...") becomes "Aku akan pergi" ("I'm going to go") in a tiny font.
-- The page renders cleanly, and the web UI lets a user fix all of these by hand (section 6).
+- The page renders cleanly *(superseded, see 0.5: the aside overflowed and was cut by the page edge)*, and the web UI lets a user fix all of these by hand (section 6).
 
 ## 4. Eval harness: baseline and full matrix
 
@@ -273,7 +483,7 @@ wrote 40 pages / 199 blocks of detector, OCR and inpaint data in 9 s.
 
 - **Shipped weights:** `weights/manga-text-yolo11n.onnx` was trained in this repo with `training/train.py`.
   `$W translate page01.png -d yolo` finds 13/13 GT bubbles, 0 false positives, 0 duplicates, OCR CER 0.005,
-  with detect in 0.08 s. In the matrix (section 4) it passes every check `ctd` passes.
+  with detect in 0.08 s. In the matrix (section 4) it passes every check `ctd` passes. *(Superseded, see 0.1: page01 is in its training data, the number proves nothing; on Arisa_010 it finds 20/30, and the fresh matrix fails its inpaint check.)*
 - **Fresh run:** `training/cli.py detector --data out/proof/train/synth/det/dataset.yaml --epochs 2
   --imgsz 640 --batch 8 --device cpu` took 16 s. Val mAP50 went 0.001 to 0.123 and it exported
   `det-smoke.onnx` (10.6 MB).

@@ -55,7 +55,7 @@ use.
 | translator | local_llm | torch, HF | Local chat LLM via transformers (offline; Qwen/Qwen2.5-3B-Instruct bf16, ~9.5GB RAM, 30-60 s/page on 4 CPU cores): whole page in one generation into English, NLLB to the target; glossary + previous pages, per-item fallback to m2m100. Opts: model, dtype, max_new_tokens, threads, pivot (en\|none), pivot_translator, fallback. |
 | translator | **m2m100** | torch, HF | M2M100 418M (offline, fastest; the default): best offline seq2seq ja->id (page01 10/13, held-out lines 23/36 adequate). One bubble at a time, no page context. |
 | translator | m2m100_big | torch, HF | M2M100 1.2B (offline, downloads ~5GB on first use). |
-| translator | nllb | torch, HF | NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): weaker than m2m100 on ja->id (page01 8/13, held-out lines 19/36 adequate); strong en->id (local_llm's pivot). |
+| translator | nllb | torch, HF | NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): weaker than m2m100 on ja->id (page01 8/13, held-out lines 18/36 adequate); strong en->id (local_llm's pivot). |
 | translator | nllb_big | torch, HF | NLLB-200 1.3B distilled (offline, downloads ~5GB on first use, slower). |
 | translator | none | – | Erase text only: inpaint without typesetting. |
 | translator | ollama | Ollama server | Local LLM through Ollama's OpenAI-compatible endpoint (no key; vision=true for VLMs such as qwen2.5vl / gemma3; 900s timeout for CPU inference). |
@@ -109,7 +109,7 @@ $W detect page.png -d ctd -o out/detect.png      # boxes + reading order; JSON o
                                                  # out/detect-mask.png = ctd's glyph mask
 $W translate page.png -d yolo --opt detector.conf=0.3
 $W translate page.png --ocr 48px                 # any script; manga_ocr is Japanese only
-$W translate page.png -t m2m100                  # or nllb_big, local_llm, gemini, ...
+$W translate page.png -t nllb                    # or local_llm, chain, gemini, ...
 $W translate page.png -t chain --opt translator.steps=m2m100:en,nllb:id
 $W translate page.png --mask bbox -i lama --opt inpainter.flat_tol=0
 $W translate page.png -t none -i telea           # erase only, no typesetting
@@ -142,18 +142,23 @@ Measured on page01 with the evaluation harness (one stage changed at a time, the
 defaults; full table under [Performance](#performance)):
 
 - **Detector**: `ctd` (default) is the only one with text lines and a glyph mask, which the
-  default mask refiner uses to erase glyphs only. `ctd_blk` (0.09 s) and `yolo` (0.04 s) find
-  the same 13/13 balloons but leave a little erase residue; `classical` needs no weights but
-  misses text outside white balloons and failed the outside-mask check.
+  default mask refiner uses to erase glyphs only. Every detector's boxes are refined from the
+  pixels (`DETECT_REFINE`, detect/postprocess.py): a box over two balloons is split, a box that
+  stops short of its text grows over the cut-off glyphs, two-page spreads run as two halves and are
+  read right page first, 4-koma strips one at a time. On five GT pages (page01, two Manga109
+  spreads, two PSImera pages) `ctd` finds 64/64 bubbles with 1 false positive; `ctd_blk` 60/64 and
+  `yolo` 50/64 (yolo was trained on page01 views, so its page01 score proves nothing). `classical`
+  needs no weights but misses text outside white balloons.
 - **OCR**: `manga_ocr` (default, ONNX, 1.2 s) for Japanese. `48px` reads any script (used
   automatically for non-Japanese sources) but read one non-text region on page01.
   `manga_ocr_hf` gives the same reads through torch (GPU, beam search).
-- **Translator**: the weakest stage. Offline: `m2m100` (10/13 balloons keep their meaning,
-  chrF 32.4, 4.6 s) currently beats the default `nllb` (8/13, chrF 30.7, 4 s); `local_llm`
-  is best (10/13, chrF 38.5) but takes ~47 s and ~9.5 GB RAM. `chain` (m2m100 -> en -> nllb)
-  9/13. With an API key, `gemini`, `anthropic`, `openai` and `deepseek` also use the series
-  context (not measured here). `none` erases without typesetting (clean pages for
-  scanlators), `original` checks OCR and typesetting.
+- **Translator**: the weakest stage. Offline, the default `m2m100` keeps the meaning of 10/13
+  page01 balloons (chrF 32.4) and 23/36 held-out lines (`eval/fixtures/lines_ja_id.tsv`); `nllb`
+  8/13 and 18/36; `chain` (m2m100 -> en -> nllb) 9/13 and 24/36; `local_llm` 10/13 (chrF 38.5)
+  and 24/36 at ~47 s and ~9.5 GB RAM per page. The seq2seq translators work bubble by bubble
+  without page context; only the LLM translators see the page. With an API key, `gemini`,
+  `anthropic`, `openai` and `deepseek` also use the series context (not measured here: no
+  keys). `none` erases without typesetting, `original` checks OCR and typesetting.
 - **Mask refiner**: keep `default`. `bbox` erases whole boxes (changes art around text);
   `dilate` is a looser glyph mask.
 - **Inpainter**: `lama_manga` (default, 3.7 s) for screentone and art behind text. On plain
@@ -258,51 +263,60 @@ cd apps/worker
 .venv/bin/python -m terjemahin_worker.eval bench ... --matrix --stages inpainter -t m2m100
 ```
 
-`page01.gt.json` holds the 13 balloons' boxes, Japanese text and a reference Indonesian
-translation. The harness scores detection (GT balloons matched by OCR text, false positives,
-duplicates), OCR CER, translation (chrF against the reference, and "meaning": embedding cosine
->= 0.8 with paraphrase-multilingual-MiniLM), inpainting (text a judge detector+OCR still reads
+`page01.gt.json` holds the 13 balloons' Japanese text and a reference Indonesian translation;
+`eval/fixtures/real/` adds two held-out real B/W pages with GT (PSImera, CC BY-NC) and
+`eval/heldout/` the GT of two Manga109 spreads (images not redistributable). The harness scores
+detection (GT balloons matched by OCR text; a box that reads under 75% of its bubble is
+*partial* and counts as not found; false positives, duplicates), OCR CER, translation (chrF
+against the reference, and "meaning": embedding cosine >= 0.8 with
+paraphrase-multilingual-MiniLM **and** no flipped negation, swapped participants or
+active-for-passive, `metrics.meaning_conflicts`), inpainting (text a judge detector+OCR still reads
 in erased areas, residue, pixels changed outside the mask), rendering (ink inside the balloon,
 the rendered text read back by an independent OCR, smallest font) and latency. It writes
 `report.md`, `report.json` and a `contact_sheet.jpg`; each stage gets PASS/FAIL against fixed
 thresholds. Methods that download GBs or need a network/server are skipped unless
 `--allow-downloads` / `--network` is given.
 
+```sh
+.venv/bin/python -m terjemahin_worker.eval lines -t m2m100 -t nllb --out out/lines   # held-out lines
+```
+
 ## Performance
 
-Fresh harness run on 2026-10-24: page01 (1487x2048, 13 balloons), 4 shared CPU cores, no GPU,
-`python -m terjemahin_worker.eval bench ... --matrix` (4 min 41 s for the whole matrix).
+Fresh harness run on 2026-10-24 (final fix round): page01 (1487x2048, 13 balloons), 4 shared CPU
+cores, no GPU, `python -m terjemahin_worker.eval bench ... --matrix` (4 min 18 s for the whole
+matrix). Other pages: docs/PROOF.md section 0.6.
 
-Default pipeline (`ctd`, `manga_ocr`, `nllb`, `default`, `lama_manga`, `default`):
+Default pipeline (`ctd`, `manga_ocr`, `m2m100`, `default`, `lama_manga`, `default`):
 
 | check | result | threshold |
 |---|---|---|
-| detection | 13/13 balloons, 0 false positives, 0 duplicates | PASS (>= 92%) |
+| detection | 13/13 balloons, 0 partial, 0 false positives, 0 duplicates | PASS (>= 92%) |
 | OCR | CER 0.008, 11/13 exact | PASS (<= 0.15) |
-| translation | chrF 30.7; meaning kept in 8/13 balloons (mean cosine 0.84) | **FAIL** (>= 70%) |
-| inpainting | 0 residual text regions, 0 residue, no change > 8 px outside the mask | PASS |
-| rendering | all ink inside balloons, read-back CER 0.012 (worst 0.17), min font 18 px | PASS |
-| latency, warm | detect 0.6, OCR 1.2, translate 4.2, mask 0.1, inpaint 3.7, render 0.6: **10.4 s** | |
-| latency, first page | 22.7 s (models load lazily) | |
+| translation | chrF 32.4; meaning kept in 10/13 balloons (mean cosine 0.86) | PASS (>= 70%) |
+| inpainting | 0 residual text regions, ghost 0.0001, no change > 8 px outside the mask | PASS |
+| rendering | read-back CER 0.005, but the 16 px aside (あとね) spills over its tiny balloon (worst inside share 0.94) | **FAIL** (>= 0.99) |
+| latency, warm | detect 0.6, OCR 1.3, translate 2.9, mask 0.3, inpaint 3.8, render 0.6: **9.5 s** | |
+| latency, first page | 22.1 s (models load lazily) | |
 
-One stage changed at a time:
+One stage changed at a time (meaning = adequate GT balloons; "erase" = the inpaint check):
 
-| run | detection | OCR CER | chrF | meaning | erase / outside mask | min font | total s |
+| run | detection | OCR CER | chrF | meaning | erase | render | total s |
 |---|---|---|---|---|---|---|---|
-| default | 13/13 | 0.008 | 30.7 | 8/13 | PASS | 18 | 22.7 (10.4 warm) |
-| `-d classical` | 13/13 | 0.035 | 30.3 | 9/13 | 1 residual, FAIL | 25 | 8.3 |
-| `-d ctd_blk` | 13/13 | 0.005 | 30.7 | 8/13 | PASS | 21 | 10.2 |
-| `-d yolo` | 13/13 | 0.005 | 30.7 | 8/13 | PASS | 21 | 10.9 |
-| `--ocr 48px` | 13/13, 1 fp | 0.005 | 30.7 | 8/13 | PASS | 12 | 12.8 |
-| `--ocr manga_ocr_hf` | 13/13 | 0.008 | 30.7 | 8/13 | PASS | 18 | 10.5 |
-| `-t m2m100` | 13/13 | 0.008 | 32.4 | **10/13** | PASS | 18 | 10.8 |
-| `-t chain` | 13/13 | 0.008 | 31.6 | 9/13 | PASS | 18 | 14.1 |
-| `-t local_llm` | 13/13 | 0.008 | **38.5** | **10/13** | PASS | 17 | 53.8 |
-| `--mask bbox` | 13/13 | 0.008 | 30.7 | 8/13 | FAIL (changes art) | 18 | 22.4 |
-| `--mask dilate` | 13/13 | 0.008 | 30.7 | 8/13 | PASS | 18 | 15.6 |
-| `-i telea` / `ns` / `fill` | 13/13 | 0.008 | 30.7 | 8/13 | PASS | 18 | 7.0 / 6.9 / 7.1 |
-| `-i lama` | 13/13 | 0.008 | 30.7 | 8/13 | PASS | 18 | 19.4 |
-| `-r basic` | 13/13 | 0.008 | 30.7 | 8/13 | PASS | 6 (FAIL) | 9.8 |
+| default | 13/13 | 0.008 | 32.4 | 10/13 | PASS | FAIL (aside) | 21.3 |
+| `-d classical` | 13/13 | 0.035 | 33.1 | 10/13 | PASS | PASS | 5.7 |
+| `-d ctd_blk` | 13/13 | 0.005 | 32.4 | 10/13 | PASS | PASS | 9.5 |
+| `-d yolo` | 13/13 | 0.005 | 32.4 | 10/13 | 1 residual, FAIL | PASS | 7.8 |
+| `--ocr 48px` | 13/13, 1 fp | 0.005 | 32.4 | 10/13 | PASS | PASS | 12.4 |
+| `--ocr manga_ocr_hf` | 13/13 | 0.008 | 32.4 | 10/13 | PASS | FAIL (aside) | 10.5 |
+| `-t nllb` | 13/13 | 0.008 | 30.7 | 8/13 FAIL | PASS | PASS | 11.6 |
+| `-t chain` | 13/13 | 0.008 | 31.6 | 9/13 FAIL | PASS | FAIL | 16.0 |
+| `-t local_llm` | 13/13 | 0.008 | **38.5** | 10/13 | PASS | PASS | 54.9 |
+| `--mask bbox` | 13/13 | 0.008 | 32.4 | 10/13 | PASS | PASS | 11.3 |
+| `--mask dilate` | 13/13 | 0.008 | 32.4 | 10/13 | PASS | PASS | 5.7 |
+| `-i telea` / `ns` / `fill` | 13/13 | 0.008 | 32.4 | 10/13 | PASS | PASS | 6.4 / 6.3 / 6.3 |
+| `-i lama` | 13/13 | 0.008 | 32.4 | 10/13 | PASS | FAIL | 18.5 |
+| `-r basic` | 13/13 | 0.008 | 32.4 | 10/13 | PASS | 6 px fonts, FAIL | 9.8 |
 
 "total s" counts stages reused from the cache at the default's warm time, so first-load
 costs only show in the default row. Not run: API translators (no keys), `ollama` (no server),
@@ -312,14 +326,17 @@ costs only show in the default row. Not run: API translators (no keys), `ollama`
 
 ## Limitations
 
-- Translation quality is the weak stage. On page01 the default NLLB-600M keeps 8 of 13
-  balloons' meaning (the harness wants 70%) and fails the translate check; it mistranslates
-  short casual lines (優しいよね -> "baik-baik saja") and anything that needs context, and
-  the small aside あとね ("and also...") becomes "Aku akan pergi" ("I'll go"). `m2m100` and
-  `local_llm` pass on this page (10/13), the latter at ~47 s and ~9.5 GB RAM per page. The
-  API translators were not measured (no keys available).
-- The harness has one annotated page; numbers on other pages, art styles or scan qualities
-  will differ.
+- Translation quality is the weak stage. The default M2M100-418M passes page01 (10/13) but
+  fails the meaning check on both held-out real pages and keeps the meaning of 23 of 36
+  held-out lines; it guesses subjects (no page context), and mistranslates casual lines and
+  asides (あとね -> "Selanjutnya ya"). `local_llm` is no better on the held-out lines (24/36) at
+  ~47 s and ~9.5 GB RAM per page. The API translators were not measured (no keys available).
+- Real-page evidence is five GT pages (page01, two Manga109 spreads, two 640 px PSImera pages);
+  other art styles and scan qualities will differ. Furigana in open balloons and ruby over art
+  can still leave faint residue (Arisa_010 ghost share 0.029 > 0.01).
+- Text that does not fit its balloon at a legible size (0.9 x the page minimum) is set at that
+  size spilling over the balloon with an outline; the harness counts this as a render failure
+  (page01's small aside does it).
 - `manga_ocr` reads Japanese only; other sources need `--ocr 48px` (chosen automatically when
   `--from` is not Japanese).
 - SFX outside balloons are detected but translated like dialogue; there is no SFX-specific
@@ -327,8 +344,9 @@ costs only show in the default row. Not run: API translators (no keys), `ollama`
 - CJK targets need a CJK font (not bundled, `CJK_FONTS=1` in Docker).
 - CPU only was tested. `DEVICE=cuda` applies to the torch methods; the ONNX methods use the
   CPU execution provider.
-- The Go API keeps jobs in memory, and it and the queue path were checked with the API's unit
-  tests, not end to end, in this revision.
+- The Go API keeps jobs in memory. The queue path ran end to end once (Go API, RabbitMQ standing
+  in for LavinMQ, `terjemahin-worker serve`; docs/PROOF.md section 6) on an earlier revision;
+  Docker compose and LavinMQ themselves were not exercised.
 
 ## Layout
 
@@ -340,7 +358,7 @@ apps/worker/terjemahin_worker/
   web/                    FastAPI web UI + JSON API
   eval/                   evaluation harness
 apps/worker/training/     training and export scripts (training/README.md)
-apps/worker/eval/fixtures page01.png + ground truth
+apps/worker/eval/         fixtures/ (page01, real/ PSImera pages, lines_ja_id.tsv) + heldout/ GT
 apps/worker/weights/      model files (weights/README.md)
 apps/worker/fonts/        lettering fonts (fonts/README.md)
 ```

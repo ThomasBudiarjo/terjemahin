@@ -48,3 +48,5 @@ SKIPPED [1] tests/test_translate_local_llm.py:273: set TERJEMAHIN_SLOW_LLM=1 (ne
 ## final re-run at end of session (2026-10-24T14:02:52Z), same command without -rA/--durations
 487 passed, 1 skipped, 17 warnings in 157.32s (0:02:37)
 wall clock: 2m39.605s
+
+Final fix round (2026-10-24 ~16:20 UTC), `.venv/bin/python -m pytest -q -p no:cacheprovider`: 520 passed, 1 skipped, 17 warnings in 175.67s (0:02:55)

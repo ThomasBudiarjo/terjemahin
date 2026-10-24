@@ -365,7 +365,7 @@ def _rules(v: Any, name: str) -> dict[str, str]:
 _KNOWN = {
     "nllb": ("facebook/nllb-200-distilled-600M", "nllb",
              ("NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): weaker than m2m100 on ja->id "
-             "(page01 8/13, held-out lines 19/36 adequate); strong en->id (local_llm's pivot).")),
+             "(page01 8/13, held-out lines 18/36 adequate); strong en->id (local_llm's pivot).")),
     "nllb_big": ("facebook/nllb-200-distilled-1.3B", "nllb",
                  "NLLB-200 1.3B distilled (offline, downloads ~5GB on first use, slower)."),
     "m2m100": ("facebook/m2m100_418M", "m2m100",
