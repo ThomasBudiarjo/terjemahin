@@ -60,10 +60,38 @@ out, so repeated lines never leak). Japanese sources are normalised with the sam
 
 ```bash
 python training/cli.py download-pool --out data/pool
-DETECTOR=ctd python training/cli.py pseudo-label --pool data/pool --out data/pseudo-text
+python training/cli.py pseudo-label --pool data/pool --out data/pseudo-text        # teacher: ctd
 python training/cli.py detector --data data/pseudo-text/dataset.yaml --epochs 60
 # or: --data data/synth/det/dataset.yaml, or a Manga109 dataset from prepare-manga109
 ```
+
+CPU recipe that produced the current `weights/manga-text-yolo11n.onnx` (4 shared cores, ~1 h
+in total, ~520 training images):
+
+```bash
+python training/cli.py download-pool --out data/pool --split test            # 211 real pages
+# text-free backgrounds: real pages through the worker with -t none (keep only pages on which
+# ctd then finds nothing: leftover text in a background is an unlabelled positive)
+terjemahin-worker translate eval/fixtures/page01.png -t none -o data/bg/page01_clean.png
+python training/cli.py synth --out data/synth --n 260 --emit det --workers 2 \
+    --fonts /path/to/manga-image-translator/fonts --backgrounds data/bg
+python training/cli.py pseudo-label --pool data/pool --out data/pseudo
+python training/cli.py pseudo-label --pool eval/fixtures/page01.png --out data/pseudo \
+    --augment 60 --val-split train --prefix p01_                  # random views of one page
+python training/cli.py detector --data data/synth/det/dataset.yaml data/pseudo/dataset.yaml \
+    --imgsz 640 --batch 16 --device cpu --epochs 30 --time 0.6
+terjemahin-worker translate page.png -d yolo
+```
+
+- `pseudo-label`: `--detector` picks the teacher (any worker detector, default `ctd`), `--augment N`
+  adds N random views per page (crop, rescale to 640-1600 px, contrast, blur, noise, JPEG) and
+  labels each view with the teacher; `--val-split` pins pages to one split, `--prefix` keeps file
+  names apart when several runs write into one dataset.
+- `detector`: several `--data` yamls are merged; `--time` (hours) caps wall clock and fits the LR
+  schedule to it; `yolo11n.pt` comes from the Hugging Face mirror `Ultralytics/YOLO11`. The ONNX
+  has a fixed 1x3xSxS input at the training size, which `detect/yolo.py` reads back.
+- The `PSImera/manga_bubbles_detect` pool pages are resized to 640x640 (aspect not kept) and are
+  CC BY-NC 4.0: fine for this experiment, not for a commercial model.
 
 ## OCR
 
