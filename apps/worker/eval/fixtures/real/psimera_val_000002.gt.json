@@ -1,0 +1,24 @@
+{
+ "image": "psimera_val_000002.jpg",
+ "source": "PSImera/manga_bubbles_detect (Hugging Face), images/val, CC BY-NC 4.0. Not in the YOLO training data (training/README.md used images/test and views of page01).",
+ "note": "Hand transcription (final fixer), dialogue only. 640x640 resize of a B/W page: small, soft text. Chapter title, page code and the bare '!?' are listed as sfx (not dialogue, not scored). References are in plain standard Indonesian (a first draft used slang, which the embedding test scored against correct plain translations).",
+ "bubbles": [
+  {
+   "ja": "5日の間に随分と増えたな",
+   "id_ref": "Dalam lima hari, jumlahnya bertambah banyak."
+  },
+  {
+   "ja": "脱走者は見つかったか？",
+   "id_ref": "Apakah pelarian itu sudah ditemukan?"
+  },
+  {
+   "ja": "お前は…！",
+   "id_ref": "Kau...!"
+  }
+ ],
+ "sfx": [
+  "第52話",
+  "B06-32②",
+  "!?"
+ ]
+}

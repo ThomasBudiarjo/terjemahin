@@ -7,6 +7,7 @@ do not match our target class.
 Usage:
     python training/download_pool.py --out data/pool
     python training/download_pool.py --out data/pool --limit 300   # quick experiment
+    python training/download_pool.py --out data/pool --split test  # 211 pages, ~70MB download
 """
 
 from __future__ import annotations
@@ -25,10 +26,13 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("data/pool"))
     ap.add_argument("--limit", type=int, default=0, help="copy at most N images (0 = all)")
     ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--split", default="", help="only download images/<split>/ (train/val/test)")
     a = ap.parse_args()
 
-    cache = snapshot_download(a.repo, repo_type="dataset", allow_patterns=["images/**"])
-    imgs = sorted(Path(cache).glob("images/**/*.jp*g")) + sorted(Path(cache).glob("images/**/*.png"))
+    pattern = f"images/{a.split}/**" if a.split else "images/**"
+    cache = snapshot_download(a.repo, repo_type="dataset", allow_patterns=[pattern])
+    root = Path(cache) / "images" / a.split if a.split else Path(cache) / "images"
+    imgs = sorted(root.glob("**/*.jp*g")) + sorted(root.glob("**/*.png"))
     if a.limit:
         imgs = imgs[: a.limit]
 

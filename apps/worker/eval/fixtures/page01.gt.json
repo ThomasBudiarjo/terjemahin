@@ -1,0 +1,20 @@
+{
+  "image": "page01.png",
+  "note": "Hand transcription of every dialogue bubble, manga reading order (right-to-left, top-to-bottom per row of panels). SFX (ごろん, もじ…, あとね handwritten) are listed separately.",
+  "bubbles": [
+    {"ja": "ねえねえ、めいは坂本のことどう思う？", "id_ref": "Hei, hei, Mei, menurutmu Sakamoto itu gimana?"},
+    {"ja": "坂本くん？", "id_ref": "Sakamoto-kun?"},
+    {"ja": "うーんそうだなぁ・・優しいよね", "id_ref": "Hmm, gimana ya... dia baik, kan?"},
+    {"ja": "えー、それだけー？", "id_ref": "Eh, cuma itu?"},
+    {"ja": "じゃあメシアはどうなの？", "id_ref": "Kalau gitu, Mesia sendiri gimana?"},
+    {"ja": "え？", "id_ref": "Eh?"},
+    {"ja": "わ、私はー・・・別にそんな・・・", "id_ref": "A-aku sih... nggak gimana-gimana..."},
+    {"ja": "反応がいちいち面白いなーとか", "id_ref": "Reaksinya selalu lucu, gitu deh"},
+    {"ja": "うんうん", "id_ref": "Iya, iya"},
+    {"ja": "店の店員さんとかにも敬語使ってて偉いなーとか", "id_ref": "Dia sopan pakai bahasa halus bahkan ke pelayan toko, keren gitu"},
+    {"ja": "わあ、いいね！", "id_ref": "Wah, bagus dong!"},
+    {"ja": "あっ、あとこないだね、髪型変えたらすぐに気付いてくれてっ・・", "id_ref": "Ah, terus kemarin itu, waktu aku ganti gaya rambut, dia langsung sadar..."},
+    {"ja": "ふふっ、他には？", "id_ref": "Fufu, terus apa lagi?"}
+  ],
+  "sfx": ["ごろん", "もじ…", "あとね"]
+}

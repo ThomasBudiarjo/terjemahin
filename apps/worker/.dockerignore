@@ -1,0 +1,14 @@
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+out
+data
+training/data
+training/runs
+# weights are fetched inside the image (terjemahin-worker fetch-weights); mount trained
+# files (yolo, ctd_blk) elsewhere and point YOLO_WEIGHTS / CTD_WEIGHTS at them
+weights/*
+!weights/README.md
+.env
+.env.*

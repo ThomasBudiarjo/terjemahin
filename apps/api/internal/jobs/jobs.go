@@ -23,6 +23,10 @@ type Job struct {
 	OutputPath string          `json:"output_path"`
 	ResultPath string          `json:"result_path"`
 	Context    json.RawMessage `json:"context,omitempty"`
+	// Pipeline is the worker's PipelineConfig (method per stage + options), passed through.
+	Pipeline json.RawMessage `json:"pipeline,omitempty"`
+	// DebugDir, relative to the storage dir, receives per-stage images when set.
+	DebugDir string `json:"debug_dir,omitempty"`
 
 	Status    Status    `json:"status"`
 	Error     string    `json:"error,omitempty"`
@@ -55,6 +59,17 @@ func (s *MemoryStore) Put(j Job) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.jobs[j.JobID] = j
+}
+
+// IDs lists the stored job ids (tests and diagnostics).
+func (s *MemoryStore) IDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.jobs))
+	for id := range s.jobs {
+		out = append(out, id)
+	}
+	return out
 }
 
 func (s *MemoryStore) Get(id string) (Job, bool) {

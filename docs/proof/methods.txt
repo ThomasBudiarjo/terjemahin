@@ -1,0 +1,35 @@
+# Command: cd apps/worker && .venv/bin/terjemahin-worker methods   (2026-10-24T13:36:05Z)
+# * = default for the stage; ok = can run here; -- = unavailable (reason in brackets)
+
+detector      classical         ok OpenCV only, no weights: white balloons + glyph projection + line merge. Misses text outside balloons.
+detector     *ctd               ok comic-text-detector, all heads: blocks + DBNet text lines + glyph mask (~0.6s CPU)
+detector      ctd_blk           ok comic-text-detector pruned to the box head (training/prune_ctd.py). Boxes only.
+detector      yolo              ok YOLO11n fine-tuned on Manga109 / pseudo-labels (training/train.py). Boxes only.
+ocr           48px              ok manga-image-translator 48px autoregressive OCR, per text line, beam search; predicts glyph/outline colours (torch, ~1-2s/page CPU)
+ocr          *manga_ocr         ok manga-ocr ViT+BERT on onnxruntime (split encoder/decoder, batched greedy). Japanese, whole-bubble crops.
+ocr           manga_ocr_hf      ok manga-ocr via transformers/torch (kha-white/manga-ocr-base); supports beam search.
+ocr           none              ok No OCR; a vision-capable translator reads the crops itself.
+translator    anthropic         -- Claude (Messages API): text mode with page image for context, or full vision (reads the crops) when OCR is off; structured JSON output.  [ANTHROPIC_API_KEY not set]
+translator    chain             ok Pivot through several translators, e.g. steps='m2m100:en,nllb:id'.
+translator    deepseek          -- DeepSeek chat API (text only, JSON mode).  [DEEPSEEK_API_KEY not set]
+translator    gemini            -- Gemini (REST): reads + translates every crop with page and series context when OCR is off, or translates OCR lines with the page image attached.  [GEMINI_API_KEY not set]
+translator    local_llm         ok Local chat LLM via transformers (offline; Qwen/Qwen2.5-3B-Instruct bf16, ~9.5GB RAM, 30-60 s/page on 4 CPU cores): whole page in one generation into English, NLLB to the target; glossary + previous pages, per-item fallback to m2m100. Opts: model, dtype, max_new_tokens, threads, pivot (en|none), pivot_translator, fallback.
+translator    m2m100            ok M2M100 418M (offline, fastest): ja->id on par with nllb-600M on page01; ja->en pivot.
+translator    m2m100_big        ok M2M100 1.2B (offline, downloads ~5GB on first use).
+translator   *nllb              ok NLLB-200 600M distilled (offline, CPU, ~2.5GB RAM): fluent ja->id; glossary + manga pre/post.
+translator    nllb_big          ok NLLB-200 1.3B distilled (offline, downloads ~5GB on first use, slower).
+translator    none              ok Erase text only: inpaint without typesetting.
+translator    ollama            ok Local LLM through Ollama's OpenAI-compatible endpoint (no key; vision=true for VLMs such as qwen2.5vl / gemma3; 900s timeout for CPU inference).
+translator    openai            -- Any OpenAI-compatible chat API (OpenAI, OpenRouter, Groq, LM Studio, vLLM...): numbered-line JSON protocol, vision with page + crops when OCR is off.  [OPENAI_API_KEY not set]
+translator    original          ok Keep the OCR text (debug OCR/typesetting).
+mask_refiner  bbox              ok Erase the whole padded text box.
+mask_refiner *default           ok Glyph pixels only: detector mask components assigned to text lines (or local binarisation), grown into anti-aliased edges, dilated by font size, balloon outlines kept.
+mask_refiner  dilate            ok Detector mask (or binarised box) inside the text zone, dilated.
+inpainter     fill              ok Flat fill with the surrounding median colour (fast).
+inpainter     lama              ok big-lama Places2 (Carve ONNX 512), same tiling as lama_manga; better on photographic backgrounds, worse on line art and screentone.
+inpainter    *lama_manga        ok LaMa fine-tuned on manga (ONNX 512), per text cluster at native resolution; flat-background holes filled exactly without the model (~3s per 512 tile CPU).
+inpainter     ns                ok OpenCV Navier-Stokes inpaint (no weights, fast).
+inpainter     telea             ok OpenCV Telea fast-marching inpaint (no weights, fast).
+renderer      basic             ok Horizontal centred text in the detector box (v1).
+renderer     *default           ok Balloon-aware typesetting: finds each balloon's interior, fits the text to its shape (font-size search, Indonesian hyphenation, no orphans), page-consistent sizes, outline over art; vertical columns for CJK targets.
+renderer      vertical          ok Vertical right-to-left columns for CJK targets (ja/zh/ko), balloon-aware, vertical punctuation forms, kinsoku; needs a CJK font (font_path or fonts/*CJK*).

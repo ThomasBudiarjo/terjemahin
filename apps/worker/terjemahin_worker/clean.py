@@ -21,6 +21,8 @@ def estimate_background(image_bgr: np.ndarray, bbox: BBox) -> tuple[int, int, in
     ring = patch[mask]
     if len(ring) == 0:
         ring = patch.reshape(-1, 3)
+    if len(ring) == 0:  # an empty or inverted box (hand-edited JSON): assume a white balloon
+        return (255, 255, 255)
     med = np.median(ring, axis=0)
     return tuple(int(v) for v in med)
 

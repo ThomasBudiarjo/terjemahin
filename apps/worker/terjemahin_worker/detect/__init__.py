@@ -1,4 +1,6 @@
-from .base import Detector, sort_reading_order
-from .factory import build_detector
+from ..registry import DETECTORS, load_plugins
+from .base import Detection, Detector, sort_reading_order
 
-__all__ = ["Detector", "build_detector", "sort_reading_order"]
+load_plugins(__name__, __path__)
+
+__all__ = ["DETECTORS", "Detection", "Detector", "sort_reading_order"]

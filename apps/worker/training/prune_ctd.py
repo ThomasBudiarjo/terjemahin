@@ -6,6 +6,8 @@ Cutting the graph at `blk` also shrinks the file from ~90MB to ~27MB.
 
 Usage:
     python training/prune_ctd.py                      # weights/comictextdetector.pt.onnx -> weights/comictextdetector-blk.onnx
+                                                      # (or weights/koharu-comictextdetector.onnx, the
+                                                      # file the `ctd` method downloads, if that is absent)
     python training/prune_ctd.py --src a.onnx --out b.onnx
 """
 
@@ -17,13 +19,23 @@ from pathlib import Path
 import onnx
 
 WEIGHTS = Path(__file__).resolve().parents[1] / "weights"
+SOURCES = ("comictextdetector.pt.onnx", "koharu-comictextdetector.onnx")
 
 
-def main() -> None:
+def default_src() -> Path:
+    """First full export present in weights/ (both have the same `images` -> `blk` head)."""
+    for name in SOURCES:
+        if (WEIGHTS / name).exists():
+            return WEIGHTS / name
+    return WEIGHTS / SOURCES[0]
+
+
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", type=Path, default=WEIGHTS / "comictextdetector.pt.onnx")
+    ap.add_argument("--src", type=Path, default=None, help=f"default: first of {SOURCES} in weights/")
     ap.add_argument("--out", type=Path, default=WEIGHTS / "comictextdetector-blk.onnx")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    a.src = a.src or default_src()
 
     if not a.src.exists():
         raise SystemExit(f"{a.src} not found; see weights/README.md for the download URL")

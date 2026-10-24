@@ -22,6 +22,17 @@ class Layout:
     line_height: int
 
 
+def _words(text: str) -> list[str]:
+    """Words, with "\\n" tokens where the text has line breaks (kept, blank lines too)."""
+    paras = text.replace("\r\n", "\n").strip().split("\n")
+    out: list[str] = []
+    for i, para in enumerate(paras):
+        out += para.split()
+        if i < len(paras) - 1:
+            out.append("\n")
+    return out
+
+
 class Typesetter:
     def __init__(self, font_path: Path | None) -> None:
         self.font_path = Path(font_path) if font_path and Path(font_path).exists() else None
@@ -34,7 +45,7 @@ class Typesetter:
 
     def layout(self, draw: ImageDraw.ImageDraw, text: str, box_w: int, box_h: int) -> Layout:
         """Largest font size whose word-wrapped text fits inside (box_w, box_h)."""
-        words = text.split()
+        words = _words(text)
         if not words:
             return Layout([], MIN_FONT, MIN_FONT)
 
@@ -57,6 +68,10 @@ class Typesetter:
         lines: list[str] = []
         cur = ""
         for w in words:
+            if w == "\n":  # a line break typed in the text
+                lines.append(cur)
+                cur = ""
+                continue
             cand = f"{cur} {w}".strip()
             if draw.textlength(cand, font=font) <= box_w:
                 cur = cand
@@ -67,7 +82,7 @@ class Typesetter:
                 cur = w
         if cur:
             lines.append(cur)
-        if draw.textlength(cur, font=font) > box_w or len(lines) * line_h > box_h:
+        if any(draw.textlength(ln, font=font) > box_w for ln in lines) or len(lines) * line_h > box_h:
             return None
         return Layout(lines, size, line_h)
 
@@ -78,6 +93,10 @@ class Typesetter:
         lines: list[str] = []
         cur = ""
         for w in words:
+            if w == "\n":
+                lines.append(cur.strip())
+                cur = ""
+                continue
             for ch in w:
                 cand = cur + ch
                 if draw.textlength(cand, font=font) <= box_w or not cur:

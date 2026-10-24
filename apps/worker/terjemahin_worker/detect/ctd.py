@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import onnxruntime as ort
 
 from ..models import TextRegion
-from .onnx_common import letterbox, xywh_to_regions
+from ..registry import DETECTORS
+from .base import Detection
+from .ctd_full import SPREAD_ASPECT, CtdFullDetector
 
 CTD_URL = (
     "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/"
@@ -14,33 +15,55 @@ CTD_URL = (
 )
 
 
-class CtdDetector:
-    """Fallback detector using comic-text-detector (YOLOv5 head) ONNX weights.
+class CtdDetector(CtdFullDetector):
+    """comic-text-detector's YOLOv5 box head only (blocks, no lines, no glyph mask).
 
-    Only the box head is used; the mask and line outputs are ignored because cleaning is
-    done by background fill. Output layout follows YOLOv5: (1, N, 5 + num_classes) with
-    [cx, cy, w, h, obj, cls...].
+    Runs `comictextdetector-blk.onnx` from training/prune_ctd.py (a full export also works: the
+    other heads are cut out at load time when onnx is installed). Pre/post-processing, tiling of
+    tall pages and NMS (iou 0.35) are the `ctd` method's, so the boxes equal ctd's raw blocks
+    before its text lines refine them. Regions are bare boxes + score: without the DB head the
+    line quads, direction and font size ctd would infer are guesses from the box alone, and
+    downstream stages (48px OCR line splitting, mask refine) do better estimating them from
+    pixels themselves.
     """
 
-    def __init__(self, weights: Path, conf: float = 0.4, iou: float = 0.5) -> None:
+    def __init__(self, weights: Path, conf: float = 0.4, iou: float = 0.35, **kw) -> None:
         if not Path(weights).exists():
             raise FileNotFoundError(
-                f"CTD weights not found at {weights}. Download {CTD_URL} and run "
-                "training/prune_ctd.py (see weights/README.md)."
+                f"CTD weights not found at {weights}. Run training/prune_ctd.py on "
+                f"weights/koharu-comictextdetector.onnx (or {CTD_URL}); see weights/README.md."
             )
-        self.session = ort.InferenceSession(str(weights), providers=["CPUExecutionProvider"])
-        inp = self.session.get_inputs()[0]
-        self.input_name = inp.name
-        self.size = int(inp.shape[2]) if isinstance(inp.shape[2], int) else 1024
-        self.conf = conf
-        self.iou = iou
+        super().__init__(Path(weights), conf=conf, iou=iou, heads=("blk",), **kw)
 
-    def detect(self, image_bgr: np.ndarray) -> list[TextRegion]:
-        tensor, scale, pad = letterbox(image_bgr, self.size)
-        outputs = self.session.run(None, {self.input_name: tensor})
-        blks = next(o for o in outputs if o.ndim == 3 and o.shape[-1] >= 6)[0]
-        boxes = blks[:, :4]
-        obj = blks[:, 4]
-        cls = blks[:, 5:].max(axis=1) if blks.shape[1] > 5 else np.ones_like(obj)
-        scores = obj * cls
-        return xywh_to_regions(boxes, scores, scale, pad, image_bgr.shape[1::-1], self.conf, self.iou)
+    def detect(self, image_bgr: np.ndarray) -> Detection:
+        det = super().detect(image_bgr)
+        return Detection(
+            [TextRegion(id=i, bbox=r.bbox, score=r.score) for i, r in enumerate(det.regions)]
+        )
+
+
+@DETECTORS.register(
+    "ctd_blk",
+    description="comic-text-detector pruned to the box head (training/prune_ctd.py). Boxes only.",
+)
+def _build(
+    settings,
+    conf: float | None = None,
+    iou: float = 0.35,
+    weights=None,
+    threads: int = 0,
+    tile_aspect: float = 2.5,
+    spread: float = SPREAD_ASPECT,
+    **extra,
+):
+    from ..opts import warn_unknown
+
+    warn_unknown("detector 'ctd_blk'", extra)
+    return CtdDetector(
+        Path(weights or settings.ctd_weights),
+        settings.detect_conf if conf is None else conf,
+        iou,
+        threads=threads,
+        tile_aspect=tile_aspect,
+        spread=spread,
+    )

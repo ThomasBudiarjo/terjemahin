@@ -1,0 +1,52 @@
+# Command: cd apps/worker && .venv/bin/python -m pytest -q -rA --durations=15 -p no:cacheprovider
+# Run: 2026-10-24T13:33:00Z on 4 shared CPU cores
+
+487 passed, 1 skipped, 17 warnings in 156.79s (0:02:36)
+wall clock (time): 2m39.162s
+
+## per-file results (from -rA short summary)
+tests/test_clean_and_order.py                 PASSED   2
+tests/test_detect_alt.py                      PASSED   13
+tests/test_detect_ctd.py                      PASSED   15
+tests/test_eval.py                            PASSED   20
+tests/test_fetch_weights.py                   PASSED   6
+tests/test_inpaint.py                         PASSED   15
+tests/test_mask_refine.py                     PASSED   87
+tests/test_ocr_48px.py                        PASSED   21
+tests/test_ocr_mangaocr.py                    PASSED   15
+tests/test_render.py                          PASSED   32
+tests/test_robustness.py                      PASSED   101
+tests/test_training_detector.py               PASSED   8
+tests/test_training_synth.py                  PASSED   15
+tests/test_training_translate_inpaint.py      PASSED   8
+tests/test_translate_llm.py                   PASSED   44
+tests/test_translate_local_llm.py             PASSED   16
+tests/test_translate_offline.py               PASSED   52
+tests/test_typeset.py                         PASSED   4
+tests/test_web.py                             PASSED   11
+tests/test_yolo_decode.py                     PASSED   2
+SKIPPED [1] tests/test_translate_local_llm.py:273: set TERJEMAHIN_SLOW_LLM=1 (needs Qwen2.5-3B-Instruct cached; ~2 min)
+
+============================= slowest 15 durations =============================
+19.33s call     tests/test_translate_offline.py::test_m2m100_and_chain_page01
+13.95s call     tests/test_inpaint.py::test_lama_real_weights_reconstruct_art[lama-lama]
+13.94s call     tests/test_inpaint.py::test_lama_real_weights_reconstruct_art[lama_manga-lama_manga]
+13.50s call     tests/test_training_synth.py::test_one_training_step_and_onnx_export
+9.56s call     tests/test_translate_offline.py::test_nllb_page01_quality
+8.59s call     tests/test_eval.py::test_bench_on_page01_real_models
+8.01s call     tests/test_web.py::test_real_methods_on_page01
+5.61s call     tests/test_training_translate_inpaint.py::test_translator_finetune_roundtrip
+4.93s call     tests/test_mask_refine.py::test_page01_with_ctd
+4.15s call     tests/test_ocr_48px.py::test_page01_cer_with_ctd
+3.43s call     tests/test_ocr_48px.py::test_reads_page01_lines
+3.24s call     tests/test_ocr_mangaocr.py::test_onnx_split_graph_matches_full_graph
+3.08s call     tests/test_ocr_mangaocr.py::test_hf_backend_agrees_with_onnx
+2.95s call     tests/test_render.py::test_page01_reference_translations_fit_inside_balloons
+2.87s call     tests/test_training_detector.py::test_train_one_epoch_exports_onnx_the_worker_loads
+=========================== short test summary info ============================
+
+## final re-run at end of session (2026-10-24T14:02:52Z), same command without -rA/--durations
+487 passed, 1 skipped, 17 warnings in 157.32s (0:02:37)
+wall clock: 2m39.605s
+
+Final fix round (2026-10-24 ~16:20 UTC), `.venv/bin/python -m pytest -q -p no:cacheprovider`: 520 passed, 1 skipped, 17 warnings in 175.67s (0:02:55)

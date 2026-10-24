@@ -1,0 +1,42 @@
+### ctd refine=true
+== page01 det 1.22s: 13/13 fp 0 dup 0 frag 0 sfx 1 cer 0.008147025388404698
+== ARMS_015 det 1.87s: 12/12 fp 1 dup 0 frag 0 sfx 0 cer 0.013970588235294118
+== Arisa_010 det 1.86s: 30/30 fp 0 dup 0 frag 0 sfx 0 cer 0.02003968253968254
+== psimera_val_000002 det 0.55s: 3/3 fp 0 dup 0 frag 0 sfx 2 cer 0.0
+== psimera_val_000005 det 0.57s: 6/6 fp 0 dup 0 frag 0 sfx 1 cer 0.0
+TOTAL {'gt': 64, 'match': 64, 'fp': 1, 'dup': 0, 'partial': 0}
+### ctd refine=false
+== page01 det 0.92s: 13/13 fp 0 dup 0 frag 0 sfx 1 cer 0.008147025388404698
+== ARMS_015 det 1.81s: 10/12 fp 2 dup 0 frag 1 sfx 0 cer 0.04029411764705883
+== Arisa_010 det 1.78s: 30/30 fp 0 dup 1 frag 0 sfx 0 cer 0.04781746031746032
+== psimera_val_000002 det 0.56s: 3/3 fp 0 dup 0 frag 0 sfx 2 cer 0.0
+== psimera_val_000005 det 0.57s: 6/6 fp 0 dup 0 frag 0 sfx 1 cer 0.0
+TOTAL {'gt': 64, 'match': 62, 'fp': 2, 'dup': 1, 'partial': 2}
+### ctd_blk refine=true
+== page01 det 0.33s: 13/13 fp 0 dup 0 frag 0 sfx 1 cer 0.005494505494505494
+== ARMS_015 det 0.32s: 8/12 fp 2 dup 0 frag 0 sfx 0 cer 0.013602941176470588
+== Arisa_010 det 0.43s: 30/30 fp 0 dup 0 frag 0 sfx 0 cer 0.018055555555555554
+== psimera_val_000002 det 0.11s: 3/3 fp 0 dup 0 frag 0 sfx 1 cer 0.0
+== psimera_val_000005 det 0.12s: 6/6 fp 0 dup 0 frag 0 sfx 0 cer 0.0
+TOTAL {'gt': 64, 'match': 60, 'fp': 2, 'dup': 0, 'partial': 0}
+### ctd_blk refine=false
+== page01 det 0.30s: 13/13 fp 0 dup 0 frag 0 sfx 1 cer 0.005494505494505494
+== ARMS_015 det 0.30s: 8/12 fp 2 dup 1 frag 0 sfx 0 cer 0.013602941176470588
+== Arisa_010 det 0.31s: 30/30 fp 0 dup 0 frag 0 sfx 0 cer 0.018055555555555554
+== psimera_val_000002 det 0.10s: 3/3 fp 0 dup 0 frag 0 sfx 1 cer 0.0
+== psimera_val_000005 det 0.12s: 6/6 fp 0 dup 0 frag 0 sfx 0 cer 0.0
+TOTAL {'gt': 64, 'match': 60, 'fp': 2, 'dup': 1, 'partial': 0}
+### yolo refine=true
+== page01 det 0.16s: 13/13 fp 0 dup 0 frag 0 sfx 0 cer 0.005494505494505494
+== ARMS_015 det 0.09s: 8/12 fp 2 dup 0 frag 0 sfx 0 cer 0.019852941176470587
+== Arisa_010 det 0.18s: 20/30 fp 0 dup 1 frag 0 sfx 0 cer 0.03317307692307692
+== psimera_val_000002 det 0.05s: 3/3 fp 0 dup 0 frag 0 sfx 1 cer 0.0
+== psimera_val_000005 det 0.06s: 6/6 fp 2 dup 0 frag 0 sfx 0 cer 0.006666666666666667
+TOTAL {'gt': 64, 'match': 50, 'fp': 4, 'dup': 1, 'partial': 0}
+### yolo refine=false
+== page01 det 0.12s: 13/13 fp 0 dup 0 frag 0 sfx 0 cer 0.005494505494505494
+== ARMS_015 det 0.06s: 9/12 fp 1 dup 1 frag 0 sfx 0 cer 0.01764705882352941
+== Arisa_010 det 0.07s: 20/30 fp 0 dup 1 frag 0 sfx 0 cer 0.03823260073260073
+== psimera_val_000002 det 0.04s: 3/3 fp 0 dup 0 frag 0 sfx 1 cer 0.0
+== psimera_val_000005 det 0.06s: 6/6 fp 2 dup 0 frag 0 sfx 0 cer 0.006666666666666667
+TOTAL {'gt': 64, 'match': 51, 'fp': 3, 'dup': 2, 'partial': 0}

@@ -1,0 +1,62 @@
+{
+ "image": "000003.jpg",
+ "note": "synthetic page from training/synth.py --seed 7; ja exact, id_ref = hand translation of each corpus line",
+ "bubbles": [
+  {
+   "ja": "わかった、行くよ私の名前はさくらです",
+   "id_ref": "Baiklah, aku pergi Namaku Sakura",
+   "bbox": [
+    796,
+    1530,
+    1006,
+    1587
+   ],
+   "vertical": false,
+   "container": "ellipse",
+   "font_size": 23
+  },
+  {
+   "ja": "早く逃げろ！！",
+   "id_ref": "Cepat lari!!",
+   "bbox": [
+    243,
+    366,
+    267,
+    495
+   ],
+   "vertical": true,
+   "container": "none",
+   "font_size": 19
+  },
+  {
+   "ja": "わかった、行くよ静かにして！え？今なんて言った？",
+   "id_ref": "Baiklah, aku pergi Diam! Hah? Barusan kamu bilang apa?",
+   "bbox": [
+    744,
+    911,
+    916,
+    1170
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 33
+  },
+  {
+   "ja": "誰かいるの？",
+   "id_ref": "Ada orang di sana?",
+   "bbox": [
+    293,
+    258,
+    319,
+    393
+   ],
+   "vertical": true,
+   "container": "none",
+   "font_size": 24
+  }
+ ],
+ "sfx": [
+  "ごろん",
+  "もじ…"
+ ]
+}

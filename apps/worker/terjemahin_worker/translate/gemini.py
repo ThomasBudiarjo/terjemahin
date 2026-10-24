@@ -1,93 +1,134 @@
+"""Gemini through the REST generateContent endpoint, plain httpx (no google-genai SDK).
+
+Uses the shared LLM core: vision mode (page + crops, Gemini reads the text) when OCR is off, text
+mode with the page image attached otherwise. JSON is enforced with responseSchema; safety filters
+are relaxed because manga routinely contains violence and insults that are fine to translate.
+"""
+
 from __future__ import annotations
 
-import cv2
-import numpy as np
-from google import genai
-from google.genai import types
-from pydantic import BaseModel
+import logging
+from typing import Any
 
-from ..models import Bubble, PageContext, TextRegion
-from .prompt import SYSTEM_PROMPT, build_user_prompt
+from ..registry import TRANSLATORS
+from .llm_common import ChatRequest, Http, Image, LLMError, as_bool, make_translator, split_opts
 
-PAGE_MAX_SIDE = 1536
-CROP_PAD = 8
+log = logging.getLogger(__name__)
 
-
-class _Item(BaseModel):
-    index: int
-    source: str
-    target: str
-    speaker: str | None = None
-
-
-class _Response(BaseModel):
-    items: list[_Item]
+API_URL = "https://generativelanguage.googleapis.com/v1beta"
+_SAFETY = [
+    {"category": c, "threshold": "BLOCK_NONE"}
+    for c in (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
+]
 
 
-def _jpeg(image_bgr: np.ndarray, quality: int = 88) -> bytes:
-    ok, buf = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        raise RuntimeError("failed to encode image")
-    return buf.tobytes()
+def gemini_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """JSON Schema -> Gemini's OpenAPI subset (upper-case types, nullable, no additionalProperties)."""
+    out: dict[str, Any] = {}
+    t = schema.get("type")
+    if isinstance(t, list):
+        non_null = [x for x in t if x != "null"]
+        out["type"] = non_null[0].upper() if non_null else "STRING"
+        if "null" in t:
+            out["nullable"] = True
+    elif t:
+        out["type"] = t.upper()
+    if "properties" in schema:
+        out["properties"] = {k: gemini_schema(v) for k, v in schema["properties"].items()}
+    if "items" in schema:
+        out["items"] = gemini_schema(schema["items"])
+    if "required" in schema:
+        out["required"] = list(schema["required"])
+    return out
 
 
-def _downscale(image_bgr: np.ndarray, max_side: int) -> np.ndarray:
-    h, w = image_bgr.shape[:2]
-    s = max_side / max(h, w)
-    if s >= 1:
-        return image_bgr
-    return cv2.resize(image_bgr, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
-
-
-class GeminiTranslator:
-    def __init__(self, api_key: str, model: str) -> None:
+class GeminiBackend:
+    def __init__(self, http: Http, api_key: str, model: str, *, base_url: str = API_URL,
+                 structured: bool = True) -> None:
         if not api_key:
             raise ValueError("GEMINI_API_KEY is empty")
-        self.client = genai.Client(api_key=api_key)
+        self.http = http
+        self.url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
         self.model = model
+        self.name = f"gemini:{model}"
+        self.vision = True
+        self.headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        self.structured = structured
+        self.usage: dict[str, int] = {}
 
-    def translate(
-        self,
-        page_bgr: np.ndarray,
-        regions: list[TextRegion],
-        context: PageContext,
-    ) -> list[Bubble]:
-        if not regions:
-            return []
+    def body(self, req: ChatRequest) -> dict[str, Any]:
+        parts: list[dict[str, Any]] = []
+        for p in req.parts:
+            if isinstance(p, Image):
+                parts.append({"inlineData": {"mimeType": "image/jpeg", "data": p.b64}})
+            else:
+                parts.append({"text": p})
+        gen: dict[str, Any] = {"maxOutputTokens": req.max_tokens, "responseMimeType": "application/json"}
+        if req.temperature is not None:
+            gen["temperature"] = req.temperature
+        if self.structured:
+            gen["responseSchema"] = gemini_schema(req.schema)
+        return {
+            "systemInstruction": {"parts": [{"text": req.system}]},
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": gen,
+            "safetySettings": _SAFETY,
+        }
 
-        H, W = page_bgr.shape[:2]
-        contents: list[types.Part | str] = [
-            build_user_prompt(context, len(regions)),
-            types.Part.from_bytes(data=_jpeg(_downscale(page_bgr, PAGE_MAX_SIDE)), mime_type="image/jpeg"),
-        ]
-        for r in regions:
-            b = r.bbox.pad(CROP_PAD).clamp(W, H)
-            crop = page_bgr[b.y1 : b.y2, b.x1 : b.x2]
-            contents.append(f"Crop balon #{r.id}:")
-            contents.append(types.Part.from_bytes(data=_jpeg(crop, 92), mime_type="image/jpeg"))
-
-        resp = self.client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema=_Response,
-                temperature=0.4,
-            ),
+    def complete(self, req: ChatRequest) -> str:
+        try:
+            data = self.http.post(self.url, self.headers, self.body(req))
+        except LLMError as e:
+            if e.status == 400 and self.structured and "schema" in str(e).lower():
+                log.info("%s: responseSchema rejected; using prompt-only JSON", self.name)
+                self.structured = False
+                data = self.http.post(self.url, self.headers, self.body(req))
+            else:
+                raise
+        block = (data.get("promptFeedback") or {}).get("blockReason")
+        if block:
+            raise LLMError(f"{self.name}: prompt blocked ({block})")
+        for k, v in (data.get("usageMetadata") or {}).items():
+            if isinstance(v, int):
+                self.usage[k] = self.usage.get(k, 0) + v
+        cands = data.get("candidates") or []
+        if not cands:
+            raise LLMError(f"{self.name}: no candidates: {str(data)[:300]}", retryable=True)
+        cand = cands[0]
+        text = "".join(
+            p.get("text", "") for p in (cand.get("content") or {}).get("parts") or [] if not p.get("thought")
         )
-        parsed = _Response.model_validate_json(resp.text or "{}")
-        by_index = {it.index: it for it in parsed.items}
+        reason = cand.get("finishReason")
+        if not text and reason not in (None, "STOP", "MAX_TOKENS"):
+            raise LLMError(f"{self.name}: no answer (finishReason={reason})")
+        if reason == "MAX_TOKENS":
+            log.warning("%s: answer truncated at maxOutputTokens", self.name)
+        return text
 
-        bubbles: list[Bubble] = []
-        for r in regions:
-            it = by_index.get(r.id)
-            bubbles.append(
-                Bubble(
-                    region=r,
-                    source_text=(it.source if it else "").strip(),
-                    target_text=(it.target if it else "").strip(),
-                    speaker=it.speaker if it else None,
-                )
-            )
-        return bubbles
+
+@TRANSLATORS.register(
+    "gemini",
+    description="Gemini (REST): reads + translates every crop with page and series context when "
+    "OCR is off, or translates OCR lines with the page image attached.",
+    needs_key="gemini_api_key",
+    offline=False,
+)
+def _build(settings, **opts):
+    core, http_opts, rest = split_opts(dict(opts))
+    core.setdefault("temperature", None)  # Gemini 3 is tuned for its default temperature
+    fallback = rest.pop("fallback", None)
+    backend = GeminiBackend(
+        Http(**http_opts),
+        rest.pop("api_key", None) or settings.gemini_api_key,
+        rest.pop("model", None) or settings.gemini_model,
+        base_url=rest.pop("base_url", None) or API_URL,
+        structured=as_bool(rest.pop("structured", True)),
+    )
+    if rest:
+        log.warning("gemini: ignoring unknown options %s", sorted(rest))
+    return make_translator(backend, settings, core, fallback)

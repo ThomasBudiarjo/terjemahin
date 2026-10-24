@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
@@ -7,34 +8,32 @@ import numpy as np
 from ..models import TextRegion
 
 
+@dataclass
+class Detection:
+    regions: list[TextRegion]
+    mask: np.ndarray | None = None
+    """Optional HxW uint8 text-pixel mask (0..255) at original resolution. Mask refiners use it
+    to erase only glyph pixels instead of whole boxes."""
+
+
 class Detector(Protocol):
-    def detect(self, image_bgr: np.ndarray) -> list[TextRegion]:
-        """Return text regions in the image. IDs are assigned by the caller."""
+    def detect(self, image_bgr: np.ndarray) -> Detection:
+        """Return text regions (and optionally a text mask). IDs are assigned by the caller."""
         ...
 
 
-def sort_reading_order(regions: list[TextRegion], row_tolerance: float = 0.5) -> list[TextRegion]:
-    """Manga reading order: right-to-left, top-to-bottom.
+def sort_reading_order(
+    regions: list[TextRegion],
+    row_tolerance: float = 0.5,
+    image: np.ndarray | None = None,
+    rtl: bool = True,
+) -> list[TextRegion]:
+    """Reading order (manga: right-to-left, top-to-bottom); ids are reassigned 0..n-1.
 
-    Regions whose vertical centres are within `row_tolerance * median_height` of each other
-    are treated as one row and ordered right-to-left; rows are ordered top-to-bottom.
-    Approximate on purpose: panel layout is not known here, and the LLM also sees the
-    whole page so small ordering errors are recoverable.
+    With the page image, panels are detected first and blocks are ordered panel by panel
+    (see order.py); without it the whole page is treated as one panel. `row_tolerance` is
+    kept for compatibility only: rows are now formed by vertical overlap.
     """
-    if not regions:
-        return []
-    heights = sorted(r.bbox.h for r in regions)
-    median_h = heights[len(heights) // 2] or 1
-    tol = row_tolerance * median_h
+    from .order import sort_regions
 
-    rows: list[list[TextRegion]] = []
-    for r in sorted(regions, key=lambda r: r.bbox.cy):
-        if rows and abs(rows[-1][0].bbox.cy - r.bbox.cy) <= tol:
-            rows[-1].append(r)
-        else:
-            rows.append([r])
-
-    ordered: list[TextRegion] = []
-    for row in rows:
-        ordered.extend(sorted(row, key=lambda r: -r.bbox.cx))
-    return [TextRegion(id=i, bbox=r.bbox, score=r.score) for i, r in enumerate(ordered)]
+    return sort_regions(regions, image, rtl=rtl)

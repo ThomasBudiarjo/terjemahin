@@ -1,0 +1,56 @@
+## synth (training data): python training/cli.py synth --out out/proof/train/synth --n 40 --seed 100 --backgrounds out/proof/synth/bg --fonts <mit fonts> <ipafont-gothic>
+  "pages": 40,
+  "val_pages": 4,
+  "blocks": 199,
+
+## detector: python training/cli.py detector --data out/proof/train/synth/det/dataset.yaml --epochs 2 --imgsz 640 --batch 8 --device cpu --workers 2 --project out/proof/train/runs --name det --out out/proof/train/det-smoke.onnx
+epoch,time,train/box_loss,train/cls_loss,train/dfl_loss,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)
+1,5.96666,3.17047,6.83706,2.64833,0.00345,0.04167,0.00115,0.00017
+2,11.3165,2.97564,7.05443,2.45123,0.15357,0.20833,0.12283,0.05418
+exported -> out/proof/train/det-smoke.onnx
+
+## pipeline with shipped weights: terjemahin-worker translate eval/fixtures/page01.png -d yolo
+terjemahin_worker.pipeline: loading detector=yolo 
+terjemahin_worker.pipeline: page done: 13 regions, 13 bubbles | detect 0.08s, ocr 1.21s, translate 8.63s, mask 0.50s, inpaint 11.51s, render 0.72s
+## pipeline with smoke weights: ... -d yolo --opt detector.weights=out/proof/train/det-smoke.onnx --opt detector.conf=0.1
+terjemahin_worker.pipeline: loading detector=yolo {'weights': 'out/proof/train/det-smoke.onnx', 'conf': 0.1}
+terjemahin_worker.pipeline: page done: 78 regions, 73 bubbles | detect 0.09s, ocr 6.64s, translate 18.18s, mask 5.16s, inpaint 26.04s, render 10.47s
+
+## ocr: python training/cli.py ocr --data out/proof/train/synth/ocr --out out/proof/train/ocr-ft --steps 20 --batch 8 --freeze-encoder --eval-every 20 --max-eval 24 --log-every 5
+train=175 val=24 unk_chars=0
+  [baseline] val: cer=0.0528 exact=0.667
+step 5/20 loss=0.0021 lr=1.67e-05 0.73s/step
+step 10/20 loss=0.0383 lr=1.11e-05 0.69s/step
+step 15/20 loss=0.0185 lr=5.56e-06 0.67s/step
+step 20/20 loss=0.0587 lr=0.00e+00 0.66s/step
+  [step 20] val: cer=0.0503 exact=0.708
+## export: python training/cli.py export-ocr --model out/proof/train/ocr-ft/best --out out/proof/train/manga-ocr-ft.onnx
+    "max_abs": 1.1444091796875e-05,
+    "argmax_agree": 1.0
+## product: terjemahin-worker translate eval/fixtures/page01.png --opt ocr.weights=out/proof/train/manga-ocr-ft.onnx
+terjemahin_worker.pipeline: loading ocr=manga_ocr {'weights': 'out/proof/train/manga-ocr-ft.onnx'}
+terjemahin_worker.pipeline: page done: 14 regions, 14 bubbles | detect 0.72s, ocr 2.95s, translate 10.28s, mask 0.08s, inpaint 11.46s, render 0.72s
+## negative control: --opt ocr.weights=/nonexistent.onnx
+error: ocr.weights: no such ONNX model: /nonexistent.onnx
+
+## translator: python training/cli.py translator --data out/proof/synth/corpus.tsv --val-ratio 0.25 --out out/proof/train/nllb-ft --steps 10 --batch 4 --lr 1e-4 --decoder-layers 2 --save-dtype float16 --eval-every 10
+nllb facebook/nllb-200-distilled-600M: 33.6M/615.1M trainable, train=15 val=5 steps=10 (4/epoch)
+{"step": 0, "chrf": 49.55, "bleu": 33.08, "samples": [{"src": "今日は本当にありがとう", "hyp": "Terima kasih banyak hari ini.", "ref": "Terima kasih banyak untuk hari ini"}, {"src": "大丈夫？ケガはない？", "hyp": "Apa kau baik-baik saja?", "ref": "Kamu nggak apa-apa? Nggak terlu
+step 10/10 loss 4.0698 lr 0.00e+00 0.39s/step
+{"step": 10, "chrf": 49.55, "bleu": 33.08, "samples": [{"src": "今日は本当にありがとう", "hyp": "Terima kasih banyak hari ini.", "ref": "Terima kasih banyak untuk hari ini"}, {"src": "大丈夫？ケガはない？", "hyp": "Apa kau baik-baik saja?", "ref": "Kamu nggak apa-apa? Nggak terl
+warning: no eval beat the base model (chrF 49.55); saved checkpoint scores 49.55
+## product: terjemahin-worker translate eval/fixtures/page01.png -t nllb --opt translator.model=out/proof/train/nllb-ft
+terjemahin_worker.pipeline: loading translator=nllb {'model': 'out/proof/train/nllb-ft'}
+terjemahin_worker.pipeline: page done: 14 regions, 14 bubbles | detect 0.69s, ocr 1.24s, translate 10.02s, mask 0.08s, inpaint 11.63s, render 0.72s
+
+## inpaint: python training/cli.py inpaint --data out/proof/train/synth --steps 30 --size 256 --batch 4 --eval-every 15 --out out/proof/train/inpaint-ft --export out/proof/train/aot-ft.onnx
+{"step": 0, "psnr_hole": 32.951397305509516, "mae_hole": 1.7506324269717926, "psnr_hole_telea": 25.34487298213346, "hole_px": 177859}
+step 10 loss 0.1108 {'hole': 0.0152, 'valid': 0.0129, 'edge': 0.0069} 2.29s/it
+{"step": 15, "psnr_hole": 32.855404041301234, "mae_hole": 1.7697228624387564, "psnr_hole_telea": 25.34487298213346, "hole_px": 177859}
+step 20 loss 0.4263 {'hole': 0.063, 'valid': 0.0176, 'edge': 0.0307} 2.36s/it
+step 30 loss 0.1079 {'hole': 0.0157, 'valid': 0.0077, 'edge': 0.0062} 2.21s/it
+{"step": 30, "psnr_hole": 32.88135037333551, "mae_hole": 1.7354034793932624, "psnr_hole_telea": 25.34487298213346, "hole_px": 177859}
+exported out/proof/train/aot-ft.onnx (23.0 MB), max |onnx - torch| = 2.6e-05
+## product: terjemahin-worker translate eval/fixtures/page01.png -i lama_manga --opt inpainter.weights=out/proof/train/aot-ft.onnx --opt inpainter.flat_tol=0
+terjemahin_worker.pipeline: loading inpainter=lama_manga {'weights': 'out/proof/train/aot-ft.onnx', 'flat_tol': 0}
+terjemahin_worker.pipeline: page done: 14 regions, 14 bubbles | detect 0.65s, ocr 1.18s, translate 8.37s, mask 0.08s, inpaint 6.93s, render 0.69s

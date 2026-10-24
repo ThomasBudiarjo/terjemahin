@@ -1,0 +1,101 @@
+{
+ "image": "000002.jpg",
+ "note": "synthetic page from training/synth.py --seed 7; ja exact, id_ref = hand translation of each corpus line",
+ "bubbles": [
+  {
+   "ja": "一緒に帰ろうよ",
+   "id_ref": "Ayo pulang bareng",
+   "bbox": [
+    379,
+    957,
+    427,
+    1045
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 25
+  },
+  {
+   "ja": "今日は本当にありがとう",
+   "id_ref": "Terima kasih banyak untuk hari ini",
+   "bbox": [
+    611,
+    717,
+    783,
+    769
+   ],
+   "vertical": false,
+   "container": "ellipse",
+   "font_size": 25
+  },
+  {
+   "ja": "私の名前はさくらです",
+   "id_ref": "Namaku Sakura",
+   "bbox": [
+    723,
+    1074,
+    841,
+    1130
+   ],
+   "vertical": false,
+   "container": "cloud",
+   "font_size": 24
+  },
+  {
+   "ja": "あの時の約束、覚えてる？",
+   "id_ref": "Kamu ingat janji waktu itu?",
+   "bbox": [
+    768,
+    76,
+    823,
+    321
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 25
+  },
+  {
+   "ja": "わかった、行くよ誰かいるの？",
+   "id_ref": "Baiklah, aku pergi Ada orang di sana?",
+   "bbox": [
+    435,
+    110,
+    517,
+    396
+   ],
+   "vertical": true,
+   "container": "rect",
+   "font_size": 36
+  },
+  {
+   "ja": "一緒に帰ろうよ",
+   "id_ref": "Ayo pulang bareng",
+   "bbox": [
+    265,
+    200,
+    342,
+    403
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 36
+  },
+  {
+   "ja": "先生に怒られちゃった",
+   "id_ref": "Aku dimarahi guru",
+   "bbox": [
+    219,
+    1142,
+    306,
+    1250
+   ],
+   "vertical": true,
+   "container": "ellipse",
+   "font_size": 23
+  }
+ ],
+ "sfx": [
+  "ごろん",
+  "もじ…"
+ ]
+}
