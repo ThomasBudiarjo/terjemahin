@@ -216,6 +216,54 @@ def normalize_ja(text: str) -> str:
     return text
 
 
+# Spoken contractions -> the standard forms MT models were trained on (信じらんない is OOV for
+# NLLB, 信じられない is not). Applied to NFKC text before elongation marks are stripped, so the
+# patterns allow a trailing ー/え (うるせー). Only unambiguous forms; order matters.
+_ELONG = "[ーえぇ〜～]*+"  # possessive: "わかんねーよ" must not match without its ー
+_ELONG1 = "[ーえぇ〜～]++"  # at least one: うめー is "tasty", うめ is a plum
+_EOW = "(?=[よなねぞぜわさっ]|[^ぁ-ゖ]|$)"  # end of word: a sentence-final particle may follow
+COLLOQUIAL_JA: list[tuple[str, str]] = [
+    (r"こないだ", "この間"),
+    (r"らんない", "られない"),
+    (r"(?<=[かまさ知分])んない", "らない"),
+    (rf"(?<=[知分わか])んね{_ELONG}{_EOW}", "らない"),
+    # 知らねー -> 知らない; spelled out, since "だからね" must stay
+    (rf"(知|わか|分か|い|たま|つま)らね{_ELONG}(?=[よなぞぜ]|[^ぁ-ゖ]|$)", r"\1らない"),
+    (rf"うるせ{_ELONG}", "うるさい"), (rf"すげ{_ELONG}{_EOW}", "すごい"),
+    (rf"やべ{_ELONG}{_EOW}", "やばい"), (rf"でけ{_ELONG1}{_EOW}", "でかい"),
+    (rf"うめ{_ELONG1}{_EOW}", "うまい"),
+    (r"マジで", "本当に"), (r"マジ(?=[？！。、…]|$)", "本当"),
+    (r"じゃん(?=[？！。、…]|$)", "じゃないか"),
+    (r"なきゃ", "なければ"), (r"なくちゃ", "なくては"),
+    (r"ちゃおう", "てしまおう"), (r"じゃおう", "でしまおう"),
+    (r"ちゃった", "てしまった"), (r"じゃった", "でしまった"),
+    (r"ちゃう(?![ぁ-ゖ])", "てしまう"),
+    # progressive てる/てた/てて after a te-form (使ってる, 聞いてた, してて, 食べてる); never
+    # after the stems of verbs that end in て themselves (捨てる, 育てる, 慌てる)
+    (r"(?<=[っいしみきれけせべめげ])て(?=る|た|て|ない|ます)", "てい"),
+    (r"(?<=[んい])(?<!なん)(?<!せい)で(?=る|た|て)", "でい"),  # 読んでる, 泳いでた (not なんで)
+    # とか as a hedge ("...or something"): dropped mid-sentence (店員さんとかにも) and at the end
+    # (not ことかも / 何とか / なんとか, where the と belongs to another word)
+    (r"(?<![こ何ひそ])(?<!なん)とか(?=[にもはがをでへ])", ""),
+]
+_TOKA_END = re.compile(
+    rf"(?:(?<=[ぁ-ゖ一-鿿ー])(?:な|ね|よ)|(?<=[ぁ-ゖ一-鿿ー])(?<![こ何ひそ])(?<!なん)){_ELONG}とか{_ELONG}(?=[。！？….]*$)"
+)
+
+
+# a dropped final とか ("reaksinya lucu, gitu") is rendered as the target's hedge word
+HEDGES = {"id": "gitu", "en": "or something"}
+
+
+def standardize_ja(text: str) -> tuple[str, bool]:
+    """Colloquial Japanese -> standard forms; True if a final hedge とか was dropped."""
+    text = unicodedata.normalize("NFKC", text).translate(_PUNCT_JA)
+    for pat, repl in COLLOQUIAL_JA:
+        text = re.sub(pat, repl, text)
+    hedge = _TOKA_END.search(text) is not None
+    return _TOKA_END.sub("", text), hedge
+
+
 def strip_stutter(text: str) -> str:
     """'わ、私は' -> '私は' when the head is a real stutter (see `prepare`), else unchanged."""
     return _STUTTER.sub("", text) if _stutter_on("".join(text.split())) else text
@@ -247,6 +295,11 @@ INTERJECTIONS: dict[str, dict[str, str]] = {
         "やった": "Hore", "よし": "Oke", "ほら": "Nih", "さあ": "Ayo", "まあ": "Yah", "もう": "Ih",
         "ちょっと": "Tunggu", "きゃ": "Kyaa", "ひ": "Hii", "は": "Hah", "ん": "Hm", "なに": "Apa",
         "なんで": "Kenapa", "そう": "Begitu", "そっか": "Oh, begitu", "なるほど": "Begitu ya",
+        "ふん": "Hmph", "ちぇ": "Cih", "じゃあ": "Kalau gitu", "さて": "Nah", "ただいま": "Aku pulang",
+        "おかえり": "Selamat datang", "おかえりなさい": "Selamat datang", "おはよう": "Selamat pagi",
+        "おやすみ": "Selamat tidur", "じゃあね": "Dah", "またね": "Sampai nanti",
+        "いただきます": "Selamat makan", "しょうがない": "Mau gimana lagi",
+        "しょうがないなあ": "Ya ampun", "しょうがないな": "Ya ampun",
     },
     "en": {
         "ねえねえ": "Hey, hey", "ねえ": "Hey", "ね": "Right", "なあ": "Hey", "おい": "Hey",
@@ -261,10 +314,16 @@ INTERJECTIONS: dict[str, dict[str, str]] = {
         "まあ": "Well", "もう": "Geez", "ちょっと": "Hey", "きゃ": "Kyaa", "ひ": "Eek", "は": "Hah",
         "ん": "Hm", "なに": "What", "なんで": "Why", "そう": "I see", "そっか": "I see",
         "なるほど": "I see",
+        "ふん": "Hmph", "ちぇ": "Tch", "じゃあ": "Then", "さて": "Now then", "ただいま": "I'm home",
+        "おかえり": "Welcome back", "おかえりなさい": "Welcome back", "おはよう": "Good morning",
+        "おやすみ": "Good night", "じゃあね": "See ya", "またね": "See you",
+        "いただきます": "Let's eat", "しょうがない": "Can't be helped",
+        "しょうがないなあ": "Oh well", "しょうがないな": "Oh well",
     },
 }
 # Unambiguous interjections that may also open a segment without a comma (うーんそうだな).
-_PREFIX_OK = ("ねえねえ", "ふむ", "うんうん", "えっと", "あはは", "えへへ", "うわっ", "あっ", "えっ", "おっ")
+_PREFIX_OK = ("ねえねえ", "ふむ", "うんうん", "えっと", "あはは", "えへへ", "うわっ", "あっ", "えっ", "おっ",
+              "じゃあ")
 _SEG = re.compile(r"[^、。！？…]+[、。！？…]*")
 
 
@@ -411,6 +470,7 @@ def prepare(
     glossary: Iterable[GlossaryEntry] = (),
     interjections: bool = True,
     names: bool = True,
+    standardize: bool = True,
 ) -> Prepared:
     source, target = iso(source), iso(target)
     raw = text.strip()
@@ -418,7 +478,11 @@ def prepare(
         out, terms = apply_glossary(unicodedata.normalize("NFKC", raw), glossary)
         return Prepared(text=out, end=_end_punct(out), terms=terms)
 
-    text = normalize_ja(raw)
+    hedge = False
+    text = raw
+    if standardize:
+        text, hedge = standardize_ja(raw)
+    text = normalize_ja(text)
     end = _end_punct(text)
     # checked on the raw text: "あっ、あと" is an exclamation, only a bare "あ、あと" stutters
     stutter_on = _stutter_on("".join(unicodedata.normalize("NFKC", raw).split()))
@@ -451,6 +515,8 @@ def prepare(
             seg = segs.pop()
             trail.insert(0, word + _latin_punct(seg[len(seg.rstrip("、。！？…")):]))
         text = "".join(segs)
+    if hedge and text and HEDGES.get(target):
+        trail.insert(0, f", {HEDGES[target]}")
     return Prepared(
         text=text.strip(),
         lead=" ".join(lead),
@@ -460,6 +526,29 @@ def prepare(
         end=end,
         terms=terms,
     )
+
+
+_SENT_CJK = re.compile(r"[^。！？!?]+[。！？!?]*|[。！？!?]+")
+_SENT_LATIN = re.compile(r"(?<=[.!?…])\s+(?=\S)")
+
+
+def split_sentences(text: str, lang: str) -> list[str]:
+    """'逃げろ！ここはもう持たない！' -> ['逃げろ！', 'ここはもう持たない！'] (ja/zh/ko split on
+    。！？ only, so 'そうだな…優しいよね' stays whole); Latin text splits after .!?… + space."""
+    text = text.strip()
+    if not text:
+        return [text]
+    if iso(lang) in ("ja", "zh", "zh-hant", "ko"):
+        parts = [p.strip() for p in _SENT_CJK.findall(text) if p.strip()]
+    else:
+        parts = [p.strip() for p in _SENT_LATIN.split(text) if p.strip()]
+    out: list[str] = []
+    for p in parts:  # a piece without letters ('！', '...') belongs to the previous one
+        if out and not _LETTER.search(p):
+            out[-1] += p
+        else:
+            out.append(p)
+    return out or [text]
 
 
 # --- output checks and clean-up ---------------------------------------------------------------
@@ -610,6 +699,8 @@ def finish(prep: Prepared, output: str, target: str, casual: bool = True) -> str
         out = apply_dict(out, CASUAL.get(iso(target)))
     if prep.text and out and prep.lead:
         out = _decap(out, prep.terms)
+    if out and prep.trail.startswith(","):
+        out = re.sub(r"\.+$", "", out)  # "lucu., gitu" -> "lucu, gitu"
     parts = [p for p in (prep.lead, out, prep.trail) if p]
     text = clean_output(" ".join(parts))
     if not text:

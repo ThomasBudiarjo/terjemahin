@@ -6,7 +6,14 @@ import pytest
 
 from terjemahin_worker.config import Settings
 from terjemahin_worker.mask import MASK_REFINERS
-from terjemahin_worker.mask.refine import DilateMask, GlyphMask, font_size
+from terjemahin_worker.mask.refine import (
+    DilateMask,
+    GlyphMask,
+    crossing_lines,
+    find_paper,
+    font_size,
+    make_crop,
+)
 from terjemahin_worker.models import BBox, TextRegion
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -518,3 +525,91 @@ def test_page01_outlined_sfx_without_detector_mask(cls, pad):
         assert m[white].mean() > 0.995 and m[fill].mean() > 0.995, (name, pad)
         if cls is GlyphMask:
             assert m[art].mean() < 0.01, (name, pad)
+
+
+def crossed_page(text: str, size: int, lines, line_bgr, pad: int):
+    """Page-sized flat paper with text (ComicShanns, strokes about as thick as the art lines)
+    and art lines running through it and well past the box, as on a real page: the line
+    leaves the refiner's window. Returns image, box-only region, glyph alpha, line alpha."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    H, W = 560, 800
+    img = np.full((H, W, 3), (172, 148, 158), np.uint8)
+    art = np.zeros((H, W), np.uint8)
+    for x1, y1, x2, y2, t in lines:
+        cv2.line(art, (x1, y1), (x2, y2), 255, t, cv2.LINE_AA)
+    pil = Image.new("L", (W, H))
+    ImageDraw.Draw(pil).text((300, 240), text, font=ImageFont.truetype(str(FONT), size), fill=255)
+    glyphs = np.array(pil)
+    img = blend(blend(img, art, line_bgr), glyphs, (5, 5, 5))
+    ys, xs = np.nonzero(glyphs)
+    box = BBox(
+        x1=int(xs.min()) - pad,
+        y1=int(ys.min()) - pad,
+        x2=int(xs.max()) + 1 + pad,
+        y2=int(ys.max()) + 1 + pad,
+    )
+    return img, TextRegion(id=0, bbox=box), glyphs, art
+
+
+CROSSED = [  # text, px, lines (x1, y1, x2, y2, width), line colour: all left half erased before
+    ("BAM", 69, [(0, 331, 800, 293, 3), (320, 0, 394, 560, 5)], (46, 75, 114)),
+    ("Ok!", 59, [(0, 302, 800, 229, 4), (419, 0, 383, 560, 4)], (107, 61, 111)),
+    ("Hello", 44, [(0, 259, 800, 308, 5), (342, 0, 384, 560, 4)], (81, 82, 104)),
+    ("BAM", 48, [(0, 246, 800, 239, 2), (418, 0, 375, 560, 5)], (72, 116, 111)),
+]
+
+
+@pytest.mark.skipif(not FONT.exists(), reason="font missing")
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize("case", range(len(CROSSED)))
+@pytest.mark.parametrize("pad", [4, 24])
+def test_box_only_glyphs_crossed_by_art_lines(cls, case, pad):
+    """Without a detector mask, glyphs that art lines run through (strokes no thicker than
+    the lines, so no stroke-width split) are erased on flat paper; the lines away from the
+    glyphs stay."""
+    img, region, glyphs, art = crossed_page(*CROSSED[case], pad=pad)
+    m = cls().refine(img, [region], None) > 0
+    assert m[glyphs > 30].mean() > 0.995
+    far = far_from(glyphs, art, region)
+    assert far.any() and m[far].mean() < 0.005
+
+
+def test_crossing_lines_spare_straight_glyph_strokes():
+    """Long straight glyph strokes end at the box; the art line goes on past it."""
+    H, W = 500, 700
+    img = np.full((H, W, 3), (172, 148, 158), np.uint8)
+    art = np.zeros((H, W), np.uint8)
+    cv2.line(art, (0, 240), (W, 262), 255, 4, cv2.LINE_AA)
+    glyphs = np.zeros((H, W), np.uint8)
+    cv2.putText(glyphs, "HIT", (260, 290), cv2.FONT_HERSHEY_SIMPLEX, 2.5, 255, 7, cv2.LINE_AA)
+    img = blend(blend(img, art, (40, 30, 90)), glyphs, (5, 5, 5))
+    ys, xs = np.nonzero(glyphs)
+    b = BBox(
+        x1=int(xs.min()) - 10, y1=int(ys.min()) - 10, x2=int(xs.max()) + 11, y2=int(ys.max()) + 11
+    )
+    c = make_crop(TextRegion(id=0, bbox=b), img, 0.5)
+    crop = img[c.sl]
+    _, dist, _, cn = find_paper(crop, c, 40.0)
+    lines = crossing_lines(dist > 40, cn, cn.font)
+    away = (glyphs[c.sl] > 128) & ~(cv2.dilate(art[c.sl], np.ones((9, 9), np.uint8)) > 0)
+    assert lines[art[c.sl] > 128].mean() > 0.8
+    assert not (lines & away).any()
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+def test_box_only_keeps_neighbour_glyph_outside_box(cls):
+    """A bare box's text zone reaches past it (a tight box may cut its glyphs), but ink
+    lying wholly beyond the box, such as a neighbour balloon's dot, is not this box's text."""
+    img = np.full((400, 600, 3), 250, np.uint8)
+    cv2.putText(
+        img, "Hello", (200, 220), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (10, 10, 10), 4, cv2.LINE_AA
+    )
+    dot = np.zeros(img.shape[:2], np.uint8)
+    cv2.circle(dot, (260, 168), 6, 1, -1)
+    img[dot > 0] = 10
+    region = TextRegion(id=0, bbox=BBox(x1=195, y1=182, x2=355, y2=230))
+    m = cls().refine(img, [region], None) > 0
+    assert not m[dot > 0].any()
+    text = (img[182:230, 195:355, 0] < 128).astype(np.float32)
+    assert covered(m[182:230, 195:355].astype(np.uint8) * 255, text, 0.5) == 1.0

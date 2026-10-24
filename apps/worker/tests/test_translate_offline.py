@@ -140,11 +140,14 @@ def test_interjection_context():
 
 
 def test_finish_punctuation_casual_terms():
-    p = tp.prepare("反応が面白いなとか", "ja", "id")
+    p = tp.prepare("反応が面白いなとか", "ja", "id", standardize=False)
     assert tp.finish(p, "Saya pikir reaksi Anda lucu.", "id") == "Aku pikir reaksi kamu lucu"
     assert tp.finish(p, "Saya pikir.", "id", casual=False) == "Saya pikir"
+    # a final hedge とか is cut from the MT input and rendered as "gitu"
+    p = tp.prepare("反応が面白いなとか", "ja", "id")
+    assert p.text == "反応が面白い" and tp.finish(p, "Reaksi Anda lucu.", "id") == "Reaksi kamu lucu, gitu"
     p = tp.prepare("じゃあメシアはどうなの？", "ja", "id", GLOSSARY)
-    assert tp.finish(p, "Bagaimana dengan Messias?", "id") == "Bagaimana dengan Mesia?"
+    assert tp.finish(p, "Bagaimana dengan Messias?", "id") == "Kalau gitu, bagaimana dengan Mesia?"
     assert tp.clean_output("Tunggu . . . apa ?!") == "Tunggu... apa?!"
 
 
@@ -321,3 +324,34 @@ def test_m2m100_and_chain_page01():
         print(f"{s} -> {o}")
     _assert_indonesian(outs)
     assert tp.chrf(outs, ref) > 24
+
+
+@pytest.mark.parametrize("raw, std", [
+    ("信じらんない…", "信じられない..."), ("わかんねーよ", "わからないよ"), ("知らねー！", "知らない！"),
+    ("うるせー…", "うるさい..."), ("こないだね", "この間ね"), ("食べちゃおうかな", "食べてしまおうかな"),
+    ("使ってて偉い", "使っていて偉い"), ("晩ご飯できてるわよ", "晩ご飯できているわよ"),
+    ("読んでるの？", "読んでいるの？"), ("やってみなきゃ", "やってみなければ"), ("言ったじゃん。", "言ったじゃないか。"),
+    ("店員さんとかにも", "店員さんにも"),
+    # left alone: verbs whose stem ends in て, ことかも / なんとか / 何とか, a noun list with とか
+    ("捨てる", "捨てる"), ("大丈夫ってことかも", "大丈夫ってことかも"), ("なんとかにも", "なんとかにも"),
+    ("何とか", "何とか"), ("ゲームとか", "ゲームとか"),
+])
+def test_standardize_colloquial_japanese(raw, std):
+    out, hedge = tp.standardize_ja(raw)
+    assert out == std and not hedge
+
+
+def test_standardize_final_hedge():
+    assert tp.standardize_ja("面白いなーとか") == ("面白い", True)
+    assert tp.standardize_ja("偉いなーとか！") == ("偉い！", True)
+    assert tp.prepare("偉いなーとか", "ja", "en").trail == ", or something"
+
+
+def test_standardize_slang_before_particles():
+    assert tp.standardize_ja("すげーよ！")[0] == "すごいよ！"
+    assert tp.standardize_ja("やべえな")[0] == "やばいな"
+
+
+@pytest.mark.parametrize("text", ["聞いて！", "だからね！", "するからね", "なんでたまに", "君のせいでた", "うめ。"])
+def test_standardize_leaves_lookalikes(text):
+    assert tp.standardize_ja(text)[0] == text

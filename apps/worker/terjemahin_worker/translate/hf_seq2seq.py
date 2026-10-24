@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +23,22 @@ from . import textproc as tp
 from .base import TranslationItem, TranslationRequest
 
 log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _num_threads(n: int | None) -> Iterator[None]:
+    """torch's thread pool is process-wide: set it for one call, then restore it."""
+    if not n:
+        yield
+        return
+    import torch
+
+    before = torch.get_num_threads()
+    torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(before)
 
 
 @dataclass
@@ -63,6 +81,47 @@ def load_model(repo: str, device: str = "cpu", quantize: bool = False) -> _Loade
         return _MODELS[key]
 
 
+def _cpu_busy_jiffies() -> int | None:
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+    except (OSError, ValueError):
+        return None
+    return sum(v) - v[3] - (v[4] if len(v) > 4 else 0)  # minus idle and iowait
+
+
+def busy_cores_elsewhere(window: float = 0.25) -> float | None:
+    """Cores other processes keep busy right now (Linux /proc/stat minus this process), or None."""
+    b0, p0, t0 = _cpu_busy_jiffies(), os.times(), time.monotonic()
+    if b0 is None:
+        return None
+    time.sleep(window)
+    b1, p1, t1 = _cpu_busy_jiffies(), os.times(), time.monotonic()
+    if b1 is None:
+        return None
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    own = (p1.user + p1.system) - (p0.user + p0.system)
+    return max(0.0, ((b1 - b0) / hz - own) / max(t1 - t0, 1e-6))
+
+
+def auto_threads(window: float = 0.25) -> int:
+    """CPU cores not kept busy by other processes, at least 1. torch with more threads than free
+    cores is several times slower, not a bit slower (oversubscribed thread pools spin): NLLB's
+    page01 went from ~3 s to ~49 s, Qwen2.5-3B decoding from 2.7 to 0.35 tok/s, with 4 threads
+    while another job kept 2 of 4 cores busy. Falls back to the load average off Linux."""
+    cpu = os.cpu_count() or 1
+    busy = busy_cores_elsewhere(window)
+    if busy is None:
+        try:
+            busy = os.getloadavg()[0]
+        except (OSError, AttributeError):  # not available on this platform
+            busy = 0.0
+    return max(1, min(cpu, int(cpu - busy + 0.5)))
+
+
+_AUTO_TTL = 30.0  # seconds an auto thread count is reused before measuring again
+
+
 def _batches(order: list[int], size: int) -> Iterable[list[int]]:
     for i in range(0, len(order), size):
         yield order[i : i + size]
@@ -85,12 +144,15 @@ class Seq2SeqTranslator:
         max_tokens: int = 200,
         no_repeat_ngram_size: int = 3,
         repetition_penalty: float = 1.0,
+        length_penalty: float = 1.0,
         retries: int = 1,
         interjections: bool = True,
         glossary: bool = True,
         names: bool = True,
         quantize: bool = False,
         casual: bool = True,
+        standardize: bool = True,
+        split: bool = True,
         pre_dict: dict[str, str] | None = None,
         post_dict: dict[str, str] | None = None,
     ) -> None:
@@ -102,10 +164,20 @@ class Seq2SeqTranslator:
         self.max_ratio, self.max_tokens = float(max_ratio), int(max_tokens)
         self.no_repeat_ngram_size = int(no_repeat_ngram_size)
         self.repetition_penalty = float(repetition_penalty)
+        self.length_penalty = float(length_penalty)
         self.retries = int(retries)
         self.interjections, self.use_glossary, self.quantize = interjections, glossary, quantize
         self.casual, self.names = casual, names
+        self.standardize = standardize  # colloquial ja -> standard forms (textproc.standardize_ja)
+        self.split = split  # translate multi-sentence bubbles sentence by sentence
+        self._auto_threads: tuple[float, int] | None = None  # threads=None: (when, idle cores)
         self.pre_dict, self.post_dict = pre_dict or {}, post_dict or {}
+
+    def _auto(self) -> int:
+        now = time.monotonic()
+        if self._auto_threads is None or now - self._auto_threads[0] > _AUTO_TTL:
+            self._auto_threads = (now, auto_threads())
+        return self._auto_threads[1]
 
     def code(self, lang: str) -> str:
         return tp.nllb_code(lang) if self.family == "nllb" else tp.m2m_code(lang)
@@ -118,6 +190,20 @@ class Seq2SeqTranslator:
         return load_model(self.repo, self.device, self.quantize)
 
     def generate(self, texts: list[str], source: str, target: str, **overrides: Any) -> list[str]:
+        """Raw model output for already-prepared texts. With `split`, a multi-sentence bubble is
+        translated sentence by sentence and re-joined: NLLB/M2M100 often drop one sentence of
+        "逃げろ！ここはもう持たない！" or "Run! This place won't hold!"."""
+        if not self.split:
+            return self._generate(texts, source, target, **overrides)
+        pieces = [tp.split_sentences(t, source) for t in texts]
+        flat = self._generate([s for ps in pieces for s in ps], source, target, **overrides)
+        out, k = [], 0
+        for ps in pieces:
+            out.append(" ".join(x for x in flat[k : k + len(ps)] if x))
+            k += len(ps)
+        return out
+
+    def _generate(self, texts: list[str], source: str, target: str, **overrides: Any) -> list[str]:
         """Raw model output for already-prepared texts (batched by length to limit padding)."""
         if not texts:
             return []
@@ -129,12 +215,14 @@ class Seq2SeqTranslator:
             "num_beams": self.num_beams,
             "no_repeat_ngram_size": self.no_repeat_ngram_size,
             "repetition_penalty": self.repetition_penalty,
+            "length_penalty": self.length_penalty,
             **overrides,
         }
         params["early_stopping"] = params["num_beams"] > 1
         order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
         out = [""] * len(texts)
-        with m.lock, torch.inference_mode():
+        n_threads = self._auto() if self.threads is None else None
+        with m.lock, torch.inference_mode(), _num_threads(n_threads):
             tok.src_lang = self.code(source)
             tgt = self.code(target)
             bos = tok.convert_tokens_to_ids(tgt) if self.family == "nllb" else tok.get_lang_id(tgt)
@@ -172,7 +260,8 @@ class Seq2SeqTranslator:
         gl = list(glossary) if self.use_glossary else []
         preps = [
             tp.prepare(
-                tp.apply_dict(t, self.pre_dict), source, target, gl, self.interjections, self.names
+                tp.apply_dict(t, self.pre_dict), source, target, gl, self.interjections, self.names,
+                self.standardize,
             )
             for t in texts
         ]

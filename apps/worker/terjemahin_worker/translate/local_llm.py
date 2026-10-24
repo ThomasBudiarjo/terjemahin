@@ -6,18 +6,29 @@ the API translators through llm_common.LLMTranslator: system prompt, glossary an
 context, tolerant parsing, the repair request for missing / still-Japanese items and the
 fallback translator. What is local-specific lives here:
 
-- the answer format defaults to `<|n|> translation` lines instead of JSON items (half the
-  output tokens; on CPU the page time is dominated by decoding);
-- a short few-shot exchange (own example lines, not from any eval page) pins the format and
-  the casual register for small models;
+- by default the LLM writes ENGLISH (`pivot="en"`) and NLLB takes each line to the target
+  (sentence by sentence). Measured on page01 + 47 own manga-style lines: Qwen2.5-3B writing
+  Indonesian directly is fluent-looking but often wrong (page01 7/13 adequate, slang and
+  invented words: "Kamisnya ayam goreng" for 今日はカレーだ), and post-editing its own English
+  into Indonesian was no better; its English is good and NLLB's en->id is far better than its
+  ja->id. Interjections, stutters, the とか hedge and glossary terms are resolved against the
+  final language by textproc.prepare/finish, as in the chain translator;
+- the answer format is `<|n|> translation` lines, not JSON items (half the output tokens; on
+  CPU the page time is dominated by decoding);
+- a short few-shot exchange (own lines, no first names: a 3B model copied "Kenji" into an
+  unrelated page) pins the format and the casual register;
 - names are made unambiguous before the model sees them: glossary terms and common kanji
   surnames are substituted in romaji (textproc), so a 3B model cannot leave 坂本 in kanji;
 - greedy decoding, with a token budget derived from the source length so a looping model stops
-  early; a repeated identical prompt (parse retry) samples instead of reproducing the failure;
-- per-item fallback to a seq2seq translator (nllb / m2m100) for items that stay missing, empty,
-  in Japanese, looping or absurdly long.
+  early; an identical prompt within one page (parse retry) samples instead of repeating itself;
+- per-item fallback to a seq2seq translator (m2m100) for items that stay missing, empty, in
+  Japanese, looping or absurdly long;
+- CPU threads follow the cores other processes leave idle, re-checked during generation: an
+  oversubscribed torch pool decodes 5-8x slower.
 
-Memory / speed on 4 CPU cores (AMX bf16): Qwen2.5-3B in bfloat16 ~6.5 GB RSS; see `methods`.
+Cost on 4 CPU cores (AMX, bfloat16): ~9.5 GB peak RSS with NLLB loaded for the hop (Qwen alone
+~6.5 GB; float32 would need ~12 GB). Decoding 5.8 tok/s with 4 idle cores, 2.7 with 2; a
+13-bubble page is ~160 output tokens, i.e. ~30 s (idle machine) to ~60 s (2 cores) per page.
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ from ..registry import TRANSLATORS
 from . import prompt as P
 from . import textproc as tp
 from .base import TranslationItem, TranslationRequest
+from .hf_seq2seq import auto_threads
 from .llm_common import ChatRequest, LLMTranslator, as_bool, as_int, split_opts
 
 log = logging.getLogger(__name__)
@@ -91,6 +103,13 @@ def load_causal(repo: str, device: str = "cpu", dtype: str = "bfloat16") -> _Loa
             tok, mdl = _from(False)
         mdl = mdl.to(device).eval()
         mdl.generation_config.max_length = None  # we always pass max_new_tokens
+        # one-token warm-up: pages the (memory-mapped) weights in and builds the CPU kernels
+        # now, instead of during the first page (which was 3-5x slower than the next ones)
+        import torch
+
+        with torch.inference_mode():
+            mdl.generate(**tok("warm up", return_tensors="pt").to(device), max_new_tokens=1,
+                         do_sample=False, pad_token_id=tok.pad_token_id or tok.eos_token_id)
         log.info("local_llm: loaded %s (%s) in %.1fs", repo, dtype, time.perf_counter() - t)
         _MODELS[key] = _Loaded(tok, mdl, threading.Lock())
         return _MODELS[key]
@@ -98,13 +117,15 @@ def load_causal(repo: str, device: str = "cpu", dtype: str = "bfloat16") -> _Loa
 
 # --- few-shot example (own lines, deliberately unrelated to the eval pages) -------------------
 
-_SHOT_JA = ["おい、ケンジ！遅刻するぞー！", "わ、わかってるって…", "また夜更かししたんでしょ？",
-            "べ、別にいいだろ！", "ふーん。佐藤先生に言っちゃおうかなー"]
+# Written the way `prepare` hands lines to the model: names already in romaji, no stutters
+# (re-attached afterwards) and no first names, which a 3B model copies into unrelated pages.
+_SHOT_JA = ["おい！遅刻するぞ！", "わかってるって…", "また夜更かししたんでしょ？", "別にいいだろ！",
+            "ふーん。Sato-sensei に言っちゃおうかな"]
 _SHOTS = {
-    "id": ["Hei, Kenji! Nanti telat lho!", "A-aku tahu kok...", "Kamu begadang lagi, kan?",
-           "B-bukan urusanmu!", "Hmm. Kuaduin ke Sato-sensei, ah."],
-    "en": ["Hey, Kenji! You're gonna be late!", "I-I know...", "You stayed up late again, didn't you?",
-           "S-so what!", "Hmm. Maybe I'll tell Sato-sensei."],
+    "id": ["Hei! Nanti telat lho!", "Iya, aku tahu...", "Kamu begadang lagi, kan?",
+           "Memangnya kenapa?!", "Hmm. Kuaduin ke Sato-sensei, ah."],
+    "en": ["Hey! You're gonna be late!", "I know, I know...", "You stayed up late again, didn't you?",
+           "So what?!", "Hmm. Maybe I'll tell Sato-sensei."],
 }
 _NUMBERED_LINE = re.compile(r"^<\|\d+\|>\s?(?:\([^)]*\)\s)?(.*)$", re.MULTILINE)
 
@@ -138,6 +159,25 @@ def token_budget(user_text: str, output: str, cap: int) -> int:
     return max(32, min(cap, 48 + per_item * len(lines) + chars))
 
 
+class _ThreadGovernor:
+    """A never-stopping stopping criterion that re-measures the idle cores every `every` tokens
+    and resizes torch's thread pool between decoding steps (a 0.1 s look, ~2% of the time)."""
+
+    def __init__(self, every: int = 24) -> None:
+        self.every, self.steps = max(1, every), 0
+
+    def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+        import torch
+
+        self.steps += 1
+        if self.steps % self.every == 0:
+            n = auto_threads(0.1)
+            if n != torch.get_num_threads():
+                log.info("local_llm: CPU load changed, now %d thread(s)", n)
+                torch.set_num_threads(n)
+        return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+
+
 class LocalLLMBackend:
     """llm_common Backend running a transformers causal LM in-process (text only)."""
 
@@ -153,6 +193,7 @@ class LocalLLMBackend:
         output: str = "lines",
         shots: bool = True,
         repetition_penalty: float = 1.0,
+        lookup: int = 0,
         source_lang: str = "ja",
         target_lang: str = "id",
     ) -> None:
@@ -163,16 +204,26 @@ class LocalLLMBackend:
         self.output = output
         self.shots = shots
         self.repetition_penalty = float(repetition_penalty)
+        self.lookup = int(lookup)  # prompt-lookup speculative decoding (n tokens), 0 = off
+        self.retune_every = 24  # tokens between idle-core checks when threads is auto
         self.langs = (source_lang, target_lang)  # set per request by the translator
         self._last_prompt = ""
+        self._auto_threads: int | None = None
         self.stats: list[dict[str, float]] = []  # per generation: prompt/new tokens, seconds
 
     def loaded(self) -> _Loaded:
-        if self.threads:
-            import torch
-
-            torch.set_num_threads(int(self.threads))
         return load_causal(self.repo, self.device, self.dtype)
+
+    def num_threads(self) -> int:
+        """`threads`, or (None) the cores other processes leave idle (hf_seq2seq.auto_threads):
+        decoding Qwen2.5-3B with 4 threads on 4 cores, 2 of them busy: 0.35 tok/s; 2 threads: 2.7."""
+        if self.threads:
+            return int(self.threads)
+        n = auto_threads()  # measured per page: other jobs come and go
+        if n != self._auto_threads:
+            log.info("local_llm: using %d CPU thread(s)", n)
+        self._auto_threads = n
+        return n
 
     def messages(self, req: ChatRequest) -> list[dict[str, str]]:
         msgs = [{"role": "system", "content": req.system}]
@@ -198,9 +249,18 @@ class LocalLLMBackend:
             params.update(do_sample=True, temperature=0.7, top_p=0.9)
         else:
             params.update(do_sample=False, temperature=None, top_p=None, top_k=None)
+            if self.lookup:
+                params["prompt_lookup_num_tokens"] = self.lookup
+        if not self.threads:  # other jobs come and go during a minute-long generation
+            params["stopping_criteria"] = [_ThreadGovernor(self.retune_every)]
         t = time.perf_counter()
         with m.lock, torch.inference_mode():
-            out = m.model.generate(**enc, pad_token_id=tok.pad_token_id or tok.eos_token_id, **params)
+            before = torch.get_num_threads()  # per call: other stages keep their own setting
+            torch.set_num_threads(self.num_threads())
+            try:
+                out = m.model.generate(**enc, pad_token_id=tok.pad_token_id or tok.eos_token_id, **params)
+            finally:
+                torch.set_num_threads(before)
         n_in = enc["input_ids"].shape[1]
         new = out[0, n_in:]
         dt = time.perf_counter() - t
@@ -244,6 +304,7 @@ class LocalLLMTranslator:
     def _llm_page(self, req: TranslationRequest, sources: list[str], source: str, target: str) -> list[str]:
         """One LLM generation for the page (plus repair), then the per-item safety net."""
         self.backend.langs = (source, target)
+        self.backend._last_prompt = ""  # resample only on a retry within this page
         sub = TranslationRequest(
             page_bgr=req.page_bgr, regions=req.regions, sources=sources, context=req.context,
             source_lang=source, target_lang=target,
@@ -291,6 +352,9 @@ class LocalLLMTranslator:
         names = [pivot_names(t) for t in mid]  # romanised by the LLM ("Hey, Mei, ...")
         if self.prepare_pivot != "strip" and pivot == "en":
             mid = [trim_interjections(t, bool(p.lead), bool(p.trail)) for t, p in zip(mid, preps)]
+        # stutters are re-attached from the source by finish(); one the LLM wrote anyway ("I-I")
+        # would come out doubled ("A-a-aku") or as "Aku-aku" after the seq2seq hop
+        mid = [destutter(t, p.stutter) for t, p in zip(mid, preps)]
         if self._pivot_tr is None:
             from ..registry import TRANSLATORS
 
@@ -322,10 +386,25 @@ class LocalLLMTranslator:
 
 _EN_INTERJ = (r"(?:hey|hei|eh|huh|wow|whoa|woah|oh|ah+|um+|uh+|er+m?|hm+|yay|yeah|yes|yep|no|nope|"
               r"well|so|look|geez|jeez|damn|ugh|hehe+|haha+|ahaha+|ehehe+|fufu+|hoho+|heh|right|"
-              r"okay|ok|alright|sorry|thanks|wait|what|why|i see|uh-huh|mm+|ooh|aah)")
+              r"okay|ok|alright|sorry|thanks|wait|what|why|i see|uh-huh|mm+|ooh|aah|hmph|humph|tch|"
+              r"phew|yikes|oops|ugh|eek|welp|then|now then|good morning|i'm home|welcome back|"
+              r"oh well|see ya|see you)")
 # only interjections set off by punctuation count ("Hey, Mei" but not "what else")
 _LEAD_INTERJ = re.compile(rf"^(?:{_EN_INTERJ}(?:[\s,]+{_EN_INTERJ})*[,.!?…~-]+\s*)+", re.IGNORECASE)
 _TRAIL_INTERJ = re.compile(rf"(?:[,.!?…~-]+\s*{_EN_INTERJ})+([.!?…]*)$", re.IGNORECASE)
+
+
+_LATIN_STUTTER = re.compile(r"(?<![^\W\d_])([^\W\d_]{1,2})-(?=\1)", re.IGNORECASE)
+
+
+_HESITATION = re.compile(r"^([^\W\d_]+)(?:…|\.{2,}|,)\s*(?=\1\b)", re.IGNORECASE)
+
+
+def destutter(text: str, stuttered: bool = False) -> str:
+    """'I-I don't' -> 'I don't', 'W-well' -> 'well' (hyphenated words like 'well-known' stay).
+    When the source stutters (re-attached by finish), an opening hesitation goes too: 'I… I'."""
+    text = _LATIN_STUTTER.sub("", text)
+    return _HESITATION.sub("", text) if stuttered else text
 
 
 def trim_interjections(text: str, lead: bool, trail: bool) -> str:
@@ -336,7 +415,9 @@ def trim_interjections(text: str, lead: bool, trail: bool) -> str:
     if trail:
         out = _TRAIL_INTERJ.sub(r"\1", out)
     out = out.strip(" ,")
-    return out if re.search(r"[^\W\d_]", out) else text
+    if not re.search(r"[^\W\d_]", out):
+        return text
+    return tp._cap(out) if out != text else out  # "really? That's it?" reads as a fragment to MT
 
 
 _MID_CAP = re.compile(r"(?<=[^\W\d_][,;]\s)([A-Z][a-z]+(?:-[a-z]+)?)\b|(?<=[a-z]\s)([A-Z][a-z]+(?:-[a-z]+)?)\b")
@@ -365,16 +446,17 @@ def _letters(s: str) -> str:
 
 
 _LOCAL_OPTS = {
-    "model": str, "dtype": str, "max_new_tokens": as_int, "threads": lambda v: as_int(v) if v else None,
-    "shots": as_bool, "repetition_penalty": float, "device": str,
+    "model": str, "dtype": str, "max_new_tokens": as_int, "threads": lambda v: None if v in (None, "", "auto", 0) else as_int(v),
+    "shots": as_bool, "repetition_penalty": float, "device": str, "lookup": as_int,
 }
 
 
 @TRANSLATORS.register(
     "local_llm",
-    description="Local chat LLM via transformers (offline; default Qwen/Qwen2.5-3B-Instruct bf16, "
-    "~6.5GB RAM, ~1 min/page on 4 CPU cores): whole page in one generation, glossary + previous "
-    "pages, per-item fallback to nllb/m2m100. Opts: model, dtype, max_new_tokens, threads.",
+    description="Local chat LLM via transformers (offline; Qwen/Qwen2.5-3B-Instruct bf16, ~9.5GB "
+    "RAM, 30-60 s/page on 4 CPU cores): whole page in one generation into English, NLLB to the "
+    "target; glossary + previous pages, per-item fallback to m2m100. Opts: model, dtype, "
+    "max_new_tokens, threads, pivot (en|none), pivot_translator, fallback.",
     requires=("torch", "transformers"),
     offline=True,
 )
@@ -383,7 +465,7 @@ def _build(settings, **opts: Any) -> LocalLLMTranslator:
     local = {k: conv(opts.pop(k)) for k, conv in _LOCAL_OPTS.items() if k in opts}
     fallback_name = opts.pop("fallback", "m2m100")
     names = as_bool(opts.pop("names", True))
-    pivot = opts.pop("pivot", None)
+    pivot = opts.pop("pivot", "en")
     pivot = None if pivot is None or str(pivot).lower() in ("", "none", "null") else str(pivot)
     pivot_translator = str(opts.pop("pivot_translator", "nllb"))
     prepare = str(opts.pop("prepare", "hybrid")).strip().lower()
@@ -406,6 +488,7 @@ def _build(settings, **opts: Any) -> LocalLLMTranslator:
         output=core["output"],
         shots=local.get("shots", True),
         repetition_penalty=local.get("repetition_penalty", 1.0),
+        lookup=local.get("lookup", 0),
     )
     core.setdefault("max_tokens", backend.max_new_tokens)
 
