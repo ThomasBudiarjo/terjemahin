@@ -216,6 +216,11 @@ def normalize_ja(text: str) -> str:
     return text
 
 
+def strip_stutter(text: str) -> str:
+    """'わ、私は' -> '私は' when the head is a real stutter (see `prepare`), else unchanged."""
+    return _STUTTER.sub("", text) if _stutter_on("".join(text.split())) else text
+
+
 def map_honorifics(text: str) -> str:
     text = _LATIN_HON.sub(lambda m: f"{m.group(1)}-{HONORIFICS[m.group(2)]}", text)
 
@@ -239,7 +244,7 @@ INTERJECTIONS: dict[str, dict[str, str]] = {
         "ふふ": "Fufu", "ふふふ": "Fufufu", "はは": "Haha", "あはは": "Ahaha", "ははは": "Hahaha",
         "へへ": "Hehe", "えへへ": "Ehehe", "くそ": "Sial", "ちくしょう": "Sialan",
         "ごめん": "Maaf", "ごめんなさい": "Maaf", "すみません": "Permisi", "ありがとう": "Makasih",
-        "やった": "Yes", "よし": "Oke", "ほら": "Nih", "さあ": "Ayo", "まあ": "Yah", "もう": "Ih",
+        "やった": "Hore", "よし": "Oke", "ほら": "Nih", "さあ": "Ayo", "まあ": "Yah", "もう": "Ih",
         "ちょっと": "Tunggu", "きゃ": "Kyaa", "ひ": "Hii", "は": "Hah", "ん": "Hm", "なに": "Apa",
         "なんで": "Kenapa", "そう": "Begitu", "そっか": "Oh, begitu", "なるほど": "Begitu ya",
     },

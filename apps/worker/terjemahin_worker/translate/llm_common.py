@@ -533,9 +533,13 @@ class LLMTranslator:
         prev_pages: int = 2,
         remember_pages: int = 0,
         fallback: Callable[[TranslationRequest], list[TranslationItem]] | None = None,
+        output: str = "json",
     ) -> None:
         if mode not in ("auto", "text", "vision"):
             raise ValueError(f"mode must be auto|text|vision, got {mode!r}")
+        if output not in ("json", "lines"):
+            raise ValueError(f"output must be json|lines, got {output!r}")
+        self.output = output  # "lines": `<|n|> target` answers in text mode (fewer tokens)
         if mode == "vision" and not backend.vision:
             raise ValueError(f"{backend.name}: model is not vision-capable (set vision=true if it is)")
         self.backend = backend
@@ -657,7 +661,8 @@ class LLMTranslator:
                     leaks[k] = _CJK_RUN.findall(tainted[k].target)
             return got
 
-        system = P.system_prompt(mode, req.source_lang, req.target_lang, page_image=page_jpeg is not None and mode == "text")
+        system = P.system_prompt(mode, req.source_lang, req.target_lang,
+                                 page_image=page_jpeg is not None and mode == "text", output=self.output)
         ctx = P.context_block(context, [s.source for s in slots], req.target_lang, self.prev_pages)
 
         got: dict[int, Parsed] = {}
@@ -753,7 +758,7 @@ class LLMTranslator:
                 )
                 for s in slots
             ]
-            task = P.text_task(lines, req.target_lang, req.source_lang)
+            task = P.text_task(lines, req.target_lang, req.source_lang, self.output)
             if missing:
                 task += "\n\n" + P.repair_note(missing, req.target_lang, leaks)
             if note:
@@ -807,6 +812,7 @@ CORE_OPTS: dict[str, Callable[[Any], Any]] = {
     "positions": as_bool, "max_items": as_int, "repair": as_int, "parse_retries": as_int,
     "page_max_side": as_int, "crop_max_side": as_int, "crop_pad": as_int, "max_tokens": as_int,
     "temperature": _optional(float), "prev_pages": as_int, "remember_pages": as_int,
+    "output": lambda v: str(v).strip().lower(),
 }
 HTTP_OPTS: dict[str, Callable[[Any], Any]] = {
     "timeout": float, "max_retries": as_int, "timeout_retries": as_int, "backoff": float,

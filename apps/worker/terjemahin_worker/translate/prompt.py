@@ -15,6 +15,7 @@ from typing import Literal
 from ..models import GlossaryEntry, PageContext
 
 Mode = Literal["text", "vision"]
+Output = Literal["json", "lines"]
 
 _NAMES = {
     "ja": "Japanese", "id": "Indonesian", "en": "English", "zh": "Chinese (Simplified)",
@@ -90,6 +91,21 @@ Satu item untuk setiap nomor masukan, index sama dengan nomor masukan, jangan di
 dilewati.
 """
 
+# "lines": the answer is just `<|n|> translation` lines (half the tokens of JSON items, which
+# matters for a local CPU model; llm_common.parse_items reads both). Text mode only.
+_ID_TEXT_LINES = """\
+Masukan: baris bernomor <|n|> berisi teks hasil OCR, satu baris per balon, urut sesuai urutan \
+baca. Semua baris berasal dari satu halaman, jadi pahami sebagai satu percakapan. OCR bisa \
+salah baca satu-dua karakter; pahami maksudnya dari konteks.
+"""
+
+_ID_FORMAT_LINES = """\
+Keluarkan HANYA terjemahan, satu baris output untuk setiap nomor masukan, persis dengan bentuk:
+<|1|> terjemahan baris 1
+<|2|> terjemahan baris 2
+Jangan menulis teks sumber, penjelasan, atau markdown; jangan menggabung atau melewati nomor.
+"""
+
 _EN_ROLE = """\
 You are a professional manga translator from {src} into {tgt}{ocr_role}.
 
@@ -130,12 +146,30 @@ One item for every input number, index equal to the input number; never merge or
 """
 
 
+_EN_TEXT_LINES = """\
+Input: numbered lines <|n|> with OCR text, one line per balloon, in reading order. All lines come \
+from one page, so read them as one conversation. OCR may misread a character or two; infer the \
+meaning from context.
+"""
+
+_EN_FORMAT_LINES = """\
+Output ONLY the translations, one output line for every input number, exactly in this shape:
+<|1|> translation of line 1
+<|2|> translation of line 2
+Never write the source text, notes or markdown; never merge or skip numbers.
+"""
+
+
 def system_prompt(
-    mode: Mode, source_lang: str = "ja", target_lang: str = "id", page_image: bool = False
+    mode: Mode, source_lang: str = "ja", target_lang: str = "id", page_image: bool = False,
+    output: Output = "json",
 ) -> str:
+    lines = output == "lines" and mode == "text"
     if _indonesian(target_lang):
         src = _NAMES_ID.get(source_lang, lang_name(source_lang))
         role = _ID_ROLE.format(src=src, ocr_role=" sekaligus pembaca teks (OCR)" if mode == "vision" else "")
+        if lines:
+            return f"{role}\n{_ID_TEXT_LINES}\n{_ID_FORMAT_LINES}"
         note = (" Gambar halaman disertakan untuk konteks; posisi (x%, y%) tiap balon diberikan."
                 if page_image else "")
         task = _ID_VISION.format(src=src) if mode == "vision" else _ID_TEXT.format(image_note=note)
@@ -145,6 +179,8 @@ def system_prompt(
               else f" A \"target\" must never contain {src} characters (kanji/kana).")
     role = _EN_ROLE.format(src=src, tgt=tgt, no_cjk=no_cjk,
                            ocr_role=" and text reader (OCR)" if mode == "vision" else "")
+    if lines:
+        return f"{role}\n{_EN_TEXT_LINES}\n{_EN_FORMAT_LINES}"
     note = (" The page image is attached for context; each line carries its balloon position "
             "(x%, y%)." if page_image else "")
     task = _EN_VISION.format(src=src) if mode == "vision" else _EN_TEXT.format(image_note=note)
@@ -207,15 +243,19 @@ def context_block(
     return "\n\n".join(parts)
 
 
-def text_task(lines: Sequence[Line], target_lang: str, source_lang: str = "ja") -> str:
+def text_task(
+    lines: Sequence[Line], target_lang: str, source_lang: str = "ja", output: Output = "json"
+) -> str:
     n = len(lines)
+    idx = _index_list(lines)
     if _indonesian(target_lang):
+        what = f"baris <|n|> untuk nomor {idx}" if output == "lines" else f"item dengan index {idx}"
         head = (f"Terjemahkan {n} baris berikut dari bahasa {_NAMES_ID.get(source_lang, lang_name(source_lang))} "
-                f"ke bahasa Indonesia. Kembalikan TEPAT {n} item dengan index "
-                f"{_index_list(lines)}.")
+                f"ke bahasa Indonesia. Kembalikan TEPAT {n} {what}.")
     else:
+        what = f"<|n|> lines for numbers {idx}" if output == "lines" else f"items with index {idx}"
         head = (f"Translate the following {n} lines from {lang_name(source_lang)} into "
-                f"{lang_name(target_lang)}. Return EXACTLY {n} items with index {_index_list(lines)}.")
+                f"{lang_name(target_lang)}. Return EXACTLY {n} {what}.")
     body = []
     for ln in lines:
         tags = []
@@ -225,8 +265,9 @@ def text_task(lines: Sequence[Line], target_lang: str, source_lang: str = "ja") 
             tags.append("SFX")
         tag = f"({'; '.join(tags)}) " if tags else ""
         body.append(f"<|{ln.index}|> {tag}{' '.join(ln.text.split())}")
-    tail = ("Tulis semua \"target\" dalam bahasa Indonesia." if _indonesian(target_lang)
-            else f"Write every \"target\" in {lang_name(target_lang)}.")
+    field = "terjemahan" if output == "lines" else '"target"'
+    tail = (f"Tulis semua {field} dalam bahasa Indonesia." if _indonesian(target_lang)
+            else f"Write every {'translation' if output == 'lines' else field} in {lang_name(target_lang)}.")
     return head + "\n\n" + "\n".join(body) + "\n\n" + tail
 
 
