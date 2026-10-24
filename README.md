@@ -52,6 +52,7 @@ use.
 | translator | chain | torch, HF | Pivot through several translators, e.g. steps='m2m100:en,nllb:id'. |
 | translator | deepseek | `DEEPSEEK_API_KEY`, network | DeepSeek chat API (text only, JSON mode). |
 | translator | gemini | `GEMINI_API_KEY`, network | Gemini (REST): reads + translates every crop with page and series context when OCR is off, or translates OCR lines with the page image attached. |
+| translator | hymt | torch, HF | Tencent HY-MT1.5 1.8B (offline, ~3.6GB, ~20s/page CPU): dedicated translation LLM, previous bubbles as context, same manga pre/post-processing as m2m100. Opts: model, context, dtype, batch_size, threads. |
 | translator | local_llm | torch, HF | Local chat LLM via transformers (offline; Qwen/Qwen2.5-3B-Instruct bf16, ~9.5GB RAM, 30-60 s/page on 4 CPU cores): whole page in one generation into English, NLLB to the target; glossary + previous pages, per-item fallback to m2m100. Opts: model, dtype, max_new_tokens, threads, pivot (en\|none), pivot_translator, fallback. |
 | translator | **m2m100** | torch, HF | M2M100 418M (offline, fastest; the default): best offline seq2seq ja->id (page01 10/13, held-out lines 23/36 adequate). One bubble at a time, no page context. |
 | translator | m2m100_big | torch, HF | M2M100 1.2B (offline, downloads ~5GB on first use). |
@@ -155,7 +156,10 @@ defaults; full table under [Performance](#performance)):
 - **Translator**: the weakest stage. Offline, the default `m2m100` keeps the meaning of 10/13
   page01 balloons (chrF 32.4) and 23/36 held-out lines (`eval/fixtures/lines_ja_id.tsv`); `nllb`
   8/13 and 18/36; `chain` (m2m100 -> en -> nllb) 9/13 and 24/36; `local_llm` 10/13 (chrF 38.5)
-  and 24/36 at ~47 s and ~9.5 GB RAM per page. The seq2seq translators work bubble by bubble
+  and 24/36 at ~47 s and ~9.5 GB RAM per page; `hymt` (Tencent HY-MT1.5 1.8B, a dedicated
+  translation LLM given the previous bubbles as context) has the best chrF (37.4 page01, 42.9
+  held-out) but the same adequacy (9-10/13, 23/36) at ~12-23 s per page, ~4 GB RAM, under the
+  Tencent HY licence (not valid in the EU/UK/South Korea). The seq2seq translators work bubble by bubble
   without page context; only the LLM translators see the page. With an API key, `gemini`,
   `anthropic`, `openai` and `deepseek` also use the series context (not measured here: no
   keys). `none` erases without typesetting, `original` checks OCR and typesetting.

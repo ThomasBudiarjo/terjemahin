@@ -284,6 +284,10 @@ def _hf_models(stage: str, name: str) -> list[str]:
 
         if name in hf_seq2seq._KNOWN:
             return [hf_seq2seq._KNOWN[name][0]]
+        if name == "hymt":
+            from .translate.hymt import DEFAULT_MODEL
+
+            return [DEFAULT_MODEL]
         if name == "local_llm":  # pivot en->target through nllb, per-item fallback m2m100
             return [local_llm.DEFAULT_MODEL] + _hf_models(stage, "nllb") + _hf_models(stage, "m2m100")
         if name == "chain":  # the translators of its default steps

@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+from conftest import latency_budget
 
 from terjemahin_worker.config import Settings
 from terjemahin_worker.models import BBox, TextRegion
@@ -325,7 +326,7 @@ def test_page01_cer_with_ctd(ocr):
     gt = [b["ja"] for b in json.loads(GT.read_text(encoding="utf-8"))["bubbles"]]
     err = sum(min(lev(norm(t), norm(g)) for t in texts) for g in gt)
     assert err / sum(len(g) for g in gt) < 0.06
-    assert elapsed < 30
+    assert elapsed < latency_budget(30)
 
 
 def norm(t: str) -> str:

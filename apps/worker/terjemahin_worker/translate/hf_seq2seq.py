@@ -144,6 +144,7 @@ class Seq2SeqTranslator:
     """Japanese bubbles -> target language with a multilingual seq2seq model."""
 
     vision = False
+    FAMILIES: tuple[str, ...] = ("nllb", "m2m100")
 
     def __init__(
         self,
@@ -169,10 +170,10 @@ class Seq2SeqTranslator:
         pre_dict: dict[str, str] | None = None,
         post_dict: dict[str, str] | None = None,
     ) -> None:
-        if family not in ("nllb", "m2m100"):
+        if family not in self.FAMILIES:
             raise ValueError(f"unknown model family '{family}'")
-        other = "m2m100" if family == "nllb" else "nllb"
-        if other in str(repo).lower():
+        other = {"nllb": "m2m100", "m2m100": "nllb"}.get(family)
+        if other and other in str(repo).lower():
             raise ValueError(f"model {repo!r} is a {other} checkpoint; use translator '{other}' "
                              f"(this one speaks {family} language codes)")
         self.repo, self.family, self.device = repo, family, device

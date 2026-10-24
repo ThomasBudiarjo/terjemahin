@@ -16,6 +16,44 @@ artifact it left in [`docs/proof/`](proof/).
   `docs/proof/` holds downscaled JPEGs (each <= 400 KB, 5 MB in total), reports, logs, the GT files and
   the helper scripts (`docs/proof/scripts/`, run from `apps/worker/out/proof`).
 
+## Final state at hand-off (2026-10-24, after section 0)
+
+Fresh run on the final tree, defaults `ctd / manga_ocr / m2m100 / default / lama_manga / default`
+([proof/final/page01_bench.md](proof/final/page01_bench.md); command
+`.venv/bin/python -m terjemahin_worker.eval bench --page eval/fixtures/page01.png --gt eval/fixtures/page01.gt.json --out out/final-bench`):
+
+| check | result |
+|---|---|
+| detect | **PASS** 13/13, 0 partial, 0 false positives |
+| OCR | **PASS** mean CER 0.008, 11/13 exact |
+| translate | **PASS** 10/13 adequate under the strict check (cosine >= 0.8 and no meaning conflict), chrF 32.4 |
+| inpaint | **PASS** 0 residual text regions, ghost 0.0001, every change within 8 px of the mask |
+| render | **FAIL** (cosmetic): 302/302 letters read back from pixels (CER 0.005), 0 lost; the tiny handwritten aside あとね -> "Selanjutnya ya" is set at the 16 px legibility floor and spills 35 px past its oval, with an outline |
+| latency | 22.0 s cold (model loading), **9.3 s warm** per page on 4 CPU cores |
+
+![page01 before / after, final tree](proof/final/page01_before_after.jpg)
+
+Also added in this last pass:
+
+- `hymt` translator (Tencent HY-MT1.5 1.8B, offline, previous bubbles as context, same manga
+  pre/post-processing as m2m100). [proof/final/hymt_lines.txt](proof/final/hymt_lines.txt)
+  (script [proof/scripts/hymt_eval.py](proof/scripts/hymt_eval.py)): page01 9/13 (chrF 37.4),
+  held-out lines 23/36 (chrF 42.9) vs m2m100 10/13 (32.4) and 23/36 (40.0). More fluent, not more
+  faithful, so it is an option, not the default.
+- Japanese pre-processing fixes found by a reviewer: っと adverbs before かも/かは (ちょっとかも was
+  mangled to ちょっも), ふーん no longer becomes the dismissive "Hmph", and 嫌いでたまらない ("I can't
+  stand it") is no longer rewritten into a progressive (m2m100 had produced "Aku tidak membencimu",
+  "I don't hate you"; now "Aku benci dan tidak suka"). Regression tests in `tests/test_translate_offline.py`.
+- Latency assertions in tests scale with the machine's load (`tests/conftest.py::latency_budget`).
+- Full suite: **531 passed, 2 skipped** (the opt-in real-model tests for `local_llm` and `hymt`).
+
+**Bottom line.** Detection, OCR, inpainting and typesetting are solid on the pages with ground
+truth, including real B/W Manga109 scans (section 0). Translation works and is selectable per job,
+but offline models on CPU keep the meaning of roughly 2 in 3 lines on held-out material; for
+publication-grade Indonesian use an API LLM translator (`gemini`, `anthropic`, `openai`,
+`deepseek`, or `ollama` with a strong local model). Those are implemented and tested against
+recorded wire formats only, because no keys were available here.
+
 ## 0. Final fix round (2026-10-24, 15:00 to 16:20 UTC): what the reviewers found, what changed
 
 Four independent reviews found that most of the evidence below rests on one real page (page01, the

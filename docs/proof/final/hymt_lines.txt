@@ -1,0 +1,2 @@
+hymt           page01  adequate 9/13 chrF 37.4 conflicts 2 19s
+hymt           held    adequate 23/36 chrF 42.9 conflicts 9 22s

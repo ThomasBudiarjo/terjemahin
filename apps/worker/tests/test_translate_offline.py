@@ -355,3 +355,26 @@ def test_standardize_slang_before_particles():
 @pytest.mark.parametrize("text", ["聞いて！", "だからね！", "するからね", "なんでたまに", "君のせいでた", "うめ。"])
 def test_standardize_leaves_lookalikes(text):
     assert tp.standardize_ja(text)[0] == text
+
+
+@pytest.mark.parametrize(
+    "src, want",
+    [
+        ("ちょっとかも", "ちょっとかも"),  # the と of っと adverbs is not the hedge とか
+        ("きっとかは", "きっとかは"),
+        ("ずっとかもしれない", "ずっとかもしれない"),
+        ("嫌いでたまらない", "嫌いでたまらない"),  # "unbearably", not a progressive 嫌いでいた
+        ("痛くてたまらない", "痛くてたまらない"),
+        ("読んでる", "読んでいる"),
+        ("店員さんとかにも", "店員さんにも"),
+    ],
+)
+def test_standardize_keeps_lookalikes(src, want):
+    assert tp.standardize_ja(tp.normalize_ja(src))[0] == want
+
+
+def test_neutral_fuun_is_not_hmph():
+    assert tp.normalize_ja("ふーん、そう") == "ふうん、そう"
+    assert tp.normalize_ja("ふん！") == "ふん！"
+    prep = tp.prepare("ふーん", "ja", "id", [], True, True, True)
+    assert "Hmph" not in tp.finish(prep, "", "id")

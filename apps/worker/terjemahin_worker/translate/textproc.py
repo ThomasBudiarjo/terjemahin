@@ -223,6 +223,7 @@ def normalize_ja(text: str) -> str:
     text = _DOTS.sub("…", text)
     text = re.sub(r"ー{2,}", "ー", text).translate(_SMALL_VOWEL)
     text = re.sub(r"う[ー〜～]+ん", "ふむ", text)  # "hmm", before ー stripping turns it into "yes"
+    text = re.sub(r"ふ[ー〜～う]+ん", "ふうん", text)  # neutral "I see", not ふん "hmph"
     text = _ELONG_AFTER.sub("", text)
     text = _TRAIL_TSU.sub("", text)
     text = re.sub(r"([！？])[！？]+", lambda m: "？！" if "？" in m.group() and "！" in m.group() else m.group(1), text)
@@ -254,14 +255,15 @@ COLLOQUIAL_JA: list[tuple[str, str]] = [
     (r"ちゃう(?![ぁ-ゖ])", "てしまう"),
     # progressive てる/てた/てて after a te-form (使ってる, 聞いてた, してて, 食べてる); never
     # after the stems of verbs that end in て themselves (捨てる, 育てる, 慌てる)
-    (r"(?<=[っいしみきれけせべめげ])て(?=る|た|て|ない|ます)", "てい"),
-    (r"(?<=[んい])(?<!なん)(?<!せい)で(?=る|た|て)", "でい"),  # 読んでる, 泳いでた (not なんで)
+    # (not 〜でたまらない "unbearably": 嫌いでたまらない is a na-adjective, not 嫌いでいた)
+    (r"(?<=[っいしみきれけせべめげ])て(?=る|た(?!まら)|て|ない|ます)", "てい"),
+    (r"(?<=[んい])(?<!なん)(?<!せい)で(?=る|た(?!まら)|て)", "でい"),  # 読んでる, 泳いでた (not なんで)
     # とか as a hedge ("...or something"): dropped mid-sentence (店員さんとかにも) and at the end
-    # (not ことかも / 何とか / なんとか, where the と belongs to another word)
-    (r"(?<![こ何ひそ])(?<!なん)とか(?=[にもはがをでへ])", ""),
+    # (not ことかも / 何とか / なんとか / ちょっとかも, where the と belongs to another word)
+    (r"(?<![こ何ひそっ])(?<!なん)とか(?=[にもはがをでへ])", ""),
 ]
 _TOKA_END = re.compile(
-    rf"(?:(?<=[ぁ-ゖ一-鿿ー])(?:な|ね|よ)|(?<=[ぁ-ゖ一-鿿ー])(?<![こ何ひそ])(?<!なん)){_ELONG}とか{_ELONG}(?=[。！？….]*$)"
+    rf"(?:(?<=[ぁ-ゖ一-鿿ー])(?:な|ね|よ)|(?<=[ぁ-ゖ一-鿿ー])(?<![こ何ひそっ])(?<!なん)){_ELONG}とか{_ELONG}(?=[。！？….]*$)"
 )
 
 
@@ -302,7 +304,7 @@ INTERJECTIONS: dict[str, dict[str, str]] = {
         "ううん": "Nggak", "うん": "Iya", "うんうん": "Iya, iya", "ええ": "Iya",
         "はい": "Ya", "いや": "Nggak", "いいえ": "Bukan", "え": "Eh", "えと": "Anu", "えっと": "Anu",
         "あの": "Anu", "あ": "Ah", "ああ": "Ah", "あれ": "Lho", "お": "Oh", "おお": "Oh",
-        "わあ": "Wah", "うわ": "Uwah", "へえ": "Hee", "ほう": "Hoo", "ふむ": "Hmm",
+        "わあ": "Wah", "うわ": "Uwah", "へえ": "Hee", "ほう": "Hoo", "ふむ": "Hmm", "ふうん": "Hmm",
         "ふふ": "Fufu", "ふふふ": "Fufufu", "はは": "Haha", "あはは": "Ahaha", "ははは": "Hahaha",
         "へへ": "Hehe", "えへへ": "Ehehe", "くそ": "Sial", "ちくしょう": "Sialan",
         "ごめん": "Maaf", "ごめんなさい": "Maaf", "すみません": "Permisi", "ありがとう": "Makasih",
@@ -320,7 +322,7 @@ INTERJECTIONS: dict[str, dict[str, str]] = {
         "ううん": "Nope", "うん": "Yeah", "うんうん": "Uh-huh", "ええ": "Yes",
         "はい": "Yes", "いや": "No", "いいえ": "No", "え": "Huh", "えと": "Um", "えっと": "Um",
         "あの": "Um", "あ": "Ah", "ああ": "Ah", "あれ": "Huh", "お": "Oh", "おお": "Oh",
-        "わあ": "Wow", "うわ": "Whoa", "へえ": "Huh", "ほう": "Oho", "ふむ": "Hmm",
+        "わあ": "Wow", "うわ": "Whoa", "へえ": "Huh", "ほう": "Oho", "ふむ": "Hmm", "ふうん": "Hmm",
         "ふふ": "Hehe", "ふふふ": "Hehehe", "はは": "Haha", "あはは": "Ahaha", "ははは": "Hahaha",
         "へへ": "Hehe", "えへへ": "Ehehe", "くそ": "Damn", "ちくしょう": "Damn it",
         "ごめん": "Sorry", "ごめんなさい": "I'm sorry", "すみません": "Excuse me",

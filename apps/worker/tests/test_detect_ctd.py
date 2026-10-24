@@ -5,6 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+from conftest import latency_budget
 
 from terjemahin_worker.config import Settings
 from terjemahin_worker.detect.ctd_full import (
@@ -185,7 +186,7 @@ def test_page01_all_bubbles_separate_lines_and_fast(ctd):
     t = time.perf_counter()
     res = ctd.detect(page)
     elapsed = time.perf_counter() - t
-    assert elapsed < 5.0, f"ctd took {elapsed:.2f}s"  # ~0.6s on 4 idle cores
+    assert elapsed < latency_budget(5.0), f"ctd took {elapsed:.2f}s"  # ~0.6s on 4 idle cores
     hits = []
     for cx, cy in BUBBLES:
         inside = [
