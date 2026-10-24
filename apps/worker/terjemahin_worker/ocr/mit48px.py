@@ -9,6 +9,7 @@ colour; those are averaged per region and returned for the renderer.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,8 @@ MAX_LINE_WIDTH = TEXT_HEIGHT * 256  # warp cap; longer lines are squeezed
 # longer lines are cut at blank columns into pieces of at most PIECE_WIDTH.
 SPLIT_WIDTH = TEXT_HEIGHT * 32
 PIECE_WIDTH = TEXT_HEIGHT * 26
+CLOSERS = ".,!?;:)]}\"'%…"
+MAX_GAP = 3.0  # in line thicknesses: wider blank stretches along a line end it
 
 
 def order_quad(q: np.ndarray) -> np.ndarray:
@@ -80,9 +83,13 @@ def _runs(on: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(d[::2].tolist(), d[1::2].tolist()))
 
 
-def glyph_mask(crop: np.ndarray, font_size: int | None = None) -> np.ndarray:
+def glyph_mask(
+    crop: np.ndarray, font_size: int | None = None, vertical: bool = False
+) -> np.ndarray:
     """0/1 mask of lettering in a grey crop: Otsu ink of the minority polarity, minus connected
-    components too big to be a glyph (balloon tails, screentone, art behind the text)."""
+    components too thick ACROSS the line direction to be lettering (balloon edges, tails,
+    screentone, art). Extent along the line is unbounded: dash runs (――), kerned or touching
+    Latin pairs and bold glyphs fused into one blob are all still text."""
     _, ink = cv2.threshold(crop, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     border = np.concatenate([ink[0], ink[-1], ink[:, 0], ink[:, -1]])
     if border.mean() > 0.5:  # background is the bright class: ink is the dark one
@@ -90,10 +97,13 @@ def glyph_mask(crop: np.ndarray, font_size: int | None = None) -> np.ndarray:
     n, labels, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
     if n <= 1:
         return ink
+    across = stats[1:, cv2.CC_STAT_WIDTH if vertical else cv2.CC_STAT_HEIGHT]
+    # glyph size from each component's larger side: narrow marks (!, dashes, kana strokes) may
+    # outnumber full glyphs, and their across extent alone would make real glyphs look "big"
     size = np.maximum(stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT])
     big = size[stats[1:, cv2.CC_STAT_AREA] >= 12]
     fs = font_size or (float(np.percentile(big, 75)) if len(big) else min(crop.shape))
-    keep = np.concatenate([[0], (size <= 1.6 * fs).astype(np.uint8)])
+    keep = np.concatenate([[0], (across <= 1.6 * fs).astype(np.uint8)])
     return keep[labels]
 
 
@@ -104,8 +114,8 @@ def split_lines(gray: np.ndarray, region: TextRegion) -> list[np.ndarray]:
     crop = gray[b.y1 : b.y2, b.x1 : b.x2]
     if crop.size == 0:
         return []
-    ink = glyph_mask(crop, region.font_size)
     vertical = region.direction == "v"
+    ink = glyph_mask(crop, region.font_size, vertical)
     prof = ink.sum(0 if vertical else 1).astype(np.float32)
     runs = _runs(prof > max(1.0, 0.02 * ink.shape[0 if vertical else 1]))
     if not runs:
@@ -120,12 +130,21 @@ def split_lines(gray: np.ndarray, region: TextRegion) -> list[np.ndarray]:
             merged[-1][1] = e
         else:
             merged.append([s, e])
+    # the strong-profile runs stop at the baseline: grow each over its faint ink (descenders,
+    # commas, accents) up to 0.35 thickness, never past halfway to its neighbour
+    merged = [m for m in merged if m[1] - m[0] >= 0.3 * thick]
+    grow = int(0.35 * thick)
+    for k, (s, e) in enumerate(merged):
+        lo = max(s - grow, (merged[k - 1][1] + s) // 2 if k else 0)
+        hi = min(e + grow, (e + merged[k + 1][0] + 1) // 2 if k + 1 < len(merged) else len(prof))
+        while s > lo and prof[s - 1] > 0:
+            s -= 1
+        while e < hi and prof[e] > 0:
+            e += 1
+        merged[k] = [s, e]
     quads = []
     for s, e in merged:
-        if e - s < 0.3 * thick:
-            continue
-        band = (ink[:, s:e] if vertical else ink[s:e]).sum(1 if vertical else 0)
-        span = _main_span(band, thick)
+        span = _main_span(ink[:, s:e] if vertical else ink[s:e].T, thick)
         if span is None:
             continue
         a, z = span
@@ -136,9 +155,14 @@ def split_lines(gray: np.ndarray, region: TextRegion) -> list[np.ndarray]:
     return quads
 
 
-def _main_span(profile: np.ndarray, thick: float) -> tuple[int, int] | None:
-    """Extent of the inkiest stretch along a line, bridging inter-glyph gaps (< one glyph) so
-    stray marks well past the text (balloon edge, art) are not included."""
+def _main_span(slab: np.ndarray, thick: float) -> tuple[int, int] | None:
+    """Extent of the text along one line's ink slab (rows = along the line). Ink stretches
+    less than one line thickness apart are one group. From the inkiest group the line grows
+    over gaps of up to MAX_GAP thicknesses (word spaces, full-width spaces, ", " in monospaced
+    fonts) to the next group that fills at least half the line's thickness like a glyph, taking
+    small marks in between along; a lone stray stroke past the text (balloon edge, speed line
+    clipped by the box) has no glyph beyond it and is left out."""
+    profile = slab.sum(1)
     runs = _runs(profile > 0)
     if not runs:
         return None
@@ -148,8 +172,22 @@ def _main_span(profile: np.ndarray, thick: float) -> tuple[int, int] | None:
             groups[-1][1] = e
         else:
             groups.append([s, e])
-    a, z = max(groups, key=lambda g: profile[g[0] : g[1]].sum())
-    return int(a), int(z)
+    glyph = []
+    for s, e in groups:
+        cross = np.flatnonzero(slab[s:e].any(0))
+        glyph.append(cross[-1] - cross[0] + 1 >= 0.5 * thick)
+    gap = [groups[i + 1][0] - groups[i][1] for i in range(len(groups) - 1)]
+
+    def reach(k: int, step: int) -> int:
+        end, i = k, k
+        while 0 <= i + step < len(groups) and gap[min(i, i + step)] <= MAX_GAP * thick:
+            i += step
+            if glyph[i]:
+                end = i
+        return end
+
+    k = int(np.argmax([profile[s:e].sum() for s, e in groups]))
+    return groups[reach(k, -1)][0], groups[reach(k, 1)][1]
 
 
 def _rect(x1: float, y1: float, x2: float, y2: float) -> np.ndarray:
@@ -165,13 +203,23 @@ def reading_order(quads: list[np.ndarray], direction: str) -> list[int]:
 
 
 def join_lines(texts: list[str]) -> str:
-    """Concatenate line texts; a space only between Latin words split across lines."""
+    """Concatenate line texts; a space only where a Latin word or sentence breaks across lines."""
     out = ""
     for t in texts:
-        if out and t and _latin(out[-1]) and _latin(t[0]):
+        if out and t and word_break(out, t):
             out += " "
         out += t
     return out
+
+
+def word_break(prev: str, nxt: str) -> bool:
+    """Whether Latin text `prev` continued by `nxt` needs a space between them: after a word
+    or its closing punctuation ("THERE," + "HOW"), before a word or an opening quote. A trailing
+    hyphen glues ("WON-" + "DERFUL"); CJK ("あ!" + "10") never gets spaces."""
+    if not prev or not nxt or not (_latin(nxt[0]) or nxt[0] in "([{\"'"):
+        return False
+    word = prev.rstrip(CLOSERS)
+    return len(prev) - len(word) <= 3 and bool(word) and _latin(word[-1])
 
 
 def _latin(c: str) -> bool:
@@ -223,6 +271,30 @@ def _inside(q: np.ndarray, w: int, h: int) -> float:
     return ix * iy / max((x1 - x0) * (y1 - y0), 1e-6)
 
 
+def as_bgr8(img: np.ndarray) -> np.ndarray:
+    """Any grey/BGR/BGRA image, (h,w) or (h,w,c), 8/16-bit or float (0-1 or 0-255) as 8-bit BGR."""
+    img = np.asarray(img)
+    if img.dtype != np.uint8:
+        if img.dtype == np.uint16:
+            img = img >> 8
+        elif img.dtype.kind == "f" and img.size and float(np.nanmax(img)) <= 1.0:
+            img = img * 255.0
+        img = np.clip(np.nan_to_num(img), 0, 255).astype(np.uint8)
+    if img.ndim == 3 and img.shape[2] == 1:
+        img = img[..., 0]
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR) if img.shape[2] == 4 else img
+
+
+def default_threads() -> int:
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:  # not on Linux
+        cores = os.cpu_count() or 2
+    return max(1, cores // 2)
+
+
 def _rgb(v: np.ndarray) -> RGB:
     r, g, b = np.clip(np.round(v * 255), 0, 255).astype(int).tolist()
     return r, g, b
@@ -232,7 +304,9 @@ class Mit48pxOCR:
     """48px OCR.
 
     Options: beams (1 = greedy; same text here at ~same speed), batch (lines per forward),
-    threads (torch intra-op threads, process wide), min_line_conf (lines below are dropped),
+    threads (torch intra-op threads while reading; default half the usable cores, because
+    a fully subscribed CPU shared with other stages or workers runs 4-15x slower), min_line_conf
+    (lines below are dropped),
     margin (quad growth as a fraction of line thickness; 0.1 keeps edge punctuation), device.
     """
 
@@ -252,8 +326,7 @@ class Mit48pxOCR:
 
         from ._mit48px_model import OCR48px
 
-        if threads:
-            torch.set_num_threads(int(threads))
+        self.threads = int(threads) if threads else default_threads()
         with open(alphabet_path, encoding="utf-8") as f:
             self.alphabet = [s.rstrip("\n") for s in f]
         self.model = OCR48px(len(self.alphabet))
@@ -293,7 +366,7 @@ class Mit48pxOCR:
                 continue
             text = ""
             for (t, _, _), (_, _, space) in zip(part, sp):
-                text += " " + t if space and text and t and _latin(text[-1]) and _latin(t[0]) else t
+                text += " " + t if space and text and t and word_break(text, t) else t
             n = np.array([max(len(t), 1) for t, _, _ in part], np.float32)
             conf = float(np.exp((np.log([max(c, 1e-9) for _, c, _ in part]) * n).sum() / n.sum()))
             out.append((text, conf, np.concatenate([c for _, _, c in part])))
@@ -304,24 +377,26 @@ class Mit48pxOCR:
 
         out: list[Any] = [None] * len(crops)
         order = sorted(range(len(crops)), key=lambda i: crops[i].shape[1])
-        for s in range(0, len(order), self.batch):
-            idx = order[s : s + self.batch]
-            widths = [crops[i].shape[1] for i in idx]
-            # black right padding, 7px at least, as the reference (white/edge fill reads worse)
-            arr = np.zeros((len(idx), TEXT_HEIGHT, max(widths) + 7, 3), np.uint8)
-            for j, i in enumerate(idx):
-                arr[j, :, : widths[j]] = crops[i]
-            x = torch.from_numpy(arr).to(self.device).permute(0, 3, 1, 2).float() / 127.5 - 1
-            for i, d in zip(idx, self.model.decode(x, widths, beams=self.beams)):
-                text = "".join(self.text[t] for t in d.tokens).strip()
-                out[i] = (text, float(np.exp(d.logprob)), d.colors.cpu().numpy())
+        prev = torch.get_num_threads()
+        torch.set_num_threads(self.threads)  # scoped, so other torch stages keep their own
+        try:
+            for s in range(0, len(order), self.batch):
+                idx = order[s : s + self.batch]
+                widths = [crops[i].shape[1] for i in idx]
+                # black right padding, 7px at least, as the reference (white/edge reads worse)
+                arr = np.zeros((len(idx), TEXT_HEIGHT, max(widths) + 7, 3), np.uint8)
+                for j, i in enumerate(idx):
+                    arr[j, :, : widths[j]] = crops[i]
+                x = torch.from_numpy(arr).to(self.device).permute(0, 3, 1, 2).float() / 127.5 - 1
+                for i, d in zip(idx, self.model.decode(x, widths, beams=self.beams)):
+                    text = "".join(self.text[t] for t in d.tokens).strip()
+                    out[i] = (text, float(np.exp(d.logprob)), d.colors.cpu().numpy())
+        finally:
+            torch.set_num_threads(prev)
         return out
 
     def recognize(self, image_bgr: np.ndarray, regions: list[TextRegion]) -> list[OcrResult]:
-        if image_bgr.ndim == 2:
-            image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
-        elif image_bgr.shape[2] == 4:
-            image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_BGRA2BGR)
+        image_bgr = as_bgr8(image_bgr)
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         owner, dirs, crops = [], [], []

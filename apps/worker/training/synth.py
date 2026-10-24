@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 FONT_EXT = {".ttf", ".otf", ".ttc"}
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+EMIT = frozenset({"det", "ocr", "inpaint"})
 FONT_DIRS = [
     ROOT / "fonts",
     Path("/usr/share/fonts"),
@@ -343,6 +345,37 @@ def is_pixel_font(font: ImageFont.FreeTypeFont) -> bool:
 
 
 @lru_cache(maxsize=64)
+def bitmap_strikes(path: str, index: int) -> frozenset[int]:
+    """Pixel sizes at which the face ships embedded bitmaps (EBLC/bloc/CBLC strikes).
+
+    FreeType prefers a strike over the outlines at its exact ppem, so msgothic at 12-22px
+    draws 1-bit glyphs with misplaced vertical punctuation instead of the outline forms.
+    """
+    try:
+        b = _font_bytes(path)
+        t = _tables(b, index)
+    except (OSError, ValueError, IndexError):
+        return frozenset()
+    sizes: set[int] = set()
+    for tag in ("EBLC", "bloc", "CBLC"):
+        if tag in t:
+            o = t[tag][0]
+            for i in range(min(_u32(b, o + 4), 256)):
+                sizes.update(b[o + 8 + 48 * i + 44 : o + 8 + 48 * i + 46])
+    return frozenset(sizes)
+
+
+@lru_cache(maxsize=4096)
+def render_scale(path: str, index: int, size: int) -> int:
+    """Smallest integer supersampling factor whose render size uses the outlines."""
+    for k in range(1, 6):
+        s = size * k
+        if s not in bitmap_strikes(path, index) and not is_pixel_font(load_font(path, index, s)):
+            return k
+    return 6
+
+
+@lru_cache(maxsize=64)
 def _missing_glyph(path: str, index: int) -> bytes:
     return _render(load_font(path, index, 32), "\U0010fffd").tobytes()
 
@@ -466,7 +499,13 @@ def render_block(
     stroke: int,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """(fill alpha, fill+stroke alpha) of a text block, cropped to the stroked ink."""
+    """(fill alpha, fill+stroke alpha) of a text block, cropped to the stroked ink.
+
+    Sizes that hit an embedded bitmap strike are drawn k times larger from the outlines and
+    downscaled, so small text is antialiased like a real scan instead of 1-bit pixel art.
+    """
+    k = render_scale(face.path, face.index, size)
+    size, stroke = size * k, stroke * k
     font = load_font(face.path, face.index, size)
     pitch = size * (1.0 + rng.uniform(0.05, 0.45))
     pad = size + stroke * 2
@@ -500,7 +539,12 @@ def render_block(
     if not len(ys):
         return fill[:1, :1], outer[:1, :1]
     y1, y2, x1, x2 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-    return fill[y1:y2, x1:x2], outer[y1:y2, x1:x2]
+    fill, outer = fill[y1:y2, x1:x2], outer[y1:y2, x1:x2]
+    if k > 1:
+        dsize = (max(1, round(fill.shape[1] / k)), max(1, round(fill.shape[0] / k)))
+        fill = cv2.resize(fill, dsize, interpolation=cv2.INTER_AREA)
+        outer = cv2.resize(outer, dsize, interpolation=cv2.INTER_AREA)
+    return fill, outer
 
 
 @lru_cache(maxsize=4096)
@@ -907,8 +951,16 @@ def generate(
 ) -> dict:
     if not fonts:
         raise SystemExit("no Japanese-capable fonts found; pass --fonts DIR_OR_FILE")
-    dirs = [out / "det" / k / s for k in ("images", "labels") for s in ("train", "val")]
-    dirs += [out / "ocr" / "crops"] + [out / "inpaint" / k for k in ("clean", "mask", "texted")]
+    if bad := set(emit) - EMIT:
+        raise ValueError(f"unknown --emit value(s) {sorted(bad)}; choose from {sorted(EMIT)}")
+    dirs = []
+    if "det" in emit:
+        dirs += [out / "det" / k / s for k in ("images", "labels") for s in ("train", "val")]
+    if "ocr" in emit:
+        dirs.append(out / "ocr" / "crops")
+    if "inpaint" in emit:
+        dirs += [out / "inpaint" / k for k in ("clean", "mask", "texted")]
+    out.mkdir(parents=True, exist_ok=True)
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
     n_val = max(1, round(n * val_ratio)) if n > 1 and val_ratio > 0 else 0
@@ -928,14 +980,11 @@ def generate(
 
     thumbs, crops_preview = [], []
     n_blocks = n_vertical = 0
-    jsonl = {k: out / "ocr" / f"{k}.jsonl" for k in ("train", "val")}
     try:
-        with (
-            open(jsonl["train"], "w", encoding="utf-8") as tr,
-            open(jsonl["val"], "w", encoding="utf-8") as va,
-            open(out / "pages.jsonl", "w", encoding="utf-8") as pages_f,
-        ):
-            ocr = {"train": tr, "val": va}
+        with contextlib.ExitStack() as stack:
+            pages_f = stack.enter_context(open(out / "pages.jsonl", "w", encoding="utf-8"))
+            ocr = {k: stack.enter_context(open(out / "ocr" / f"{k}.jsonl", "w", encoding="utf-8"))
+                   for k in ("train", "val") if "ocr" in emit}
             for record, rows, thumb, crops in results:
                 pages_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 for split, row in rows:
@@ -949,10 +998,11 @@ def generate(
         if pool is not None:
             pool.close()
             pool.join()
-    (out / "det" / "dataset.yaml").write_text(
-        f"path: {(out / 'det').resolve()}\ntrain: images/train\nval: images/val\n"
-        "names:\n  0: text\n"
-    )
+    if "det" in emit:
+        (out / "det" / "dataset.yaml").write_text(
+            f"path: {(out / 'det').resolve()}\ntrain: images/train\nval: images/val\n"
+            "names:\n  0: text\n"
+        )
     if thumbs:
         cv2.imwrite(str(out / "preview.jpg"), grid(thumbs, 360), [cv2.IMWRITE_JPEG_QUALITY, 85])
     if crops_preview:
@@ -1016,6 +1066,9 @@ def main(argv: list[str] | None = None) -> dict:
                     help="share of corpus lines reserved for validation pages")
     ap.add_argument("--emit", default="det,ocr,inpaint", help="outputs to write")
     a = ap.parse_args(argv)
+    emit = frozenset(e.strip() for e in a.emit.split(",") if e.strip())
+    if not emit or emit - EMIT:
+        ap.error(f"--emit: unknown {sorted(emit - EMIT) or a.emit!r}; choose from {sorted(EMIT)}")
 
     fonts = find_fonts(a.fonts if a.fonts else FONT_DIRS, a.any_cjk_font)
     if not fonts:
@@ -1028,7 +1081,7 @@ def main(argv: list[str] | None = None) -> dict:
     corpus = load_corpus(a.corpus, load_vocab(a.vocab))
     cfg = Config(vertical=a.vertical)
     meta = generate(a.out, a.n, a.seed, fonts, corpus, bgs, a.val_ratio, cfg, a.preview,
-                    a.workers, a.val_corpus_ratio, frozenset(a.emit.split(",")))
+                    a.workers, a.val_corpus_ratio, emit)
     print(json.dumps(meta, indent=2, ensure_ascii=False), file=sys.stderr)
     print(f"preview: {a.out / 'preview.jpg'}  ocr: {a.out / 'ocr_preview.jpg'}")
     return meta

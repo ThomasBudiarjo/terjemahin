@@ -96,7 +96,11 @@ def test_translator_finetune_roundtrip(tmp_path):
     ln = sum(p.numel() for p in model.get_decoder().layer_norm.parameters())
     assert trainable == layer + ln < total
     tr_all, _ = tt.freeze(model, False, False, -1)
-    assert tr_all == total - model.get_input_embeddings().weight.numel()
+    emb = model.get_input_embeddings().weight.numel()
+    assert tr_all == total - emb
+    assert tt.freeze(model, True, False, 1)[0] == layer + ln + emb  # embeddings combine with N layers
+    enc = sum(p.numel() for n, p in model.named_parameters() if ".encoder." in n and "embed" not in n)
+    assert tt.freeze(model, False, True, -1)[0] == total - emb - enc
 
     data = tmp_path / "c.jsonl"
     data.write_text("\n".join(json.dumps({"src": s, "tgt": t}, ensure_ascii=False) for s, t in [
@@ -122,6 +126,13 @@ def test_translator_finetune_roundtrip(tmp_path):
                               model.get_decoder().layers[-1].fc1.weight, atol=1e-4)
     assert torch.allclose(tuned.get_decoder().layers[0].fc1.weight,
                           model.get_decoder().layers[0].fc1.weight, atol=1e-4)
+    val = tmp_path / "v.tsv"  # held-out file overlapping the data: its sources leave training
+    val.write_text("ありがとう\tMakasih\n待って！\tTunggu!\n")
+    res = tt.main(["--data", str(data), "--val", str(val), "--model", str(base), "--out",
+                   str(tmp_path / "acc"), "--epochs", "1", "--batch", "1", "--grad-accum", "3",
+                   "--eval-beams", "1", "--no-baseline", "--decoder-layers", "1"])
+    assert (res["steps"], res["epochs"]) == (2, 1)  # 4 micro-batches = 3 + a stepped tail of 1
+
     outs = Seq2SeqTranslator(str(out), "nllb", num_beams=1, retries=0).translate_texts(
         ["ありがとう", "坂本くん？"], "ja", "id")
     assert len(outs) == 2 and all(isinstance(s, str) for s in outs)
@@ -194,6 +205,25 @@ def test_inpaint_train_export_and_run_through_lama(tmp_path):
     ck = torch.load(tmp_path / "run" / "best.pt", weights_only=False)
     assert ck["config"] == {"ch": 8, "blocks": 1}
 
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    odd = {"image": np.random.rand(1, 3, 101, 99).astype(np.float32),
+           "mask": np.zeros((1, 1, 101, 99), np.float32)}
+    odd["mask"][..., 40:60, 30:50] = 1
+    y = sess.run(None, odd)[0]  # H, W not multiples of 4: padded inside the graph
+    assert y.shape == (1, 3, 101, 99)
+    keep = odd["mask"][:, 0] == 0
+    assert np.allclose(y.transpose(1, 0, 2, 3)[:, keep], odd["image"].transpose(1, 0, 2, 3)[:, keep])
+
+    from terjemahin_worker.config import get_settings
+    from terjemahin_worker.registry import INPAINTERS
+
+    factory = INPAINTERS.get("lama_manga").factory  # `--opt inpainter.weights=` reaches lama.py
+    assert factory(get_settings(), weights=str(onnx_path)).model == onnx_path
+    with pytest.raises(FileNotFoundError):
+        factory(get_settings(), weights=str(tmp_path / "missing.onnx"))
+
     img = np.full((200, 240, 3), 255, np.uint8)
     img[::6] = 40
     mask = np.zeros((200, 240), np.uint8)
@@ -201,6 +231,18 @@ def test_inpaint_train_export_and_run_through_lama(tmp_path):
     out = LamaInpainter(onnx_path, out_scale=1.0, flat_tol=0, dilate=0, feather=0).inpaint(img, mask)
     assert out.shape == img.shape
     assert np.array_equal(out[mask == 0], img[mask == 0])
+
+
+def test_inpaint_eval_ignores_holeless_val_pages(tmp_path):
+    """A held-out page without holes must not yield a perfect score that pins best.pt to step 0."""
+    _write_triplets(tmp_path / "data")
+    cv2.imwrite(str(tmp_path / "data" / "inpaint" / "mask" / "000000.png"), np.zeros((160, 160), np.uint8))
+    res = ti.main(["--data", str(tmp_path / "data"), "--init", "none", "--ch", "8", "--blocks", "1",
+                   "--size", "96", "--batch", "2", "--steps", "2", "--eval-every", "1",
+                   "--val-ratio", "0.34", "--val-crops", "2", "--warmup", "1",
+                   "--out", str(tmp_path / "run")])
+    assert all(h["hole_px"] > 0 and h["psnr_hole"] < 80 for h in res["history"])
+    assert ti.evaluate(ti.AOTGenerator(ch=8, blocks=1), [])["psnr_hole"] is None
 
 
 @pytest.mark.skipif(not AOT_CKPT.exists(), reason="weights/aot-inpainting.ckpt not downloaded")

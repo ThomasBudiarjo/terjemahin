@@ -264,3 +264,167 @@ def test_bench_on_page01_real_models(tmp_path):
     assert m["translation"]["japanese"] == m["translation"]["outputs"]  # passthrough is caught
     assert m["inpaint"]["outside_far_changed"] == 0 and m["inpaint"]["outside_mad"] < 0.5
     assert m["render"]["bubbles"] >= 12 and m["render"]["lost"] == 0
+
+
+# -- proof hardening: read-back, duplicates, meaning, vacuous passes -------------------------
+
+
+def test_ink_lines_joins_dots_and_splits_touching_lines():
+    ink = np.zeros((120, 200), np.uint8)
+    ink[10:12, 20:24] = 1  # an i-dot band above line 1
+    ink[14:30, 20:150] = 1
+    ink[40:56, 20:120] = 1
+    ink[60:92, 30:160] = 1  # two lines touching: one tall band
+    ink[75:77, 30:160] = 0  # ...with an emptier row between them
+    quads = M.ink_lines(ink, pad=0)
+    ys = [(int(q[0, 1]), int(q[2, 1])) for q in quads]
+    assert len(quads) == 4 and ys[0] == (10, 30) and ys[1] == (40, 56)
+    assert abs(ys[2][1] - 76) <= 3 and ys[3][1] == 92
+    assert int(quads[1][1, 0]) == 120
+    assert M.ink_lines(np.zeros((5, 5), np.uint8)) == []
+
+
+def test_match_detections_flags_duplicates():
+    gt = ["坂本くん？", "えー、それだけー？"]
+    boxes = [BBox(x1=0, y1=0, x2=50, y2=100), BBox(x1=100, y1=0, x2=150, y2=100)]
+    s = M.match_detections(["坂本くん？", "えー、それだけー？", "坂本くん？"], gt, boxes=boxes + [boxes[0]])
+    assert s.duplicates == [2] and not s.fragments and not s.false_positives
+    # same box, partial text (a second detection over the same bubble) is a duplicate too
+    s = M.match_detections(["坂本くん？", "それだけ"], gt[:1], boxes=[boxes[0], boxes[0]])
+    assert s.duplicates == [1]
+
+
+def _reader_from(texts):
+    calls = []
+
+    def read(img, quads):
+        calls.append(quads)
+        return [texts[i] if q else "" for i, q in enumerate(quads)]
+
+    return read, calls
+
+
+def test_render_check_read_back_catches_dropped_words():
+    page, box = _balloon_page()
+    b = _bubble(box, "Halo dunia yang indah")
+    drawn = page.copy()
+    cv2.putText(drawn, "Halo", (160, 205), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+    read, calls = _reader_from(["Halo"])
+    [r], _ = M.render_check(page, drawn, page, [b], reader=read)
+    assert calls and len(calls[0][0]) == 1  # one line quad around the drawn word
+    assert r.read_text == "Halo" and r.read_cer > M.LOST_CER and r.lost
+    read, _ = _reader_from(["HALO DUNIA YANG IN-DAH"])  # case and hyphens do not count
+    [r], _ = M.render_check(page, drawn, page, [b], reader=read)
+    assert r.read_cer == 0.0 and not r.lost and r.read_chars == M.count_chars(b.target_text)
+    [r], _ = M.render_check(page, drawn, page, [_bubble(box, "こんにちは")], reader=read)
+    assert r.read_text is None  # CJK targets are not read back as Latin lines
+
+
+def _metrics(**kw):
+    base = {
+        "detection": {"recall": 1.0, "false_positives": 0, "duplicates": 0, "gt_bubbles": 2},
+        "translation": {"chrf": 40.0, "empty": 0, "japanese": 0, "semantic": {"adequate_frac": 1.0}},
+        "inpaint": {
+            "mask_px": 100, "residual_regions": 0, "dark_residue": 0.0, "ghost_residue": 0.0,
+            "outside_mad": 0.0, "outside_far_changed": 0,
+        },
+        "render": {
+            "bubbles": 2, "all_inside": True, "lost": 0, "chars_rendered": 0, "chars_target": 0,
+            "chars_checked": 0, "min_font_px": 14.0, "read_back": True, "read_cer_mean": 0.02,
+            "read_cer_max": 0.1,
+        },
+    }
+    for k, v in kw.items():
+        base[k] = base[k] | v
+    return base
+
+
+def test_checks_refuse_vacuous_and_unverified_passes():
+    assert all(B.checks(_metrics()).values())
+    assert B.checks(_metrics(detection={"duplicates": 1}))["detect"] is False
+    assert B.checks(_metrics(translation={"semantic": {"adequate_frac": 0.5}}))["translate"] is False
+    assert B.checks(_metrics(translation={"semantic": None}))["translate"] is True  # chrF only
+    assert B.checks(_metrics(inpaint={"mask_px": 0}))["inpaint"] is False  # nothing erased
+    no_gt = _metrics(inpaint={"mask_px": 0})
+    no_gt.pop("detection")
+    assert B.checks(no_gt)["inpaint"] is None
+    assert B.checks(_metrics(render={"read_cer_max": 0.6}))["render"] is False
+    # no read-back and no layout: completeness unproven -> n/a, never a pass
+    assert B.checks(_metrics(render={"read_back": False}))["render"] is None
+    assert B.checks(_metrics(render={"read_back": False, "lost": 1}))["render"] is False
+
+
+def test_estimate_total_uses_warm_time_for_cached_stages():
+    run = {"latency_s": {"detect": 0.5, "translate": 40.0, "inpaint": 0.2}, "cached_stages": ["translate"]}
+    assert B.estimate_total(run, {"translate": 3.0}) == 3.7
+    assert B.estimate_total(run, {}) == 40.7
+
+
+def test_translation_meaning_with_fake_embedder(monkeypatch):
+    from terjemahin_worker.eval import semantic
+
+    class Fake:
+        def similarity(self, hyps, refs):
+            return np.array([[1.0 if h in (r, "坂本くん？") else 0.3 for r in refs] for h in hyps])
+
+    monkeypatch.setattr(semantic, "get_embedder", lambda: Fake())
+    gt = B.GroundTruth(["坂本くん？", "うんうん"], ["Sakamoto-kun?", "Iya, iya"])
+    bubbles = [_bubble(BBox(x1=0, y1=0, x2=9, y2=9), "Sakamoto-kun?")]
+    s = M.match_detections(["坂本くん？"], gt.ja)
+    t = B.score_translation(bubbles, gt, s, 0.8)
+    assert t["semantic"]["adequate"] == 1 and t["semantic"]["inadequate_gt"] == [1]
+    assert t["semantic"]["own_sim"] == [1.0, 0.0] and t["semantic"]["aligned"] == 1
+    bubbles[0].target_text = "坂本くん？"  # passthrough scores 0 whatever the embedder says
+    assert B.score_translation(bubbles, gt, s, 0.8)["semantic"]["adequate"] == 0
+
+
+def test_cli_rejects_unknown_method(tmp_path):
+    from typer.testing import CliRunner
+
+    from terjemahin_worker.eval.__main__ import app
+
+    r = CliRunner().invoke(app, ["bench", "--page", str(PAGE), "--out", str(tmp_path), "-d", "nope"])
+    assert r.exit_code == 2 and "unknown detector 'nope'" in r.output
+
+
+def _embedder_cached() -> bool:
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        from terjemahin_worker.eval.semantic import MODEL_FILE, REPO
+
+        return isinstance(try_to_load_from_cache(REPO, MODEL_FILE), str)
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _embedder_cached(), reason="multilingual MiniLM not in the HF cache")
+def test_semantic_similarity_separates_paraphrase_from_wrong_meaning():
+    from terjemahin_worker.eval.semantic import get_embedder
+
+    emb = get_embedder()
+    refs = ["Eh, cuma itu?", "Hmm, gimana ya... dia baik, kan?", "Fufu, terus apa lagi?"]
+    hyps = ["Eh, itu saja?", "Hmm, ya, baik-baik saja", ""]
+    sim = emb.similarity(hyps, refs)
+    assert sim[0, 0] >= 0.8 > sim[1, 1]  # paraphrase vs wrong meaning (both low chrF)
+    assert sim[2, 2] == 0.0
+    concat = emb.similarity([" ".join(refs)], refs)
+    assert concat.max() < 0.8  # pasting every reference is not a translation
+
+
+READER_W = [WEIGHTS / "ocr_ar_48px.ckpt", WEIGHTS / "alphabet-all-v7.txt"]
+
+
+@pytest.mark.skipif(not all(p.exists() for p in READER_W), reason="48px OCR weights missing")
+def test_read_back_with_real_48px_reader():
+    from PIL import Image, ImageDraw, ImageFont
+
+    page = np.full((160, 420, 3), 255, np.uint8)
+    img = Image.fromarray(page)
+    font = ImageFont.truetype(str(Settings().font_path), 26)
+    ImageDraw.Draw(img).multiline_text((10, 10), "Aku pikir reaksi\nmereka selalu lucu", fill=(0, 0, 0), font=font)
+    final = np.asarray(img).copy()
+    pipe = B.BenchPipeline(Settings())
+    b = _bubble(BBox(x1=0, y1=0, x2=420, y2=160), "Aku pikir reaksi mereka selalu lucu")
+    [r], _ = M.render_check(page, final, page, [b], reader=pipe.reader())
+    assert r.read_cer is not None and r.read_cer <= 0.1, r.read_text

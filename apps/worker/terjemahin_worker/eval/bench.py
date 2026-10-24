@@ -4,6 +4,10 @@
 defaults. Expensive stage calls (detect, OCR, translate, inpaint) are memoised on their inputs,
 so a renderer variant does not re-run the detector; reported latencies are always the measured
 time of the real call, never of a cache hit.
+
+The judges are independent of the methods under test: inpainting is re-read by the baseline
+detector + OCR, rendered text by the 48px OCR on a blank canvas of the drawn ink, and
+translation meaning by a multilingual sentence-embedding model (eval/semantic.py).
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from ..config import Settings
-from ..models import Bubble, PipelineConfig
+from ..models import Bubble, PipelineConfig, TextRegion
 from ..pipeline import Pipeline, draw_regions
 from ..registry import REGISTRIES, STAGES
 from . import metrics as M
@@ -48,6 +52,8 @@ TIMING_KEY = {
     "renderer": "render",
 }
 MEMO_STAGES = {"detector", "ocr", "translator", "inpainter"}
+READER_OCR = "48px"  # reads rendered Latin text back: trained on mixed ja/en lines
+CJK_TARGETS = {"ja", "zh", "ko"}
 HEAVY_DOWNLOAD = re.compile(r"downloads? ~?\d", re.IGNORECASE)
 NEEDS_SERVER = {"translator:ollama": "needs a running Ollama server (OLLAMA_BASE_URL)"}
 
@@ -57,12 +63,17 @@ THRESHOLDS = {
     "false_positives": 0,
     "ocr_cer": 0.15,
     "chrf": 25.0,
+    "semantic_sim": 0.8,  # a bubble's translation counts as adequate at this cosine or above
+    "adequate_frac": 0.7,  # share of GT bubbles that must be adequately translated
     "residual_regions": 0,
     "dark_residue": 0.01,
     "ghost_residue": 0.01,
     "outside_mad": 0.5,
     "outside_far_changed": 0,
+    "outside_ring_px": 8,  # changes this close to the mask are edge feathering (0 = strict)
     "inside_frac": 0.99,
+    "read_cer_mean": 0.1,  # rendered text read back vs the translation, letters only
+    "read_cer_max": 0.34,
     "min_font_px": 10.0,
 }
 
@@ -137,6 +148,24 @@ class BenchPipeline(Pipeline):
         self.use_memo = True
         self.calls: dict[str, Call] = {}
         self.load_seconds: dict[str, float] = {}
+        self.thresholds = dict(THRESHOLDS)
+        self._reader: M.Reader | None | bool = False  # False: not built yet
+
+    def reader(self) -> M.Reader | None:
+        """Independent OCR for rendered Latin text (built once; None when unavailable)."""
+        if self._reader is False:
+            self._reader = None
+            if self.settings.target_lang in CJK_TARGETS:
+                log.warning("render read-back skipped: CJK target language")
+            elif READER_OCR in REGISTRIES["ocr"].methods:
+                try:
+                    t = time.perf_counter()
+                    ocr = REGISTRIES["ocr"].build(READER_OCR, self.settings, beams=1, min_line_conf=0.0)
+                    self.load_seconds[f"judge:{READER_OCR}"] = time.perf_counter() - t
+                    self._reader = _ocr_reader(ocr)
+                except Exception as e:  # noqa: BLE001 - the bench runs on, reporting n/a
+                    log.warning("render read-back unavailable (%s: %s)", type(e).__name__, e)
+        return self._reader
 
     def stage(self, stage: str, cfg: PipelineConfig) -> Any:
         name = getattr(cfg, stage)
@@ -148,6 +177,25 @@ class BenchPipeline(Pipeline):
             self.load_seconds[f"{stage}:{name}"] = time.perf_counter() - t
             self._cache[key] = _Timed(self, stage, name, inner)
         return self._cache[key]
+
+
+def _ocr_reader(ocr: Any) -> M.Reader:
+    def read(image: np.ndarray, quads: list[list[np.ndarray]]) -> list[str]:
+        idx = [i for i, q in enumerate(quads) if q]
+        regions = []
+        for k, i in enumerate(idx):
+            pts = np.concatenate(quads[i])
+            (x1, y1), (x2, y2) = pts.min(0).astype(int), np.ceil(pts.max(0)).astype(int)
+            lines = [[(int(x), int(y)) for x, y in q] for q in quads[i]]
+            regions.append(
+                TextRegion(id=k, bbox={"x1": x1, "y1": y1, "x2": x2, "y2": y2}, lines=lines, direction="h")
+            )
+        out = [""] * len(quads)
+        for i, r in zip(idx, ocr.recognize(image, regions) if regions else []):
+            out[i] = r.text
+        return out
+
+    return read
 
 
 # -- one run ------------------------------------------------------------------------------
@@ -172,8 +220,10 @@ def _bbox(b: Any) -> list[int] | None:
     return [b.x1, b.y1, b.x2, b.y2] if b is not None else None
 
 
-def score_detection(texts: list[str], gt: GroundTruth) -> tuple[dict, M.DetectionScore]:
-    s = M.match_detections(texts, gt.ja, gt.sfx)
+def score_detection(
+    texts: list[str], gt: GroundTruth, boxes: list | None = None
+) -> tuple[dict, M.DetectionScore]:
+    s = M.match_detections(texts, gt.ja, gt.sfx, boxes=boxes)
     return {
         "gt_bubbles": s.n_gt,
         "detections": s.n_det,
@@ -181,6 +231,7 @@ def score_detection(texts: list[str], gt: GroundTruth) -> tuple[dict, M.Detectio
         "recall": len(s.matches) / max(1, s.n_gt),
         "false_positives": len(s.false_positives),
         "fragments": len(s.fragments),
+        "duplicates": len(s.duplicates),
         "sfx_hits": len(s.sfx),
         "missed_gt": s.missed,
     }, s
@@ -195,12 +246,38 @@ def score_ocr(s: M.DetectionScore) -> dict:
     }
 
 
-def score_translation(bubbles: list[Bubble], gt: GroundTruth, s: M.DetectionScore) -> dict:
+def score_translation(
+    bubbles: list[Bubble], gt: GroundTruth, s: M.DetectionScore, sim_min: float
+) -> dict:
+    """chrF against id_ref, plus meaning: embedding similarity of each GT bubble's translation
+    to its own reference (missed bubbles score 0), and whether its own reference is the
+    closest of all (catches outputs shifted between bubbles or padded with other lines)."""
+    from .semantic import get_embedder
+
     by_gt = {m.gt: bubbles[m.det].target_text for m in s.matches}
     hyps_all = [by_gt.get(g, "") for g in range(len(gt.ja))]
     matched = sorted(by_gt)
     targets = [b.target_text for b in bubbles]
-    return {
+    sem: dict[str, Any] = {"semantic": None}
+    emb = get_embedder() if gt.id_ref and all(gt.id_ref) else None
+    if emb is not None:
+        sim = np.array(emb.similarity(hyps_all, gt.id_ref), np.float64)
+        # an empty or untranslated bubble is not adequate, however close the cross-lingual
+        # embedding puts the Japanese to its reference
+        sim[[not h.strip() or M.is_japanese(h) for h in hyps_all]] = 0.0
+        own = np.diag(sim)
+        ok = own >= sim_min
+        sem = {
+            "semantic": {
+                "own_sim": [round(float(x), 3) for x in own],
+                "mean_sim": float(own.mean()),
+                "adequate": int(ok.sum()),
+                "adequate_frac": float(ok.mean()),
+                "aligned": int(sum(int(np.argmax(sim[g])) == g for g in range(len(own)))),
+                "inadequate_gt": [int(g) for g in np.flatnonzero(~ok)],
+            }
+        }
+    return sem | {
         "chrf": M.chrf(hyps_all, gt.id_ref),
         "chrf_pp": M.chrf(hyps_all, gt.id_ref, word_order=2),
         "chrf_matched": M.chrf([by_gt[g] for g in matched], [gt.id_ref[g] for g in matched])
@@ -223,7 +300,10 @@ def score_inpaint(
     """Pixels outside the mask must be untouched; the judge detector + OCR must find no text
     left inside the erased areas."""
     out = {"mask_px": int((mask > 0).sum())}
-    out.update({f"outside_{k}": v for k, v in M.outside_mask_change(original, inpainted, mask).items()})
+    ring = int(pipe.thresholds["outside_ring_px"])
+    out.update(
+        {f"outside_{k}": v for k, v in M.outside_mask_change(original, inpainted, mask, ring).items()}
+    )
     zone = cv2.dilate((mask > 0).astype(np.uint8), np.ones((15, 15), np.uint8))
     regions = pipe.stage("detector", judge).detect(inpainted).regions
     inside = [r for r in regions if M.box_overlap(zone, r.bbox) >= 0.5]
@@ -250,12 +330,18 @@ def score_inpaint(
 
 
 def score_render(
-    inpainted: np.ndarray, final: np.ndarray, original: np.ndarray, bubbles: list[Bubble], plans
+    inpainted: np.ndarray,
+    final: np.ndarray,
+    original: np.ndarray,
+    bubbles: list[Bubble],
+    plans,
+    reader: M.Reader | None = None,
 ) -> tuple[dict, list[dict], np.ndarray]:
     drawn = [b for b in bubbles if b.target_text.strip()]
-    boxes, overlay = M.render_check(inpainted, final, original, drawn, plans)
+    boxes, overlay = M.render_check(inpainted, final, original, drawn, plans, reader)
     fonts = [b.font_px for b in boxes if b.font_px]
     known = [b for b in boxes if b.rendered_chars is not None]
+    read = [b for b in boxes if b.read_cer is not None]
     summary = {
         "bubbles": len(boxes),
         "all_inside": all(b.inside_frac >= THRESHOLDS["inside_frac"] and b.bbox_inside for b in boxes),
@@ -265,6 +351,11 @@ def score_render(
         "chars_checked": len(known),
         "chars_target": sum(b.target_chars for b in known),
         "chars_rendered": sum(b.rendered_chars or 0 for b in known),
+        "read_back": bool(read),
+        "read_cer_mean": float(np.mean([b.read_cer for b in read])) if read else None,
+        "read_cer_max": max((b.read_cer for b in read), default=None),
+        "chars_read": sum(b.read_chars or 0 for b in read),
+        "chars_read_target": sum(b.target_chars for b in read),
         "overflow": sum(b.fits is False for b in boxes),
         "min_font_px": min(fonts) if fonts else None,
         "median_font_px": float(np.median(fonts)) if fonts else None,
@@ -281,39 +372,64 @@ def score_render(
             "rendered_chars": b.rendered_chars,
             "font_px": b.font_px,
             "fits": b.fits,
+            "read_text": b.read_text,
+            "read_cer": None if b.read_cer is None else round(b.read_cer, 3),
         }
         for b in boxes
     ]
     return summary, per, overlay
 
 
-def checks(m: dict) -> dict[str, bool | None]:
-    """Pass/fail per criterion (None: not measurable for this run)."""
-    T = THRESHOLDS
+def checks(m: dict, T: dict | None = None) -> dict[str, bool | None]:
+    """Pass/fail per criterion (None: not measurable for this run).
+
+    Render text completeness needs proof from pixels (independent read-back) or at least the
+    renderer's own layout; with neither, render is None rather than a pass.
+    """
+    T = T or THRESHOLDS
     d, o, t, i, r = (m.get(k) or {} for k in ("detection", "ocr", "translation", "inpaint", "render"))
     out: dict[str, bool | None] = {}
     if d:
-        out["detect"] = d["recall"] >= T["detect_recall"] - 1e-9 and d["false_positives"] <= T["false_positives"]
+        out["detect"] = (
+            d["recall"] >= T["detect_recall"] - 1e-9
+            and d["false_positives"] <= T["false_positives"]
+            and d.get("duplicates", 0) == 0
+        )
     if o:
         out["ocr"] = o["mean_cer"] is not None and o["mean_cer"] <= T["ocr_cer"]
     if t:
-        out["translate"] = t["chrf"] >= T["chrf"] and t["empty"] == 0 and t["japanese"] == 0
+        sem = t.get("semantic")
+        out["translate"] = (
+            t["chrf"] >= T["chrf"]
+            and t["empty"] == 0
+            and t["japanese"] == 0
+            and (sem is None or sem["adequate_frac"] >= T["adequate_frac"] - 1e-9)
+        )
     if i:
+        erased = i["mask_px"] > 0
         out["inpaint"] = (
-            i["residual_regions"] <= T["residual_regions"]
+            erased
+            and i["residual_regions"] <= T["residual_regions"]
             and i["dark_residue"] <= T["dark_residue"]
             and i["ghost_residue"] <= T["ghost_residue"]
             and i["outside_mad"] <= T["outside_mad"]
             and i["outside_far_changed"] <= T["outside_far_changed"]
+        ) if erased or d.get("gt_bubbles") else None
+    if r and r["bubbles"]:
+        read_ok = r.get("read_back") and (
+            r["read_cer_mean"] <= T["read_cer_mean"] and r["read_cer_max"] <= T["read_cer_max"]
         )
-    if r:
-        out["render"] = (
-            r["bubbles"] > 0
-            and r["all_inside"]
+        verified = bool(r.get("read_back")) or r["chars_checked"] > 0
+        ok = (
+            r["all_inside"]
             and r["lost"] == 0
             and r["chars_rendered"] >= r["chars_target"]
             and (r["min_font_px"] or 0) >= T["min_font_px"]
-        ) if r["bubbles"] else None
+            and (read_ok if r.get("read_back") else True)
+        )
+        out["render"] = (ok if verified else None) if ok else False
+    elif r:
+        out["render"] = None
     return out
 
 
@@ -341,6 +457,7 @@ def evaluate(
         "options": resolved.options,
         "latency_s": latency,
         "latency_total_s": round(sum(latency.values()), 3),
+        "latency_own_s": round(sum(c.seconds for c in calls.values() if not c.cached), 3),
         "wall_s": round(wall, 3),
         "cached_stages": cached,
         "regions_detected": len(det_call.result.regions) if det_call else None,
@@ -359,9 +476,10 @@ def evaluate(
         for b, r in zip(bubbles, read)
     ]
     if gt is not None:
-        m["detection"], s = score_detection(read, gt)
+        m["detection"], s = score_detection(read, gt, [b.region.bbox for b in bubbles])
         m["ocr"] = score_ocr(s)
-        m["translation"] = score_translation(bubbles, gt, s)
+        m["translation"] = score_translation(bubbles, gt, s, pipe.thresholds["semantic_sim"])
+        sem = m["translation"]["semantic"]
         for mt in s.matches:
             pb = per_bubble[mt.det]
             pb.update(
@@ -371,22 +489,28 @@ def evaluate(
                 cer=round(mt.cer, 3),
                 chrf=round(M.chrf([pb["target"]], [gt.id_ref[mt.gt]]), 1),
             )
+            if sem is not None:
+                pb["sim"] = sem["own_sim"][mt.gt]
         for d in s.sfx:
             per_bubble[d]["class"] = "sfx"
         for d in s.fragments:
             per_bubble[d]["class"] = "fragment"
+        for d in s.duplicates:
+            per_bubble[d]["class"] = "duplicate"
         for d in s.false_positives:
             per_bubble[d]["class"] = "false_positive"
         m["missed_gt_text"] = [gt.ja[g] for g in s.missed]
     inpainted, mask, final = res.debug["inpainted"], res.debug["mask"], res.debug["final"]
     m["inpaint"] = score_inpaint(pipe, page, inpainted, mask, bubbles, judge or pipe.resolve(None))
     plans = getattr(pipe.stage("renderer", resolved), "plans", None)
-    m["render"], per_render, overlay = score_render(inpainted, final, page, bubbles, plans)
+    m["render"], per_render, overlay = score_render(
+        inpainted, final, page, bubbles, plans, pipe.reader()
+    )
     drawn = [i for i, b in enumerate(bubbles) if b.target_text.strip()]
     for i, pr in zip(drawn, per_render):
         per_bubble[i]["render"] = pr
     m["bubbles"] = per_bubble
-    m["checks"] = checks(m)
+    m["checks"] = checks(m, pipe.thresholds)
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
         regions = det_call.result.regions if det_call else [b.region for b in bubbles]
@@ -414,6 +538,14 @@ def warm_latency(pipe: BenchPipeline, page: np.ndarray, cfg: PipelineConfig) -> 
         return {TIMING_KEY[s]: round(c.seconds, 3) for s, c in pipe.calls.items()}
     finally:
         pipe.use_memo = True
+
+
+def estimate_total(run: dict, warm: dict[str, float]) -> float:
+    """Pipeline seconds for this config alone: stages this run reused from the cache (the
+    baseline's, often with a cold model load) count at the baseline's warm time instead."""
+    lat = run["latency_s"]
+    cached = set(run.get("cached_stages", []))
+    return round(sum(warm.get(k, v) if k in cached else v for k, v in lat.items()), 3)
 
 
 def available_methods(
@@ -475,6 +607,7 @@ def run_matrix(
     one("baseline", None, None, base)
     if warm and runs[0]["status"] == "ok":
         runs[0]["latency_warm_s"] = warm_latency(pipe, page, base)
+    warm_lat = runs[0].get("latency_warm_s") or {}
     methods = available_methods(pipe, base, allow_downloads, network)
     for stage in stages or list(STAGES):
         for name, skip in methods[stage]:
@@ -488,10 +621,13 @@ def run_matrix(
             setattr(cfg, stage, name)
             cfg.options.pop(stage, None)
             one(label, stage, name, cfg)
+    for r in runs:
+        if r["status"] == "ok":
+            r["latency_est_s"] = estimate_total(r, warm_lat)
     report = {
         "page_shape": list(page.shape),
         "baseline": {s: getattr(base, s) for s in STAGES},
-        "thresholds": THRESHOLDS,
+        "thresholds": pipe.thresholds,
         "load_seconds": {k: round(v, 2) for k, v in pipe.load_seconds.items()},
         "runs": runs,
     }
@@ -524,7 +660,7 @@ def contact_sheet(runs: list[dict], out_dir: Path, font_path: Path | None, tile_
         mark = " ".join(f"{s[:3]}{'+' if v else '-' if v is False else '?'}" for s, v in c.items())
         draw.text((x, y + 2), r["label"], fill=(255, 255, 255), font=font)
         draw.text((x, y + 24), mark, fill=(150, 230, 150) if all(v is not False for v in c.values()) else (255, 160, 120), font=font)
-        tot = r.get("latency_total_s")
+        tot = r.get("latency_est_s", r.get("latency_total_s"))
         draw.text((x, y + 44), f"{tot:.1f}s" if tot is not None else "", fill=(200, 200, 200), font=font)
     path = out_dir / "contact_sheet.jpg"
     sheet.save(path, quality=88)
@@ -551,22 +687,26 @@ def _ck(v: bool | None) -> str:
 def run_row(r: dict) -> str:
     if r["status"] != "ok":
         why = r.get("reason") or r.get("error", "")
-        return f"| {r['label']} | {r['status']} | {why} |" + " |" * 10
+        return f"| {r['label']} | {r['status']} | {why} |" + " |" * 11
     d, o, t, i, rd = (r.get(k) or {} for k in ("detection", "ocr", "translation", "inpaint", "render"))
     c = r["checks"]
     lat = r["latency_s"]
     stage_lat = lat.get(TIMING_KEY[r["stage"]]) if r.get("stage") else None
+    sem = t.get("semantic") or {}
+    adq = f"{sem['adequate']}/{len(sem['own_sim'])}" if sem else "–"
     return (
         f"| {r['label']} | ok | "
-        f"{d.get('matched', '–')}/{d.get('gt_bubbles', '–')} fp {d.get('false_positives', '–')} {_ck(c.get('detect'))} | "
+        f"{d.get('matched', '–')}/{d.get('gt_bubbles', '–')} fp {d.get('false_positives', '–')} "
+        f"dup {d.get('duplicates', '–')} {_ck(c.get('detect'))} | "
         f"{_f(o.get('mean_cer'), 3)} {_ck(c.get('ocr'))} | "
-        f"{_f(t.get('chrf'), 1)} e{t.get('empty', '–')} j{t.get('japanese', '–')} {_ck(c.get('translate'))} | "
+        f"{_f(t.get('chrf'), 1)} e{t.get('empty', '–')} j{t.get('japanese', '–')} | "
+        f"{adq} {_f(sem.get('mean_sim'), 2)} {_ck(c.get('translate'))} | "
         f"{i.get('residual_regions', '–')} / {_f(i.get('dark_residue'), 4)} / {_f(i.get('ghost_residue'), 4)} | "
         f"{_f(i.get('outside_mad'), 3)} / {_f(i.get('outside_changed_frac'), 4)} / {i.get('outside_far_changed', '–')} {_ck(c.get('inpaint'))} | "
         f"{_f(rd.get('min_inside_frac'), 3)} lost {rd.get('lost', '–')} | "
-        f"{rd.get('chars_rendered', '–')}/{rd.get('chars_target', '–')} | "
+        f"{_f(rd.get('read_cer_mean'), 3)} / {_f(rd.get('read_cer_max'), 2)} | "
         f"{_f(rd.get('min_font_px'), 0)} {_ck(c.get('render'))} | "
-        f"{_f(stage_lat, 2)} | {_f(r['latency_total_s'], 1)} |"
+        f"{_f(stage_lat, 2)} | {_f(r.get('latency_est_s', r['latency_total_s']), 1)} |"
     )
 
 
@@ -583,19 +723,25 @@ def markdown(report: dict) -> str:
         ),
         "",
         (
-            "Columns: detection = GT bubbles matched by OCR text (Hungarian on CER <= 0.5) and false "
-            "positives; OCR = mean CER over matched bubbles; chrF vs `id_ref` (missing bubbles count "
-            "as empty), e/j = empty / Japanese outputs; residual = text regions the judge detector+OCR "
+            "Columns: detection = GT bubbles matched by OCR text (Hungarian on CER <= 0.5), false "
+            "positives and duplicate detections; OCR = mean CER over matched bubbles; chrF vs `id_ref` "
+            "(missing bubbles count as empty), e/j = empty / Japanese outputs; meaning = GT bubbles "
+            f"whose translation has embedding cosine >= {THRESHOLDS['semantic_sim']} to its reference "
+            "(paraphrase-multilingual-MiniLM) and the mean cosine; "
+            "residual = text regions the judge detector+OCR "
             "still reads inside erased areas / dark and off-tone (ghost) pixel shares left in "
             "erased balloon interiors; "
             "outside = mean abs diff / changed share of pixels OUTSIDE the mask / changed pixels more "
             "than 8 px from it (must be 0: only edge feathering may touch the ring); inside = "
-            "worst share of a bubble's rendered ink inside its balloon (or padded box); chars = "
-            "letters in the renderer's layout / in the translation; font = smallest font px."
+            "worst share of a bubble's rendered ink inside its balloon (or padded box) and bubbles "
+            "whose text was lost; read-back = mean / worst CER (letters only) of the rendered text "
+            f"read back from pixels by an independent OCR (`{READER_OCR}`) against the translation; "
+            "font = smallest font px; total = pipeline seconds for that config, stages reused from "
+            "the cache counted at the baseline's warm time."
         ),
         "",
-        "| run | status | detection | OCR CER | chrF | residual | outside mask | inside | chars | min font | stage s | total s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| run | status | detection | OCR CER | chrF | meaning | residual | outside mask | inside | read-back CER | min font | stage s | total s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     L += [run_row(r) for r in runs]
     if base.get("status") == "ok":
@@ -607,7 +753,7 @@ def markdown(report: dict) -> str:
             L.append(
                 f"- **detect** {_ck(c.get('detect'))}: {d['matched']}/{d['gt_bubbles']} GT bubbles matched "
                 f"(need >= {T['detect_recall']:.0%}), {d['false_positives']} false positives, "
-                f"{d['sfx_hits']} SFX regions, {d['fragments']} fragments, "
+                f"{d['sfx_hits']} SFX regions, {d['fragments']} fragments, {d['duplicates']} duplicates, "
                 f"{base['regions_detected']} raw regions."
             )
         if o:
@@ -619,22 +765,40 @@ def markdown(report: dict) -> str:
             L.append(
                 f"- **translate** {_ck(c.get('translate'))}: chrF {_f(t['chrf'], 1)} (need >= {T['chrf']}), "
                 f"chrF++ {_f(t['chrf_pp'], 1)}, {t['empty']} empty, {t['japanese']} still Japanese "
-                f"of {t['outputs']}."
+                f"of {t['outputs']}; "
+                + (
+                    f"meaning: {t['semantic']['adequate']}/{len(t['semantic']['own_sim'])} GT bubbles "
+                    f"adequate (cosine >= {T['semantic_sim']}, need >= {T['adequate_frac']:.0%}), mean "
+                    f"cosine {_f(t['semantic']['mean_sim'], 3)}, {t['semantic']['aligned']} closest to "
+                    f"their own reference; inadequate GT #"
+                    + ", #".join(map(str, t["semantic"]["inadequate_gt"]))
+                    + "."
+                    if t.get("semantic")
+                    else "meaning NOT checked (embedding model unavailable)."
+                )
             )
         L.append(
-            f"- **inpaint** {_ck(c.get('inpaint'))}: {i['residual_regions']} residual text regions "
+            f"- **inpaint** {_ck(c.get('inpaint'))}: {i['mask_px']} px erased, "
+            f"{i['residual_regions']} residual text regions "
             f"({i['residual_chars']} chars of {i['erased_chars']} erased), dark residue "
             f"{_f(i['dark_residue'], 4)} (was {_f(i['dark_before'], 3)} before erasing), ghost "
             f"{_f(i['ghost_residue'], 4)} ("
             f"{i['dark_zone_px']} px), outside-mask MAD {_f(i['outside_mad'], 4)}, max "
-            f"{i['outside_max']}, changed {_f(i['outside_changed_frac'], 6)} (all within 8 px of "
-            f"the mask: {i['outside_far_changed'] == 0})."
+            f"{i['outside_max']}, changed {_f(i['outside_changed_frac'], 6)} (all within "
+            f"{T['outside_ring_px']} px of the mask: {i['outside_far_changed'] == 0})."
         )
         L.append(
             f"- **render** {_ck(c.get('render'))}: {rd['bubbles']} bubbles, worst inside share "
             f"{_f(rd['min_inside_frac'], 4)}, {rd['outside_px']} ink px outside, {rd['lost']} lost, "
-            f"chars {rd['chars_rendered']}/{rd['chars_target']} ({rd['chars_checked']} layouts), "
-            f"{rd['overflow']} overflowing, font {_f(rd['min_font_px'], 0)}..{_f(rd['median_font_px'], 0)} px "
+            f"layout chars {rd['chars_rendered']}/{rd['chars_target']} ({rd['chars_checked']} layouts), "
+            + (
+                f"read back from pixels: {rd['chars_read']}/{rd['chars_read_target']} letters, CER mean "
+                f"{_f(rd['read_cer_mean'], 3)} (need <= {T['read_cer_mean']}), worst "
+                f"{_f(rd['read_cer_max'], 3)} (need <= {T['read_cer_max']}), "
+                if rd.get("read_back")
+                else "NO pixel read-back (judge OCR unavailable), "
+            )
+            + f"{rd['overflow']} overflowing, font {_f(rd['min_font_px'], 0)}..{_f(rd['median_font_px'], 0)} px "
             f"(min..median, {rd['font_source']})."
         )
         L.append(
@@ -653,16 +817,17 @@ def markdown(report: dict) -> str:
             "",
             "## Baseline per bubble",
             "",
-            "| # | GT | OCR | CER | translation | reference | chrF | font | inside |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| # | GT | OCR | CER | translation | reference | chrF | cosine | read back from pixels | read CER | font | inside |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for b in base["bubbles"]:
             rr = b.get("render") or {}
             gtj = b.get("gt_ja") or f"*{b.get('class', 'unmatched')}*"
             L.append(
                 f"| {b['id']} | {gtj} | {b['source']} | {_f(b.get('cer'), 2)} | {b['target']} | "
-                f"{b.get('id_ref', '')} | {_f(b.get('chrf'), 1)} | {_f(rr.get('font_px'), 0)} | "
-                f"{_f(rr.get('inside_frac'), 3)} |"
+                f"{b.get('id_ref', '')} | {_f(b.get('chrf'), 1)} | {_f(b.get('sim'), 2)} | "
+                f"{rr.get('read_text') or ''} | {_f(rr.get('read_cer'), 2)} | "
+                f"{_f(rr.get('font_px'), 0)} | {_f(rr.get('inside_frac'), 3)} |"
             )
         if base.get("missed_gt_text"):
             L += ["", "Missed GT bubbles: " + ", ".join(base["missed_gt_text"])]
@@ -683,12 +848,15 @@ def bench(
     allow_downloads: bool = False,
     network: bool = False,
     warm: bool = True,
+    strict_mask: bool = False,
 ) -> dict:
     page = cv2.imread(str(page_path))
     if page is None:
         raise FileNotFoundError(page_path)
     gt = GroundTruth.load(gt_path) if gt_path else None
     pipe = BenchPipeline(settings)
+    if strict_mask:  # no pixel outside the mask may change, not even edge feathering
+        pipe.thresholds["outside_ring_px"] = 0
     base = base or PipelineConfig()
     out_dir.mkdir(parents=True, exist_ok=True)
     if matrix:
@@ -698,10 +866,11 @@ def bench(
         m.update(label="baseline", stage=None, method=None, status="ok")
         if warm:
             m["latency_warm_s"] = warm_latency(pipe, page, base)
+        m["latency_est_s"] = m["latency_own_s"]
         report = {
             "page_shape": list(page.shape),
             "baseline": m["config"],
-            "thresholds": THRESHOLDS,
+            "thresholds": pipe.thresholds,
             "load_seconds": {k: round(v, 2) for k, v in pipe.load_seconds.items()},
             "runs": [m],
         }

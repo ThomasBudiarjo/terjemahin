@@ -12,6 +12,11 @@ Usage:
     python training/export_ocr_onnx.py --model training/runs/ocr-ft/best \
         --out weights/manga-ocr-ft.onnx
     terjemahin-worker translate page.png --ocr manga_ocr --opt ocr.weights=weights/manga-ocr-ft.onnx
+    terjemahin-worker translate page.png --ocr manga_ocr_hf --opt ocr.repo=training/runs/ocr-ft/best
+
+<out>/best is the checkpoint with the lowest held-out CER and <out>/final the last one; when
+they are the same weights (or there is no eval) one of them is a symlink, so a run costs one
+~440MB copy, not two.
 
 Everything runs on CPU (slowly); `--freeze-encoder` trains only the 2-layer decoder, which is
 ~4x faster per step and enough to adapt to new fonts' glyph statistics or a vocabulary shift.
@@ -235,6 +240,9 @@ def train(a: argparse.Namespace) -> dict:
     sets = {"val": val_rows} if val_rows else {}
     for src in a.eval or []:
         rows = read_jsonl(src / "val.jsonl" if src.is_dir() else src)
+        if not rows:
+            print(f"warning: --eval {src} has no samples, skipped", file=sys.stderr)
+            continue
         sets[src.stem if src.is_file() else src.name] = rows[: a.max_eval]
 
     def run_evals(tag: str) -> dict:

@@ -228,6 +228,16 @@ def _opts(settings, **o: Any) -> dict[str, Any]:
     return out
 
 
+def _graph(settings, key: str, weights: Any = None) -> Path:
+    """`weights=<onnx>` swaps in another graph with the same interface (e.g. a trained AOT export)."""
+    if not weights:
+        return ensure(key, settings)
+    path = Path(weights).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"inpainter weights not found: {path}")
+    return path
+
+
 @INPAINTERS.register(
     "lama_manga",
     description="LaMa fine-tuned on manga (ONNX 512), per text cluster at native resolution; "
@@ -236,7 +246,8 @@ def _opts(settings, **o: Any) -> dict[str, Any]:
     weights=("lama_manga",),
 )
 def _build_manga(settings, **opts: Any) -> LamaInpainter:
-    return LamaInpainter(ensure("lama_manga", settings), out_scale=1.0, **_opts(settings, **opts))
+    path = _graph(settings, "lama_manga", opts.get("weights"))
+    return LamaInpainter(path, out_scale=1.0, **_opts(settings, **opts))
 
 
 @INPAINTERS.register(
@@ -247,4 +258,5 @@ def _build_manga(settings, **opts: Any) -> LamaInpainter:
     weights=("lama",),
 )
 def _build_big(settings, **opts: Any) -> LamaInpainter:
-    return LamaInpainter(ensure("lama", settings), out_scale=255.0, **_opts(settings, **opts))
+    path = _graph(settings, "lama", opts.get("weights"))
+    return LamaInpainter(path, out_scale=255.0, **_opts(settings, **opts))

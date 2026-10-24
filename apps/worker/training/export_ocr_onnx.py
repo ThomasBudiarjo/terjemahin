@@ -38,7 +38,6 @@ from terjemahin_worker.ocr.manga_ocr_onnx import (
     EOS,
     SIZE,
     START,
-    MangaOcrOnnx,
     decode_tokens,
     load_vocab,
     preprocess,
@@ -142,13 +141,20 @@ def check_logits(model_id: str, onnx_path: Path, crops: list[np.ndarray], seed: 
 
 
 def check_decode(model_id: str, onnx_path: Path, crops: list[np.ndarray]) -> dict:
-    """The worker's split-graph ONNX decoder vs transformers greedy generate, text for text."""
+    """The worker's split-graph ONNX decoder vs transformers greedy generate, text for text.
+
+    The ONNX side is built the way the product builds it (`--ocr manga_ocr --opt
+    ocr.weights=...`), so this also checks that the export plugs into the registry."""
     import torch
     from transformers import VisionEncoderDecoderModel
 
+    from terjemahin_worker.config import Settings
+    from terjemahin_worker.registry import OCRS, load_all
+
     model = VisionEncoderDecoderModel.from_pretrained(model_id).eval()
     vocab = load_vocab(vocab_path(onnx_path))
-    ocr = MangaOcrOnnx(onnx_path, vocab_path(onnx_path))
+    load_all()
+    ocr = OCRS.build("manga_ocr", Settings(), weights=str(onnx_path))
     pixels = preprocess(crops)
     with torch.inference_mode():
         ref = model.generate(

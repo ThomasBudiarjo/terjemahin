@@ -44,26 +44,46 @@ def bench_cmd(
     allow_downloads: Annotated[bool, Opt(help="include methods that download GBs first")] = False,
     network: Annotated[bool, Opt(help="include network / local-server methods")] = False,
     warm: Annotated[bool, Opt(help="re-time the baseline without caches (warm latency)")] = True,
+    strict_mask: Annotated[
+        bool, Opt(help="fail inpainters that change any pixel outside the mask (no 8 px ring)")
+    ] = False,
 ) -> None:
     """Score detect / OCR / translate / inpaint / render on a page; write report.md + JSON."""
     from ..cli import _parse_opts
+    from ..registry import REGISTRIES, load_all
     from .bench import bench, markdown
+
+    load_all()
 
     chosen = [s.strip() for s in stages.split(",") if s.strip()]
     bad = [s for s in chosen if s not in STAGES]
     if bad:
         raise typer.BadParameter(f"unknown stage(s) {bad}, choose from {', '.join(STAGES)}")
-    base = PipelineConfig(
-        detector=detector,
-        ocr=ocr,
-        translator=translator,
-        mask_refiner=mask_refiner,
-        inpainter=inpainter,
-        renderer=renderer,
-        options=_parse_opts(opt or []),
-    )
+    picked = {
+        "detector": detector,
+        "ocr": ocr,
+        "translator": translator,
+        "mask_refiner": mask_refiner,
+        "inpainter": inpainter,
+        "renderer": renderer,
+    }
+    for stage, name in picked.items():
+        if name is not None and name not in REGISTRIES[stage].methods:
+            names = ", ".join(REGISTRIES[stage].names())
+            raise typer.BadParameter(f"unknown {stage} '{name}', choose from: {names}")
+    base = PipelineConfig(**picked, options=_parse_opts(opt or []))
     report = bench(
-        page, gt, out, get_settings(), matrix, chosen or None, base, allow_downloads, network, warm
+        page,
+        gt,
+        out,
+        get_settings(),
+        matrix,
+        chosen or None,
+        base,
+        allow_downloads,
+        network,
+        warm,
+        strict_mask,
     )
     md = markdown(report)
     typer.echo(md.split("\n## Baseline per bubble")[0])

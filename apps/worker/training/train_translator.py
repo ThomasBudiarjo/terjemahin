@@ -9,7 +9,8 @@ or a small GPU the useful knobs are, from cheapest to most expressive:
     --decoder-layers 2      train only the last 2 decoder layers (+ final layer norm)
     --freeze-encoder        encoder fixed, whole decoder trains
     (default)               everything except the shared embedding/lm_head
-    --train-embeddings      full fine-tune
+    --train-embeddings      also train the shared embedding (alone: full fine-tune); combines
+                            with either option above
 Frozen parts get no gradients or optimizer state, so `--decoder-layers 2` fits in ~4 GB RAM.
 
 The output dir is a normal Hugging Face checkpoint (config, safetensors, tokenizer) that the
@@ -98,10 +99,8 @@ def freeze(model, train_embeddings: bool, freeze_encoder: bool, decoder_layers: 
     """Set requires_grad per the CLI policy; returns (trainable, total) parameter counts."""
     enc, dec = model.get_encoder(), model.get_decoder()
     for p in model.parameters():
-        p.requires_grad = True
-    if decoder_layers >= 0:
-        for p in model.parameters():
-            p.requires_grad = False
+        p.requires_grad = decoder_layers < 0
+    if decoder_layers >= 0:  # implies a frozen encoder
         layers = dec.layers
         for layer in layers[len(layers) - decoder_layers :] if decoder_layers else []:
             for p in layer.parameters():
@@ -112,10 +111,9 @@ def freeze(model, train_embeddings: bool, freeze_encoder: bool, decoder_layers: 
     elif freeze_encoder:
         for p in enc.parameters():
             p.requires_grad = False
-    if not train_embeddings:
-        for emb in (model.get_input_embeddings(), model.get_output_embeddings()):
-            for p in emb.parameters():
-                p.requires_grad = False
+    for emb in (model.get_input_embeddings(), model.get_output_embeddings()):
+        for p in emb.parameters():
+            p.requires_grad = train_embeddings
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return trainable, sum(p.numel() for p in model.parameters())
 
@@ -190,7 +188,7 @@ def evaluate(model, tok, val, src_code, tgt_code, device, beams: int) -> dict:
 def main(argv: list[str] | None = None) -> dict:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--data", type=Path, nargs="+", required=True, help=".jsonl {src,tgt} or .tsv")
-    ap.add_argument("--val", type=Path, nargs="*", default=[], help="explicit held-out files")
+    ap.add_argument("--val", type=Path, nargs="*", default=[], help="explicit held-out files (their sources are removed from --data)")
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--model", default=DEFAULT_MODEL, help="HF id or local dir (NLLB or M2M100)")
     ap.add_argument("--src", default="ja")
@@ -208,8 +206,10 @@ def main(argv: list[str] | None = None) -> dict:
     ap.add_argument("--label-smoothing", type=float, default=0.1)
     ap.add_argument("--decoder-layers", type=int, default=-1,
                     help="train only the last N decoder layers (-1 = no such limit)")
-    ap.add_argument("--freeze-encoder", action="store_true")
-    ap.add_argument("--train-embeddings", action="store_true")
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="encoder fixed (implied by --decoder-layers)")
+    ap.add_argument("--train-embeddings", action="store_true",
+                    help="also train the shared embedding / lm_head")
     ap.add_argument("--eval-every", type=int, default=0, help="steps between evals (0 = per epoch)")
     ap.add_argument("--eval-beams", type=int, default=4)
     ap.add_argument("--eval-max", type=int, default=200, help="score at most N held-out pairs")
@@ -235,7 +235,11 @@ def main(argv: list[str] | None = None) -> dict:
     norm = (lambda s: s) if a.no_normalize or tp.iso(a.src) != "ja" else tp.normalize_ja
     pairs = [(norm(s), t) for f in a.data for s, t in read_pairs(f)]
     if a.val:
-        train, val = pairs, [(norm(s), t) for f in a.val for s, t in read_pairs(f)]
+        val = [(norm(s), t) for f in a.val for s, t in read_pairs(f)]
+        held = {s for s, _ in val}
+        train = [p for p in pairs if p[0] not in held]
+        if len(train) < len(pairs):
+            print(f"dropped {len(pairs) - len(train)} training pairs whose source is in --val", flush=True)
     else:
         train, val = split_pairs(pairs, a.val_ratio, a.seed)
     val = val[: a.eval_max]
@@ -255,7 +259,8 @@ def main(argv: list[str] | None = None) -> dict:
     src_code, tgt_code = lang_codes(family, a.src, a.tgt)
     trainable, total = freeze(model, a.train_embeddings, a.freeze_encoder, a.decoder_layers)
     batcher = Batcher(train, tok, src_code, tgt_code, a.batch, a.max_len, a.seed)
-    per_epoch = math.ceil(math.ceil(len(train) / a.batch) / a.grad_accum)
+    n_batches = math.ceil(len(train) / a.batch)
+    per_epoch = math.ceil(n_batches / a.grad_accum)  # a short tail of micro-batches still steps
     steps = a.steps or max(1, round(per_epoch * a.epochs))
     warmup = int(a.warmup * steps) if a.warmup < 1 else int(a.warmup)
     eval_every = a.eval_every or per_epoch
@@ -291,16 +296,22 @@ def main(argv: list[str] | None = None) -> dict:
         (a.out / "terjemahin.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
 
     model.train()
-    step, t0, running = 0, time.time(), []
+    step, epochs, t0, running = 0, 0, time.time(), []
     while step < steps:
+        epochs += 1
         for k, batch in enumerate(batcher.epoch()):
             batch = {n: v.to(a.device) for n, v in batch.items()}
             logits = model(**batch).logits
             loss = loss_f(logits.view(-1, logits.size(-1)), batch["labels"].view(-1))
             (loss / a.grad_accum).backward()
             running.append(loss.item())
-            if (k + 1) % a.grad_accum:
+            micro = k % a.grad_accum + 1
+            if micro < a.grad_accum and k + 1 < n_batches:
                 continue
+            if micro < a.grad_accum:  # epoch tail: rescale to a mean over the micro-batches seen
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.mul_(a.grad_accum / micro)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             sched.step()
@@ -323,7 +334,7 @@ def main(argv: list[str] | None = None) -> dict:
     if best_state is not None:
         model.load_state_dict(best_state, strict=False)
     save(best_metrics if val else {"step": step})
-    result = {"out": str(a.out), "family": family, "steps": step, "trainable": trainable,
+    result = {"out": str(a.out), "family": family, "steps": step, "epochs": epochs, "trainable": trainable,
               "history": history, "best_chrf": best if val else None}
     if history and history[0]["step"] == 0 and val and best <= history[0]["chrf"]:
         print(f"warning: no eval beat the base model (chrF {history[0]['chrf']}); "

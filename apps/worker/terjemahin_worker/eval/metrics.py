@@ -2,7 +2,9 @@
 
 Ground truth has text per bubble but no boxes, so detections are matched to GT bubbles by what
 OCR read in them (Hungarian assignment on CER). Inpainting and typesetting are judged from
-pixels only, so every registered method is scored the same way whatever it does inside.
+pixels only, so every registered method is scored the same way whatever it does inside:
+rendered text is read back from the drawn ink by an independent OCR, never taken from the
+renderer's own account of what it drew.
 """
 
 from __future__ import annotations
@@ -10,7 +12,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 import cv2
 import numpy as np
@@ -193,6 +197,7 @@ class DetectionScore:
     n_det: int
     sfx: list[int] = field(default_factory=list)  # detections that read a listed SFX
     fragments: list[int] = field(default_factory=list)  # pieces of an already matched bubble
+    duplicates: list[int] = field(default_factory=list)  # the same bubble detected again
     false_positives: list[int] = field(default_factory=list)
     missed: list[int] = field(default_factory=list)  # GT bubbles nothing matched
 
@@ -212,13 +217,27 @@ def _contained(part: str, whole: str) -> bool:
     return len(part) - (levenshtein(part, whole) - (len(whole) - len(part))) >= 0.8 * len(part)
 
 
+def overlap_small(a: BBox, b: BBox) -> float:
+    """Intersection over the smaller box: 1 when one box lies inside the other."""
+    iw = min(a.x2, b.x2) - max(a.x1, b.x1)
+    ih = min(a.y2, b.y2) - max(a.y1, b.y1)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    return iw * ih / max(1, min(a.w * a.h, b.w * b.h))
+
+
 def match_detections(
-    det_texts: list[str], gt_texts: list[str], sfx: list[str] = (), max_cer: float = 0.5
+    det_texts: list[str],
+    gt_texts: list[str],
+    sfx: list[str] = (),
+    max_cer: float = 0.5,
+    boxes: list[BBox] | None = None,
 ) -> DetectionScore:
     """Assign detections to GT bubbles by OCR text; a pair counts when its CER <= max_cer.
 
-    Unmatched detections are SFX hits (if they read a listed SFX), fragments (a bubble split in
-    two, the other half matched), or false positives.
+    Unmatched detections are SFX hits (if they read a listed SFX), duplicates (they read the
+    same text as, or mostly overlap, the detection matched to that bubble), fragments (a bubble
+    split in two, the other half matched), or false positives.
     """
     hyp = [normalize_ja(t, punct=False) for t in det_texts]
     ref = [normalize_ja(t, punct=False) for t in gt_texts]
@@ -232,11 +251,22 @@ def match_detections(
     matched_d = {m.det for m in matches}
     matched_g = {m.gt for m in matches}
     sfx_n = [normalize_ja(s, punct=False) for s in sfx]
+
+    def duplicate(d: int) -> bool:
+        for m in matches:
+            if cer(hyp[d], hyp[m.det]) <= 0.2 or (
+                boxes is not None and overlap_small(boxes[d], boxes[m.det]) >= 0.5
+            ):
+                return True
+        return False
+
     for d, h in enumerate(hyp):
         if d in matched_d:
             continue
         if any(cer(h, s) <= max_cer for s in sfx_n):
             score.sfx.append(d)
+        elif duplicate(d):
+            score.duplicates.append(d)
         elif any(_contained(h, ref[g]) for g in matched_g):
             score.fragments.append(d)
         else:
@@ -335,6 +365,10 @@ def dark_residue(
 
 INK_THRESHOLD = 40  # max channel difference between final and inpainted that counts as ink
 TOLERANCE_PX = 3  # anti-aliasing / outline slack around a container
+LOST_CER = 0.5  # read-back CER above which a bubble's text counts as lost
+
+# reads the page's rendered text back: (image, per bubble a list of line quads) -> texts
+Reader = Callable[[np.ndarray, list[list[np.ndarray]]], list[str]]
 
 
 @dataclass
@@ -350,22 +384,88 @@ class RenderBox:
     font_px: float | None
     font_source: str  # "layout" or "estimate"
     fits: bool | None
+    read_text: str | None = None  # what an independent OCR reads in the drawn ink
+    read_cer: float | None = None  # of read_text against the translation, letters only
 
     @property
     def inside_frac(self) -> float:
         return 1.0 - self.outside_px / self.ink_px if self.ink_px else 1.0
 
     @property
+    def read_chars(self) -> int | None:
+        return count_chars(self.read_text) if self.read_text is not None else None
+
+    @property
     def lost(self) -> bool:
         return self.target_chars > 0 and (
             self.ink_px == 0
             or (self.rendered_chars is not None and self.rendered_chars < self.target_chars)
+            or (self.read_cer is not None and self.read_cer > LOST_CER)
         )
 
 
 def count_chars(text: str) -> int:
     """Letters and digits only: renderers legitimately respell punctuation and hyphenate."""
     return sum(c.isalnum() for c in unicodedata.normalize("NFKC", text))
+
+
+def letters(text: str) -> str:
+    """Case-folded letters and digits: what read-back is compared on (renderers may hyphenate,
+    upper-case or respell punctuation)."""
+    return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
+
+
+def _runs(on: np.ndarray) -> list[list[int]]:
+    d = np.flatnonzero(np.diff(np.concatenate([[0], on.astype(np.int8), [0]])))
+    return [[int(a), int(b)] for a, b in zip(d[::2], d[1::2])]
+
+
+def ink_lines(ink: np.ndarray, pad: int = 2) -> list[np.ndarray]:
+    """Horizontal text-line quads of a 0/1 ink mask, from its row profile.
+
+    Thin bands (i-dots, accents, commas cut off by the ink threshold) join their nearest line.
+    Tightly set lines touch (descenders meet ascenders), so a band is also cut wherever the
+    profile has two dense x-height cores with a near-empty valley between them. Used to read
+    rendered text back with our own line boxes, not the renderer's.
+    """
+    prof = ink.sum(1).astype(np.float64)
+    bands = _runs(prof > 0)
+    if not bands:
+        return []
+    hs = np.array([e - s for s, e in bands])
+    line_h = float(np.median(hs[hs >= 0.5 * hs.max()]))
+    while len(bands) > 1:
+        k = min(range(len(bands)), key=lambda i: bands[i][1] - bands[i][0])
+        if bands[k][1] - bands[k][0] >= 0.45 * line_h:
+            break
+        gaps = [
+            bands[k][0] - bands[k - 1][1] if k > 0 else np.inf,
+            bands[k + 1][0] - bands[k][1] if k + 1 < len(bands) else np.inf,
+        ]
+        j = k - 1 if gaps[0] <= gaps[1] else k + 1
+        a, b = sorted((j, k))
+        bands[a : b + 1] = [[bands[a][0], bands[b][1]]]
+    out: list[list[int]] = []
+    for s, e in bands:
+        p = prof[s:e]
+        cores = _runs(p >= 0.4 * p.max())
+        tall = max(b - a for a, b in cores)
+        cores = [c for c in cores if c[1] - c[0] >= 0.3 * tall]
+        cuts = [s]
+        for (_, z), (a, _) in pairwise(cores):
+            if a > z and p[z:a].min() <= 0.25 * p.max():
+                cuts.append(s + z + int(np.argmin(p[z:a])))
+        out += [[a, b] for a, b in zip(cuts, cuts[1:] + [e])]
+    H, W = ink.shape
+    quads = []
+    for s, e in out:
+        cols = np.flatnonzero(ink[s:e].any(0))
+        if not len(cols):
+            continue
+        x1, y1 = max(0, int(cols[0]) - pad), max(0, s - pad)
+        x2, y2 = min(W, int(cols[-1]) + 1 + pad), min(H, e + pad)
+        quads.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], np.float32))
+    return quads
 
 
 def open_container(b: BBox, W: int, H: int) -> BBox:
@@ -412,18 +512,34 @@ def _estimate_font(ink: np.ndarray) -> float | None:
     return float(np.median(runs)) if len(runs) else None
 
 
+def reading_canvas(inpainted: np.ndarray, final: np.ndarray, ink: np.ndarray) -> np.ndarray:
+    """Only what the renderer drew, as dark-on-white: pixels it darkened near the ink keep their
+    final value (glyphs and their anti-aliased edges), everything else is white, so neither the
+    art behind the text nor a light outline (halo) over it can help or hurt the read."""
+    near = cv2.dilate(ink, np.ones((3, 3), np.uint8)) > 0
+    g_in = cv2.cvtColor(inpainted, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    g_fi = cv2.cvtColor(final, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    keep = near & (g_fi < g_in - 16)
+    out = np.full_like(final, 255)
+    out[keep] = (255 - (g_in - g_fi)[keep, None].clip(0, 255)).astype(np.uint8)
+    return out
+
+
 def render_check(
     inpainted: np.ndarray,
     final: np.ndarray,
     original: np.ndarray,
     bubbles: list[Bubble],
     plans: list | None = None,
+    reader: Reader | None = None,
 ) -> tuple[list[RenderBox], np.ndarray]:
     """Attribute every drawn pixel to a bubble and check it stays in that bubble's container.
 
     Ink = pixels the renderer changed. Each 8-connected ink component goes to the bubble whose
-    container holds most of it (else the nearest box). `plans` (renderers that expose their
-    layouts, like the default one) add exact rendered characters and font sizes.
+    container holds most of it (else the nearest box). `reader` reads each bubble's ink back
+    (on a blank canvas, so neither art nor the neighbours' text can help or hurt) to prove the
+    whole translation was drawn legibly. `plans` (renderers that expose their layouts, like the
+    default one) add the layout's characters and font sizes.
     Returns the per-bubble results and a debug overlay.
     """
     diff = np.abs(final.astype(np.int16) - inpainted.astype(np.int16)).max(axis=2)
@@ -446,10 +562,18 @@ def render_check(
         id(p.bubble): p for p in (plans or []) if getattr(p, "bubble", None) is not None
     }
     owner_map = owner[labels]
+    mines = [owner_map == i for i in range(len(bubbles))]
+    reads: list[str | None] = [None] * len(bubbles)
+    if reader is not None and bubbles:
+        canvas = reading_canvas(inpainted, final, ink)
+        latin = [not is_japanese(b.target_text) for b in bubbles]  # the reader reads lines
+        quads = [ink_lines(m.astype(np.uint8)) if ok else [] for m, ok in zip(mines, latin)]
+        texts = reader(canvas, quads)
+        reads = [(t if q else "") if ok else None for t, q, ok in zip(texts, quads, latin)]
     overlay = final.copy()
     results = []
     for i, (b, cont) in enumerate(zip(bubbles, conts)):
-        mine = owner_map == i
+        mine = mines[i]
         ink_px = int(mine.sum())
         outside = mine & ~cont
         ink_bbox, bbox_inside = None, True
@@ -481,6 +605,8 @@ def render_check(
                 font_px=font,
                 font_source=src,
                 fits=getattr(lay, "fits", None),
+                read_text=reads[i],
+                read_cer=cer(letters(reads[i]), letters(b.target_text)) if reads[i] is not None else None,
             )
         )
         edge = cont & ~cv2.erode(cont.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)

@@ -167,10 +167,18 @@ def test_page01_with_ctd():
     boxes = [r.model_copy(update={"lines": [], "font_size": None}) for r in regions]
     for fs, r in zip([font_size(b, img) for b in boxes], regions, strict=True):
         assert 0.7 * r.font_size <= fs <= 1.3 * r.font_size  # measured from ink, not the box
+    H, W = img.shape[:2]
+    loose = [  # hand-drawn boxes 20 px too big: they cross balloon outlines and art
+        b.model_copy(update={"bbox": BBox(x1=max(0, b.bbox.x1 - 20), y1=max(0, b.bbox.y1 - 20),
+                                          x2=min(W, b.bbox.x2 + 20), y2=min(H, b.bbox.y2 + 20))})
+        for b in boxes
+    ]  # fmt: skip
+    sizes = {}
     for name, regs, raw in (
         ("seg", regions, det.mask),
         ("pixels", regions, None),
         ("box", boxes, None),
+        ("loose", loose, None),
     ):
         for refiner in (GlyphMask(), DilateMask()):
             m = refiner.refine(img, regs, raw) > 0
@@ -196,6 +204,9 @@ def test_page01_with_ctd():
             else:
                 assert outline_hit < 3000, tag
             assert m.mean() < 0.08, tag  # glyphs only: no page-sized blobs
+            sizes[name, type(refiner).__name__] = m.sum()
+    for cls in ("GlyphMask", "DilateMask"):  # a loose box must not turn into an erased box
+        assert sizes["loose", cls] < 1.1 * sizes["box", cls], sizes
 
 
 def multi_column_page():
@@ -279,3 +290,113 @@ def test_unknown_option_warns(caplog):
         MASK_REFINERS.build("default", Settings(), dilatation="0.3")
         MASK_REFINERS.build("dilate", Settings(), flat_spread="30")
     assert len(caplog.records) == 1 and "dilatation" in caplog.records[0].getMessage()
+
+
+def loosen(region: TextRegion, pad: int) -> TextRegion:
+    b = region.bbox
+    box = BBox(x1=b.x1 - pad, y1=b.y1 - pad, x2=b.x2 + pad, y2=b.y2 + pad)
+    return region.model_copy(update={"bbox": box, "lines": [], "font_size": None})
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize("pad", [12, 25, 45])
+def test_loose_box_over_outline_keeps_outline_and_art(cls, pad):
+    """A hand-drawn box that crosses the balloon outline onto the art: the border rings are
+    mixed, so the paper comes from the balloon interior; no box-shaped erase."""
+    img, region, glyphs, outline = balloon_page()
+    m = cls().refine(img, [loosen(region, pad)], None)
+    assert covered(m, glyphs, 0.05 if cls is GlyphMask else 0.3) == 1.0
+    assert (m[outline] > 0).mean() < (0.01 if cls is GlyphMask else 0.05)
+    inside = np.zeros(m.shape, np.uint8)
+    cv2.ellipse(inside, (150, 130), (110, 80), 0, 0, 360, 255, -1)
+    assert not (m > 0)[inside == 0].any()  # nothing on the art outside the balloon
+    b = region.bbox
+    assert (m[b.y1 : b.y2, b.x1 : b.x2] > 0).mean() < 0.9
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+def test_loose_box_mostly_background_no_blob(cls):
+    """Narrow balloon in a box that holds more grey background than balloon: the background is
+    the box's dominant colour, but the balloon (in the box middle) is the paper."""
+    H, W = 300, 200
+    img = np.full((H, W, 3), (160, 150, 155), np.uint8)
+    cv2.ellipse(img, (100, 150), (26, 90), 0, 0, 360, (252, 252, 252), -1)
+    cv2.ellipse(img, (100, 150), (26, 90), 0, 0, 360, (0, 0, 0), 4, cv2.LINE_AA)
+    glyphs = np.zeros((H, W), np.uint8)
+    for j, ch in enumerate("ABC"):
+        cv2.putText(glyphs, ch, (88, 115 + 40 * j), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 255, 2,
+                    cv2.LINE_AA)  # fmt: skip
+    img = blend(img, glyphs, (10, 10, 10))
+    ys, xs = np.nonzero(glyphs)
+    tight = TextRegion(id=0, bbox=BBox(x1=int(xs.min()), y1=int(ys.min()),
+                                       x2=int(xs.max()) + 1, y2=int(ys.max()) + 1))  # fmt: skip
+    m = cls().refine(img, [loosen(tight, 45)], None) > 0
+    g = glyphs.astype(np.float32) / 255.0
+    assert covered(m.astype(np.uint8) * 255, g, 0.3) == 1.0
+    grown = cv2.dilate((glyphs > 0).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    assert (m & ~grown).sum() < 100  # glyph-shaped, not the balloon interior
+
+
+FONT = ROOT / "fonts" / "ComicShanns2.ttf"
+
+
+def pil_page(outline=None, tone=False):
+    """400x300 white page, "Hello!" at 40 px, optional balloon outline or screentone."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    a = np.full((300, 400, 3), 255, np.uint8)
+    if tone:
+        for y in range(0, 300, 6):
+            for x in range(0, 400, 6):
+                cv2.circle(a, (x + (y // 6) % 2 * 3, y), 2, (60, 60, 60), -1)
+    im = Image.fromarray(a)
+    d = ImageDraw.Draw(im)
+    if outline:
+        d.ellipse(outline, fill=(255, 255, 255), outline=(0, 0, 0), width=5)
+    font = ImageFont.truetype(str(FONT), 40)
+    d.text((100, 120), "Hello!", font=font, fill=(0, 0, 0))
+    return np.array(im)[..., ::-1].copy(), d.textbbox((100, 120), "Hello!", font=font)
+
+
+@pytest.mark.skipif(not FONT.exists(), reason="font missing")
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+@pytest.mark.parametrize("pad", [0, 10, 20])
+def test_screentone_falls_back_to_box(cls, pad):
+    """Text on screentone passes the ring test (the gaps between dots are paper) but has no
+    solid paper: erase the whole box rather than a mesh of dots."""
+    img, (x1, y1, x2, y2) = pil_page(tone=True)
+    region = TextRegion(id=0, bbox=BBox(x1=x1 - pad, y1=y1 - pad, x2=x2 + pad, y2=y2 + pad))
+    m = cls().refine(img, [region], None)
+    assert (m[y1 - pad : y2 + pad, x1 - pad : x2 + pad] > 0).all()
+
+
+@pytest.mark.skipif(not FONT.exists(), reason="font missing")
+def test_outline_dilation_does_not_hug_outline():
+    """A tight balloon whose outline joins a glyph: the outline is cut before dilating, so no
+    mask ring is left along it, outside the balloon."""
+    o = (92, 112, 290, 172)
+    img, (x1, y1, x2, y2) = pil_page(outline=o)
+    region = TextRegion(id=0, bbox=BBox(x1=x1 - 4, y1=y1 - 4, x2=x2 + 4, y2=y2 + 4))
+    m = GlyphMask().refine(img, [region], None) > 0
+    inside = np.zeros(m.shape, np.uint8)
+    c, ax = (
+        ((o[0] + o[2]) // 2, (o[1] + o[3]) // 2),
+        ((o[2] - o[0]) // 2 - 3, (o[3] - o[1]) // 2 - 3),
+    )
+    cv2.ellipse(inside, c, ax, 0, 0, 360, 1, -1)
+    assert not (m & (inside == 0)).any()
+    assert m[y1:y2, x1:x2].mean() > 0.25  # the glyphs clear of the outline are erased
+
+
+@pytest.mark.parametrize("cls", [GlyphMask, DilateMask])
+def test_box_partly_off_page(cls):
+    img, region, glyphs, _ = balloon_page()
+    shifted = np.zeros_like(img)
+    dx = region.bbox.x1 - 2
+    shifted[:, : img.shape[1] - dx] = img[:, dx:]
+    g = np.zeros_like(glyphs)
+    g[:, : img.shape[1] - dx] = glyphs[:, dx:]
+    b = region.bbox
+    r = TextRegion(id=0, bbox=BBox(x1=-30, y1=b.y1 - 5, x2=b.x2 - dx + 5, y2=b.y2 + 5))
+    m = cls().refine(shifted, [r], None)
+    assert covered(m, g, 0.3) > 0.99

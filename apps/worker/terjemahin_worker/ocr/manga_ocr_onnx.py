@@ -263,6 +263,8 @@ def _build(settings, **opts):
     next to it as <name>.vocab.txt unless `vocab=` says otherwise."""
     opts.setdefault("threads", int(os.environ.get("OCR_THREADS", "0")))
     weights, vocab = opts.pop("weights", None), opts.pop("vocab", None)
+    if weights and not Path(weights).is_file():
+        raise FileNotFoundError(f"ocr.weights: no such ONNX model: {weights}")
     if weights and not vocab:
         vocab = Path(weights).with_suffix(".vocab.txt")
     return MangaOcrOnnx(

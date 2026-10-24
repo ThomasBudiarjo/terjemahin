@@ -2,7 +2,7 @@
 
 Graph contract (same as koharu-lama-manga.onnx, so lama.py runs it unchanged):
     image [B,3,H,W] float32 RGB 0..1   mask [B,1,H,W] float32, 1 = hole   ->   output [B,3,H,W] 0..1
-H and W are dynamic (multiples of 4; the worker feeds 512). The graph zeroes the hole and maps to
+H and W are dynamic (padded to a multiple of 4 inside the graph, at least 68; the worker feeds 512). The graph zeroes the hole and maps to
 the network's -1..1 range itself, and returns the input outside the hole.
 
 Weight standardisation is folded into plain Conv/ConvTranspose weights before tracing: the graph
@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_inpaint import (
@@ -60,9 +61,13 @@ class LamaInterface(nn.Module):
         self.gen = gen
 
     def forward(self, image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        m = (mask > 0.5).to(image.dtype)
-        y = (self.gen((image * 2 - 1) * (1 - m), m).clamp(-1, 1) + 1) * 0.5
-        return image * (1 - m) + y * m
+        """Pads H, W up to a multiple of 4 (traced as shape ops, so it stays dynamic)."""
+        h, w = image.shape[2], image.shape[3]
+        ph, pw = (4 - h % 4) % 4, (4 - w % 4) % 4
+        x = F.pad(image, (0, pw, 0, ph), mode="replicate")
+        m = (F.pad(mask, (0, pw, 0, ph), mode="replicate") > 0.5).to(image.dtype)
+        y = (self.gen((x * 2 - 1) * (1 - m), m).clamp(-1, 1) + 1) * 0.5
+        return (x * (1 - m) + y * m)[:, :, :h, :w]
 
 
 def export(ckpt: str | Path, out: Path, size: int = 512, opset: int = 17, check: bool = True) -> Path:
@@ -81,12 +86,15 @@ def export(ckpt: str | Path, out: Path, size: int = 512, opset: int = 17, check:
             opset_version=opset, dynamo=False,
         )
         expected = ref(img, mask).numpy()
-    if check:
+    if check:  # parity at the trace size and at an odd size (exercises the in-graph padding)
         import onnxruntime as ort
 
-        got = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"]).run(
-            None, {"image": img.numpy(), "mask": mask.numpy()})[0]
-        err = float(np.abs(got - expected).max())
+        sess = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+        err = float(np.abs(sess.run(None, {"image": img.numpy(), "mask": mask.numpy()})[0] - expected).max())
+        oi, om = img[..., : size - 3, : size - 1], mask[..., : size - 3, : size - 1]
+        with torch.no_grad():
+            want = ref(oi, om).numpy()
+        err = max(err, float(np.abs(sess.run(None, {"image": oi.numpy(), "mask": om.numpy()})[0] - want).max()))
         if err > 2e-3:
             raise RuntimeError(f"onnx output differs from torch by {err:.2e}")
         print(f"exported {out} ({out.stat().st_size / 1e6:.1f} MB), max |onnx - torch| = {err:.1e}")

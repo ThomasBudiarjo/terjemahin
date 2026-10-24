@@ -88,10 +88,13 @@ terjemahin-worker translate page.png -t nllb --opt translator.model=training/run
 - What trains, from cheapest to most expressive: `--decoder-layers N` (last N decoder layers +
   final norm: 33.6M of 615M params for N=2, fits CPU in about 4 GB), `--freeze-encoder` (whole
   decoder), default (all but the 256k-token shared embedding, which is tied to the output layer),
-  `--train-embeddings` (everything). Frozen parameters get no gradients or optimizer state.
+  `--train-embeddings` (adds the shared embedding to any of the above; alone it is a full
+  fine-tune). Frozen parameters get no gradients or optimizer state.
 - Schedule: AdamW, `--scheduler linear|cosine|constant` with `--warmup` (steps, or a fraction
   of all steps if < 1), label smoothing 0.1, gradient clipping 1.0, `--grad-accum` for larger
   effective batches. Batches are length-bucketed to keep padding (and CPU time) down.
+- Held-out data: `--val FILE` (its sources are removed from the training data, so a page's
+  reference lines can never leak into training) or `--val-ratio`, split by distinct source.
 - Eval: corpus chrF (`textproc.chrf`) and a smoothed word BLEU on the held-out set before training
   (the baseline) and every `--eval-every` steps (default once per epoch); the best chrF checkpoint
   is saved. `--eval-worker` also scores the base and tuned models through the worker's own
@@ -125,12 +128,21 @@ terjemahin-worker translate page.png -i lama_manga --opt inpainter.weights=weigh
   and screentone edges sharp). No perceptual network or GAN, so it runs on CPU.
 - Eval: hole-only PSNR and MAE of the composited output on fixed held-out crops, next to the cv2
   Telea baseline; `best.pt` keeps the best PSNR, `metrics.json` the history.
+- Eval: if the held-out pages have no hole pixels, crops come from training pages instead; with no
+  holes at all the scores are `null` and `best.pt` follows the latest eval (never a fake 128 dB).
 - ONNX contract (identical to `koharu-lama-manga.onnx`): inputs `image [B,3,H,W]` RGB 0..1 and
-  `mask [B,1,H,W]` (1 = hole), output `output [B,3,H,W]` RGB 0..1; H, W dynamic (the worker uses
-  512). The graph zeroes the hole and does the -1..1 mapping itself. Weight standardisation is
-  folded into plain conv weights before export, and the export checks ONNX against torch.
-  `inpainter.weights` swaps the graph inside the `lama_manga` method, keeping its per-cluster
-  tiling and flat-balloon shortcut (that option is read by `inpaint/lama.py`).
+  `mask [B,1,H,W]` (1 = hole), output `output [B,3,H,W]` RGB 0..1; H, W dynamic (padded to a
+  multiple of 4 inside the graph, at least 68; the worker uses 512). The graph zeroes the hole
+  and does the -1..1 mapping itself. Weight standardisation is folded into plain conv weights
+  before export, and the export checks ONNX against torch at the trace size and an odd size.
+- Using it: `-i lama_manga --opt inpainter.weights=<onnx>` makes `inpaint/lama.py` load that graph
+  instead of koharu's LaMa, keeping its per-cluster tiling and flat-balloon shortcut; a missing
+  file is an error, not a silent fallback. Use `lama_manga`, not `lama`: the `lama` method expects
+  Carve's 0..255 output. On page01 with `--opt inpainter.flat_tol=0` (every hole through the
+  model) the fine-tuned AOT inpaints in 7.1 s vs 35.0 s for the stock LaMa.
+- Quality: AOT is a speed option, not a LaMa replacement. It copies periodic screentone and
+  hatching worse than LaMa's Fourier convolutions, and where two balloons overlap (page01's small
+  bottom-left balloon) it breaks the outline and leaves grey smears that LaMa does not.
 
 ## Smoke tests
 

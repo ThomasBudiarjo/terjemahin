@@ -334,9 +334,24 @@ def loss_fn(net, texted, clean, mask, hole_w: float, valid_w: float, edge_w: flo
                    "edge": round(l_edge.item(), 4)}
 
 
+def val_crops(pages: Pages, rng: random.Random, n: int, size: int, hard_ratio: float,
+              max_down: float) -> list:
+    """Fixed held-out crops that contain hole pixels (a crop without any cannot be scored)."""
+    out: list = []
+    for _ in range(n * 8):
+        if len(out) == n:
+            break
+        crop = sample_crop(pages, rng, size, hard_ratio, max_down, 0)
+        if crop[2].any():
+            out.append(crop)
+    return out
+
+
 @torch.no_grad()
-def evaluate(net: AOTGenerator, val: list) -> dict[str, float]:
-    """Hole-only PSNR / MAE (0..255) of the composited output, and the cv2 Telea baseline."""
+def evaluate(net: AOTGenerator, val: list) -> dict[str, float | None]:
+    """Hole-only PSNR / MAE (0..255) of the composited output, and the cv2 Telea baseline.
+
+    Scores are None when the crops hold no hole pixel, so no step can win on an empty set."""
     net.eval()
     se = ae = n = se_telea = 0.0
     for t, c, m in val:
@@ -350,8 +365,11 @@ def evaluate(net: AOTGenerator, val: list) -> dict[str, float]:
         tel = cv2.inpaint((t * 255).astype(np.uint8), k.astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
         se_telea += float((((tel.astype(np.float32) / 255 - c)[k] * 255) ** 2).sum())
     net.train()
-    psnr = lambda s: 10 * math.log10(255**2 / max(s / max(n, 1), 1e-8))
-    return {"psnr_hole": psnr(se), "mae_hole": ae / max(n, 1), "psnr_hole_telea": psnr(se_telea)}
+    if not n:
+        return {"psnr_hole": None, "mae_hole": None, "psnr_hole_telea": None, "hole_px": 0}
+    psnr = lambda s: 10 * math.log10(255**2 / max(s / n, 1e-8))
+    return {"psnr_hole": psnr(se), "mae_hole": ae / n, "psnr_hole_telea": psnr(se_telea),
+            "hole_px": int(n // 3)}
 
 
 def split(items: list, val_ratio: float) -> tuple[list, list]:
@@ -414,7 +432,13 @@ def main(argv: list[str] | None = None) -> dict:
         ap.error("no training pages: pass --data and/or --clean-only")
     val_pages = Pages(va_t, va_c, a.flat_tol) if va_t or va_c else train
     vr = random.Random(a.seed + 1)
-    val = [sample_crop(val_pages, vr, a.size, a.hard_ratio, a.max_down, 0) for _ in range(a.val_crops)]
+    val = val_crops(val_pages, vr, a.val_crops, a.size, a.hard_ratio, a.max_down)
+    if not val and val_pages is not train:
+        print("warning: held-out pages have no holes; scoring on training pages", flush=True)
+        val_pages = train
+        val = val_crops(train, vr, a.val_crops, a.size, a.hard_ratio, a.max_down)
+    if not val:
+        print("warning: no hole pixels to score; best.pt follows the latest eval", flush=True)
 
     net = load_generator(a.init, a.ch, a.blocks).to(a.device).train()
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, betas=(0.5, 0.9), weight_decay=0.0)
@@ -446,8 +470,9 @@ def main(argv: list[str] | None = None) -> dict:
         if step % a.eval_every == 0 or step == a.steps:
             history.append({"step": step, **evaluate(net, val)})
             print(json.dumps(history[-1]), flush=True)
-            if history[-1]["psnr_hole"] > best:
-                best = history[-1]["psnr_hole"]
+            cur = history[-1]["psnr_hole"]
+            if cur is None or best is None or cur > best:
+                best = cur
                 save(net, a.out / "best.pt", step, history[-1])
     save(net, a.out / "last.pt", a.steps, history[-1])
     result = {"history": history, "best": str(a.out / "best.pt"), "best_psnr_hole": best}

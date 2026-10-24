@@ -14,6 +14,7 @@ from terjemahin_worker.ocr.mit48px import (
     PIECE_WIDTH,
     SPLIT_WIDTH,
     TEXT_HEIGHT,
+    as_bgr8,
     join_lines,
     line_direction,
     line_pieces,
@@ -101,9 +102,67 @@ def test_split_lines_glues_punctuation():
     assert len(split_lines(gray, r)) == 1
 
 
+def test_split_lines_keeps_dashes_spaces_and_touching_glyphs():
+    """Glyph filtering is by thickness across the line only, and a line runs over word or
+    full-width spaces: a dash run, a fused bold blob and the text after a space all stay."""
+    gray = np.full((400, 120), 255, np.uint8)
+    gray[20:56, 40:76] = 0  # glyph
+    gray[60:140, 56:60] = 0  # ―― : thin and 2+ em long along the column
+    gray[190:226, 40:76] = 0  # after a full-width space (50px gap)
+    gray[230:340, 38:78] = 0  # three touching bold glyphs, one 110px blob
+    r = TextRegion(id=0, bbox=BBox(x1=0, y1=0, x2=120, y2=400), direction="v")
+    (q,) = split_lines(gray, r)
+    q = order_quad(q)
+    assert q[0, 1] <= 20 and q[2, 1] >= 339
+    gray = np.full((140, 600), 255, np.uint8)
+    gray[30:60, 20:200] = 0  # touching Latin letters fused into one wide component
+    gray[55:68, 206:210] = 0  # a comma hanging below the baseline
+    gray[30:60, 260:330] = 0  # next word after ", "
+    gray[90:120, 20:120] = 0  # second row
+    r = TextRegion(id=0, bbox=BBox(x1=0, y1=0, x2=600, y2=140), direction="h")
+    q1, q2 = (order_quad(split_lines(gray, r)[i]) for i in reading_order(split_lines(gray, r), "h"))
+    assert q1[0, 0] <= 20 and q1[1, 0] >= 329 and q1[2, 1] >= 67  # comma tail inside
+    assert q2[0, 1] >= 75  # rows do not bleed into each other
+
+
+def test_split_lines_leaves_out_stray_strokes_past_the_text():
+    gray = np.full((400, 100), 255, np.uint8)
+    cv2.line(gray, (30, 2), (36, 30), 0, 3)  # speed line clipped by the box, 2+ em above
+    gray[110:146, 30:66] = 0  # は
+    gray[150:186, 30:66] = 0  # い
+    gray[190:198, 30:38] = 0  # 、 small, then a full-width space
+    gray[250:286, 30:66] = 0  # そ
+    r = TextRegion(id=0, bbox=BBox(x1=0, y1=0, x2=100, y2=400), direction="v")
+    (q,) = split_lines(gray, r)
+    q = order_quad(q)
+    assert 100 <= q[0, 1] <= 110 and q[2, 1] >= 285  # stroke out, comma and space bridged
+
+
+def test_as_bgr8_normalises_layouts_and_dtypes():
+    ref = np.random.default_rng(0).integers(0, 256, (8, 9), np.uint8)
+    want = np.repeat(ref[..., None], 3, 2)
+    for img in (
+        ref,
+        ref[..., None],
+        ref.astype(np.float32),
+        ref / 255.0,
+        ref.astype(np.uint16) << 8,
+    ):
+        out = as_bgr8(img)
+        assert out.dtype == np.uint8 and out.shape == (8, 9, 3)
+        assert np.abs(out.astype(int) - want).max() <= 1
+
+
 def test_text_helpers():
     assert join_lines(["ねえねえ、", "めいは"]) == "ねえねえ、めいは"
     assert join_lines(["HELLO", "WORLD"]) == "HELLO WORLD"
+    assert join_lines(["HELLO THERE,", "HOW", "ARE YOU?", '"FINE."', "OK"]) == (
+        'HELLO THERE, HOW ARE YOU? "FINE." OK'
+    )
+    assert join_lines(["WAIT...", "WHAT"]) == "WAIT... WHAT"
+    assert join_lines(["WON-", "DERFUL"]) == "WON-DERFUL"
+    assert join_lines(["どう思う?", "じゃあ"]) == "どう思う?じゃあ"
+    assert join_lines(["えー!", "10円"]) == "えー!10円"
     assert vertical_forms("そうだなあ：") == "そうだなあ‥"
     assert vertical_forms("：あ:") == "‥あ‥"
     assert vertical_forms("10:30に") == "10:30に"  # a real colon between digits stays
@@ -344,3 +403,66 @@ def test_long_line_is_split_not_collapsed(ocr):
     (o,) = ocr.recognize(img, [region])
     assert cer(o.text, text) < 0.03, o.text
     assert " " in o.text and o.fg_color is not None
+
+
+def _font(*paths):
+    return next((p for p in map(Path, paths) if p.exists()), None)
+
+
+JA_FONT = _font(
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+    "/home/user/zyddnys/manga-image-translator/fonts/msgothic.ttc",
+)
+
+
+@needs_model
+def test_box_only_fallback_keeps_latin_words_and_punctuation(ocr):
+    """Regions without line quads (classical, ctd_blk, yolo) go through split_lines; nothing
+    after a comma-space, a touching pair or a line-final comma may be lost."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.truetype(str(ROOT / "fonts" / "ComicShanns2.ttf"), 40)
+    for lines in (
+        ["HELLO THERE, HOW", "ARE YOU DOING", "TODAY, FRIEND?"],
+        ["I'M NOT GOING", "ANYWHERE, OKAY?"],
+    ):
+        w = max(int(font.getlength(t)) for t in lines) + 60
+        im = Image.new("RGB", (w, len(lines) * 52 + 60), "white")
+        for i, t in enumerate(lines):
+            ImageDraw.Draw(im).text((30, 30 + i * 52), t, font=font, fill="black")
+        img = np.ascontiguousarray(np.array(im)[..., ::-1])
+        region = TextRegion(id=0, bbox=BBox(x1=0, y1=0, x2=w, y2=im.height), direction="h")
+        (o,) = ocr.recognize(img, [region])
+        assert o.text == " ".join(lines), o.text
+
+
+def _raqm() -> bool:
+    from PIL import features
+
+    return bool(features.check("raqm"))
+
+
+@needs_model
+@pytest.mark.skipif(JA_FONT is None or not _raqm(), reason="no Japanese font / vertical layout")
+def test_box_only_fallback_keeps_dashes_and_fullwidth_spaces(ocr):
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.truetype(str(JA_FONT), 40)
+    for cols in (
+        ["待って――！！"],
+        ["まさか――", "嘘だろ？"],
+        ["はい、　そうです"],
+        ["ちょっと　まって", "まだ　だめ"],
+    ):
+        w, h = len(cols) * 56 + 60, max(map(len, cols)) * 42 + 80
+        im = Image.new("RGB", (w, h), "white")
+        d = ImageDraw.Draw(im)
+        for j, col in enumerate(cols):
+            x = w - 30 - (j + 1) * 56
+            d.text((x, 30), col, font=font, fill="black", direction="ttb", features=["vert"])
+        img = np.ascontiguousarray(np.array(im)[..., ::-1])
+        region = TextRegion(id=0, bbox=BBox(x1=0, y1=0, x2=w, y2=h), direction="v")
+        (o,) = ocr.recognize(img, [region])
+        dash = str.maketrans("―ー一", "---")  # a lone vertical bar is any of these
+        got, want = o.text.translate(dash), "".join(cols).translate(dash)
+        assert cer(got, want) <= 0.1 and len(norm(got)) >= len(norm(want)), o.text

@@ -11,7 +11,7 @@ long ink structures (balloon outlines, art lines) out of the mask.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -36,6 +36,7 @@ class Crop:
     box: tuple[int, int, int, int]  # region bbox in crop coords
     cut: np.ndarray  # bool, crop border pixels that are not page border: things continue there
     has_lines: bool = True  # False when `lines` is just the box
+    reach: float = 0.5  # `near` = `lines` grown by reach x font
 
     @property
     def sl(self) -> tuple[slice, slice]:
@@ -73,11 +74,12 @@ def measure_glyphs(crop: np.ndarray) -> int | None:
         return None
     g = cv2.cvtColor(crop[..., :3], cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     _, ink = cv2.threshold(g, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    if ink.mean() > 0.5:
-        ink = 1 - ink
-    st = cv2.connectedComponentsWithStats(ink, connectivity=8)[2]
-    st = st[1:]
-    h, w = g.shape[:2]
+    return glyph_extent(ink < 1 if ink.mean() > 0.5 else ink > 0)
+
+
+def glyph_extent(ink: np.ndarray) -> int | None:
+    st = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)[2][1:]
+    h, w = ink.shape[:2]
     x, y, bw, bh, area = st.T
     inner = (x > 0) & (y > 0) & (x + bw < w) & (y + bh < h) & (area >= 6)
     if inner.sum() < 2:
@@ -97,9 +99,10 @@ def make_crop(r: TextRegion, img: np.ndarray, reach: float) -> Crop | None:
     b = r.bbox
     bx1, bx2 = sorted((b.x1, b.x2))
     by1, by2 = sorted((b.y1, b.y2))
-    if min(bx2, W) <= max(bx1, 0) or min(by2, H) <= max(by1, 0):
+    bx1, bx2, by1, by2 = max(bx1, 0), min(bx2, W), max(by1, 0), min(by2, H)
+    if bx2 <= bx1 or by2 <= by1:
         return None
-    if (bx1, by1) != (b.x1, b.y1):
+    if (bx1, by1, bx2, by2) != (b.x1, b.y1, b.x2, b.y2):
         r = r.model_copy(update={"bbox": BBox(x1=bx1, y1=by1, x2=bx2, y2=by2)})
     fs = font_size(r, img)
     grow = max(2, round(fs * reach))
@@ -118,7 +121,7 @@ def make_crop(r: TextRegion, img: np.ndarray, reach: float) -> Crop | None:
     cut = np.zeros_like(near)
     cut[0, :], cut[-1, :], cut[:, 0], cut[:, -1] = y1 > 0, y2 < H, x1 > 0, x2 < W
     box = (bx1 - x1, by1 - y1, bx2 - x1, by2 - y1)
-    return Crop(x1, y1, x2, y2, fs, lines, near, box, cut, has_lines)
+    return Crop(x1, y1, x2, y2, fs, lines, near, box, cut, has_lines, reach)
 
 
 def as_u8_mask(raw: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
@@ -272,6 +275,111 @@ def binarise(
     return None
 
 
+def dominant(px: np.ndarray) -> np.ndarray:
+    """Median of the most frequent 16-level colour bin: the paper, even with lots of ink."""
+    q = (px >> 4).astype(np.int32)
+    key = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
+    return np.median(px[key == np.bincount(key).argmax()], axis=0)
+
+
+def balloon_paper(
+    crop: np.ndarray, c: Crop, tol: float = 30.0
+) -> tuple[np.ndarray, np.ndarray, float, Crop] | None:
+    """Paper for a box that spills over the balloon outline or onto art, where the border rings
+    mix paper with outline and art: the dominant colour of the box (or of its middle, when the
+    box holds more background than balloon) and its solid connected area, the balloon interior.
+    The text zone is cut to that area's filled outline, so art and outlines beyond it are out of
+    reach. Of the candidates that work, the one leaving the least ink on the text lines wins."""
+    x1, y1, x2, y2 = c.box
+    if (x2 - x1) * (y2 - y1) < 64:
+        return None
+    dy, dx = (y2 - y1) // 4, (x2 - x1) // 4
+    cands = [dominant(crop[y1:y2, x1:x2].reshape(-1, 3))]
+    mid = crop[y1 + dy : y2 - dy, x1 + dx : x2 - dx].reshape(-1, 3)
+    if len(mid) >= 16:
+        alt = dominant(mid)
+        if color_distance(alt[None, None], cands[0])[0, 0] > tol / 2:
+            cands.append(alt)
+    best = None
+    for bg in cands:
+        found = paper_area(crop, c, bg, tol)
+        if found is not None and (best is None or found[0] < best[0]):
+            best = found
+    return None if best is None else best[1:]
+
+
+def paper_area(
+    crop: np.ndarray,
+    c: Crop,
+    bg: np.ndarray,
+    tol: float,
+    solid: int = 7,
+    min_solid: float = 0.15,
+    max_ink: float = 0.65,
+) -> tuple[float, np.ndarray, np.ndarray, float, Crop] | None:
+    """(ink share of the lines, paper colour, distance, spread, narrowed crop) for paper `bg`.
+    None when it has no solid area in the box: an opening by `solid` px removes the thin gaps
+    between screentone dots or hatching."""
+    x1, y1, x2, y2 = c.box
+    dist = color_distance(crop, bg)
+    paper = (dist < tol).astype(np.uint8)
+    n, labels = cv2.connectedComponents(paper, connectivity=4)
+    core = cv2.erode(paper, ellipse(solid)) > 0
+    inbox = np.zeros(paper.shape, bool)
+    inbox[y1:y2, x1:x2] = True
+    votes = np.bincount(labels[core & inbox], minlength=n)
+    votes[0] = 0
+    # every solid paper piece counts: a glyph touching the outline can cut a balloon in
+    # pieces, and a loose box can hold a neighbour balloon bigger than the text's own
+    area = np.bincount(labels[inbox], minlength=n)
+    keep = (votes >= max(64, 0.02 * votes.max())) & (votes >= 0.25 * area)
+    if votes[keep].sum() < min_solid * inbox.sum():
+        return None
+    region = keep[labels].astype(np.uint8)
+    contours, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(region)
+    cv2.drawContours(filled, contours, -1, 1, -1)
+    spread = float(np.percentile(dist[(region > 0) & inbox], 60))
+    ink = dist > max(30.0, 2 * spread)
+    font = c.font
+    if not c.has_lines:  # a loose box measured background shapes too; the balloon's ink is text
+        est = glyph_extent(ink & (filled > 0))
+        font = font if est is None else int(np.clip(est, 6, font))
+    # glyphs touching the outline dent the paper's contour instead of being holes in it
+    interior = cv2.dilate(filled, ellipse(2 * max(2, round(0.15 * font)) + 1)) > 0
+    lines = c.lines & interior
+    if not lines.any():
+        return None
+    share = float(ink[lines].mean())
+    if share > max_ink:
+        return None
+    near = c.near & interior
+    if font < c.font:
+        grow = max(2, round(font * c.reach))
+        near = (cv2.dilate(lines.astype(np.uint8), ellipse(2 * grow + 1)) > 0) & interior
+    return share, bg, dist, spread, replace(c, font=font, lines=lines, near=near)
+
+
+def textured(dist: np.ndarray, c: Crop, tol: float = 30.0, solid: int = 7) -> bool:
+    """Screentone or hatching passes the ring test (most ring pixels are the paper between the
+    dots) but has no solid paper anywhere near the text: the gaps vanish under an opening."""
+    paper = cv2.erode((dist < tol).astype(np.uint8), ellipse(solid)) > 0
+    return float(paper[c.near].mean()) < 0.05
+
+
+def find_paper(
+    crop: np.ndarray, c: Crop, flat_spread: float
+) -> tuple[np.ndarray, np.ndarray, float, Crop] | None:
+    """Rings around the text lines first; the balloon interior when they are mixed, and for a
+    bare box (whose edge may cross the outline or art) before the rings."""
+    if not c.has_lines and (b := balloon_paper(crop, c)) is not None:
+        return b
+    found = binarise(crop, c)
+    if found is not None and found[2] <= flat_spread and not textured(found[1], c):
+        return (*found, c)
+    return None if not c.has_lines else balloon_paper(crop, c)
+
+
 def busy_box(c: Crop) -> np.ndarray:
     """Text over art: glyphs cannot be told from art by colour, so erase the text lines with
     a small margin rather than leave half-erased strokes."""
@@ -343,13 +451,13 @@ class GlyphMask:
             bg, _ = border_background(crop, c.near, c.box)
         body = cv2.erode(sure.astype(np.uint8), ellipse(3)) > 0
         fg = np.median(crop[body if body.sum() >= 8 else core], axis=0)
-        return self._complete(core, blend_ink(crop, bg, fg, self.ink), sure, c)
+        return self._complete(core, blend_ink(crop, bg, fg, self.ink), c, sure)
 
     def _from_pixels(self, crop: np.ndarray, c: Crop) -> np.ndarray:
-        found = binarise(crop, c)
-        if found is None or found[2] > self.flat_spread:
+        found = find_paper(crop, c, self.flat_spread)
+        if found is None:
             return busy_box(c)
-        bg, dist, spread = found
+        bg, dist, spread, c = found
         zone = dist[c.near] if c.near.any() else dist.ravel()
         otsu, _ = cv2.threshold(
             zone.astype(np.uint8).reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
@@ -360,25 +468,31 @@ class GlyphMask:
         if not core.any():
             return np.zeros(crop.shape[:2], np.uint8)
         fg = np.median(crop[sure], axis=0)
-        return self._complete(core, blend_ink(crop, bg, fg, self.ink), sure, c)
+        return self._complete(core, blend_ink(crop, bg, fg, self.ink), c)
 
-    def _complete(self, core: np.ndarray, ink: np.ndarray, sure: np.ndarray, c: Crop) -> np.ndarray:
+    def _complete(
+        self, core: np.ndarray, ink: np.ndarray, c: Crop, sure: np.ndarray | None = None
+    ) -> np.ndarray:
         """Grow the core into touching ink (fringe, thin strokes, dots), dilate by font size,
-        and cut out balloon outlines / art lines that the dilation reached."""
+        and cut out balloon outlines / art lines that the dilation reached. `sure` = pixels the
+        detector calls text; colour alone cannot tell a glyph from the outline it touches."""
         zone = cv2.dilate(core.astype(np.uint8), ellipse(2 * round(c.font * self.grow) + 1)) > 0
         cand = (ink & zone) | core
         n, labels = cv2.connectedComponents(cand.astype(np.uint8), connectivity=8)
         touch = np.bincount(labels[core], minlength=n) > 0
         touch[0] = False
         m = touch[labels]
-        d = max(self.min_dilate, round(c.font * self.dilation) * 2 + 1)
-        m = cv2.dilate(m.astype(np.uint8), ellipse(d)) > 0
+        guard = None
         if self.protect:
             guard = structure(ink, c)
-            if c.has_lines:
+            if c.has_lines and sure is not None:
                 # confident text pixels on a real text line still go: a glyph touching the outline
                 k = ellipse(2 * (c.font // 10) + 1)
                 guard &= ~(sure & (cv2.dilate(c.lines.astype(np.uint8), k) > 0))
+            m &= ~guard  # before dilating, or the outline's own dilation hugs it as a ring
+        d = max(self.min_dilate, round(c.font * self.dilation) * 2 + 1)
+        m = cv2.dilate(m.astype(np.uint8), ellipse(d)) > 0
+        if guard is not None:
             m &= ~(cv2.dilate(guard.astype(np.uint8), ellipse(3)) > 0)
         return m.astype(np.uint8) * 255
 
@@ -414,11 +528,11 @@ class DilateMask:
             if raw is not None:
                 m = raw[c.sl] >= self.threshold * 255
             else:
-                found = binarise(img[c.sl], c)
-                if found is None or found[2] > self.flat_spread:
+                found = find_paper(img[c.sl], c, self.flat_spread)
+                if found is None:
                     out[c.sl] |= busy_box(c)
                     continue
-                _, dist, spread = found
+                _, dist, spread, c = found
                 t = max(40.0, 2 * spread)
                 # ink that runs out of the window is art or a balloon outline, not text
                 m = hysteresis(dist > t, c.near, c, retry=(dist > 2 * t,))
