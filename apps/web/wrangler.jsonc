@@ -28,6 +28,7 @@
 		// offline, so the app needs no Clerk secret.
 		"PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsudGVyamVtYWguaW4k",
 		"CLERK_JWT_KEY": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxqogf5FPGBosO6uZ/xpa\nwSZjOl1hbE4AOzlYjZvfTr1CTmHQ6eURNhoAFLv/3AMaVMUXkmFxtfa/lDwhVGN7\nJ618dUQ8u/Uu0G9DT8zGT19jVQtglTuzRV7MnugMIG2xbwgLiRyvQmgJb++zB099\n+DC3xLJ60tql8+u2TK4XvxI7tl/WMBKIZrcDIVpX/s0+4328cLLLHiZkDgMcGQLg\narRKbFapTto9/P+cWweKIU6q7zP0AE+wFP2WTqM+sxi/P8wojit5YYRCnd90F6tq\nqo4Y13Mapv2hDeyr1wRLbaQRgEdK5eXTW3YhtaQ7y6Gsxf65tCOQNKVHKrYaLKu8\nMwIDAQAB\n-----END PUBLIC KEY-----"
-	}
-	// secrets (`wrangler secret put`): WORKER_TOKEN, CF_QUEUES_API_TOKEN (Account > Queues > Edit)
+	},
+	// set in the dashboard or with `wrangler secret put`; CF_QUEUES_API_TOKEN: Account > Queues > Edit
+	"secrets": { "required": ["WORKER_TOKEN", "CF_QUEUES_API_TOKEN"] }
 }
