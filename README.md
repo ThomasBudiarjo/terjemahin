@@ -13,7 +13,7 @@ the web UI, the HTTP API or `.env`.
                      ┌──────────────────── apps/worker (Python) ──────────────────────┐
  CLI  ──────────────▶│                                                                │
  web UI / JSON API ─▶│  detect ─▶ OCR ─▶ translate ─▶ mask refine ─▶ inpaint ─▶ render │──▶ page.png
- (terjemahin-worker  │   ctd      manga  m2m100       default        lama_manga  default │    + page.json
+ (terjemahin-worker  │   ctd      manga  m2m100       default        telea       default │    + page.json
   web, :8000)        │            _ocr                                                │      (bubbles)
                      └───────────▲────────────────────────────────────────────────────┘
  apps/api (Go, :8080)            │ JobMessage (input path, PageContext, PipelineConfig)
@@ -67,9 +67,9 @@ use.
 | mask_refiner | dilate | – | Detector mask (or binarised box) inside the text zone, dilated. |
 | inpainter | fill | – | Flat fill with the surrounding median colour (fast). |
 | inpainter | lama | weights | big-lama Places2 (Carve ONNX 512), same tiling as lama_manga; better on photographic backgrounds, worse on line art and screentone. |
-| inpainter | **lama_manga** | weights | LaMa fine-tuned on manga (ONNX 512), per text cluster at native resolution; flat-background holes filled exactly without the model (~3s per 512 tile CPU). |
+| inpainter | lama_manga | weights | LaMa fine-tuned on manga (ONNX 512), per text cluster at native resolution; flat-background holes filled exactly without the model (~3s per 512 tile CPU). |
 | inpainter | ns | – | OpenCV Navier-Stokes inpaint (no weights, fast). |
-| inpainter | telea | – | OpenCV Telea fast-marching inpaint (no weights, fast). |
+| inpainter | **telea** | – | OpenCV Telea fast-marching inpaint (no weights, fast), radius 5 px by default. |
 | renderer | basic | – | Horizontal centred text in the detector box (v1). |
 | renderer | **default** | – | Balloon-aware typesetting: finds each balloon's interior, fits the text to its shape (font-size search, Indonesian hyphenation, no orphans), page-consistent sizes, outline over art; vertical columns for CJK targets. |
 | renderer | vertical | – | Vertical right-to-left columns for CJK targets (ja/zh/ko), balloon-aware, vertical punctuation forms, kinsoku; needs a CJK font (font_path or fonts/*CJK*). |
@@ -165,7 +165,8 @@ defaults; full table under [Performance](#performance)):
   keys). `none` erases without typesetting, `original` checks OCR and typesetting.
 - **Mask refiner**: keep `default`. `bbox` erases whole boxes (changes art around text);
   `dilate` is a looser glyph mask.
-- **Inpainter**: `lama_manga` (default, 3.7 s) for screentone and art behind text. On plain
+- **Inpainter**: `telea` is the default, with radius 5 px. Choose `lama_manga` (3.7 s in the
+  benchmark below) for screentone and art behind text. On plain
   white balloons `telea`, `ns` and `fill` (0.3 s) score the same on page01 and are 10x
   faster. `lama` (Places2) is slower and meant for photographic backgrounds.
 - **Renderer**: `default` for Latin targets; `vertical` only for ja/zh/ko targets (with a CJK
@@ -291,7 +292,8 @@ Fresh harness run on 2026-10-24 (final fix round): page01 (1487x2048, 13 balloon
 cores, no GPU, `python -m terjemahin_worker.eval bench ... --matrix` (4 min 18 s for the whole
 matrix). Other pages: docs/PROOF.md section 0.6.
 
-Default pipeline (`ctd`, `manga_ocr`, `m2m100`, `default`, `lama_manga`, `default`):
+Pipeline at the time of this benchmark (`ctd`, `manga_ocr`, `m2m100`, `default`, `lama_manga`, `default`;
+the current default inpainter is `telea`):
 
 | check | result | threshold |
 |---|---|---|

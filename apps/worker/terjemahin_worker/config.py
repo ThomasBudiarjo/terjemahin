@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     ocr: str = "manga_ocr"
     translator: str = "m2m100"  # best offline seq2seq on page01 + eval/fixtures/lines_ja_id.tsv
     mask_refiner: str = "default"
-    inpainter: str = "lama_manga"
+    inpainter: str = "telea"
     renderer: str = "default"
     source_lang: str = "ja"
     target_lang: str = "id"
