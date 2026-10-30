@@ -8,10 +8,11 @@ WORKER_ROOT = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # queue
-    amqp_url: str = "amqp://guest:guest@localhost:5672/"
-    amqp_queue: str = "terjemahin.jobs"
-    storage_dir: Path = Path("./data")
+    # `serve`: the web app (apps/web) the worker takes jobs from
+    api_url: str = "http://localhost:5173"
+    worker_token: str = ""  # the app's WORKER_TOKEN secret
+    poll_interval: float = 2.0  # seconds between claims while there is nothing to do
+    storage_dir: Path = Path("./data")  # the worker web UI keeps its jobs here
 
     # default method per stage (see `terjemahin-worker methods`)
     detector: str = "ctd"

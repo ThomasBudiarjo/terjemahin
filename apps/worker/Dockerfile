@@ -1,4 +1,4 @@
-# terjemahin worker: queue consumer (`serve`, default) or web UI (`web --host 0.0.0.0`).
+# terjemahin worker: takes jobs from the web app (`serve`, default) or web UI (`web --host 0.0.0.0`).
 #
 #   docker build -t terjemahin-worker apps/worker
 #   docker build --build-arg FETCH="--all" -t terjemahin-worker apps/worker    # every weight file

@@ -693,27 +693,68 @@ def test_cli_llm_connection_failure_is_one_line(tmp_path):
     assert "Traceback" not in r.output
 
 
-# --- consumer -------------------------------------------------------------------------------
+# --- serve (consumer) -------------------------------------------------------------------------------
 
-def test_consumer_reports_bad_messages_and_creates_result_dirs(tmp_path, pipe):
-    from terjemahin_worker.consumer import bad_message_status, process
-    from terjemahin_worker.models import JobMessage
+def test_serve_runs_claimed_jobs_and_reports_failures(pipe):
+    """`serve` against a fake web app: a good debug job, a malformed job (reported failed, not
+    left running) and an unreadable page, then nothing to do."""
+    import httpx
 
-    st = bad_message_status(json.dumps({"job_id": "j1", "page_id": "p", "context": 123}).encode(),
-                            ValueError("context Input should be an object"))
-    assert st and st["job_id"] == "j1" and st["status"] == "failed" and "context" in st["error"]
-    assert bad_message_status(b"not json", ValueError("x")) is None
+    from terjemahin_worker.consumer import run_once
 
-    settings = Settings(storage_dir=tmp_path)
-    cv2.imwrite(str(tmp_path / "in.png"), _page())
-    job = JobMessage(job_id="x4", page_id="p", input_path="in.png", output_path="o4/out.png",
-                     result_path="r4/result.json", pipeline=PipelineConfig(**CHEAP))
-    st = process(job, pipe, settings)
-    assert st["status"] == "done", st
-    assert (tmp_path / "r4" / "result.json").exists()
-    (tmp_path / "txt.png").write_text("hello")
-    st = process(job.model_copy(update={"input_path": "txt.png"}), pipe, settings)
-    assert st["status"] == "failed" and "not a readable image" in st["error"]
+    page = cv2.imencode(".png", _page())[1].tobytes()
+    claims = [
+        {"lease": "L1", "job": {"job_id": "j1", "page_id": "j1", "pipeline": CHEAP, "debug": True}},
+        {"lease": "L2", "job": {"job_id": "j2", "page_id": "j2", "context": 123}},
+        {"lease": "L3", "job": {"job_id": "j3", "page_id": "j3", "pipeline": CHEAP}},
+    ]
+    inputs = {"j1": page, "j3": b"not an image"}
+    posted: dict[str, httpx.Request] = {}
+
+    def app(req: httpx.Request) -> httpx.Response:
+        assert req.headers["authorization"] == "Bearer t"
+        path = req.url.path
+        if path == "/api/worker/claim":
+            return httpx.Response(200, json=claims.pop(0)) if claims else httpx.Response(204)
+        job_id = path.split("/")[4]
+        if path.endswith("/input"):
+            return httpx.Response(200, content=inputs[job_id])
+        posted[job_id] = req
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.Client(base_url="http://app", headers={"authorization": "Bearer t"},
+                          transport=httpx.MockTransport(app))
+    settings = Settings()
+    while run_once(client, pipe, settings):
+        pass
+
+    def form(req: httpx.Request) -> dict[str, bytes]:
+        """name -> value of a multipart or urlencoded body."""
+        ctype = req.headers["content-type"]
+        if ctype.startswith("application/x-www-form-urlencoded"):
+            from urllib.parse import parse_qsl
+            return {k: v.encode() for k, v in parse_qsl(req.content.decode())}
+        from email.parser import BytesParser
+        msg = BytesParser().parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n"
+                                       + req.content)
+        return {p.get_param("name", header="content-disposition"): p.get_payload(decode=True)
+                for p in msg.get_payload()}
+
+    done = form(posted["j1"])
+    assert done["lease"] == b"L1" and done["status"] == b"done"
+    out = cv2.imdecode(np.frombuffer(done["output"], np.uint8), cv2.IMREAD_COLOR)
+    assert out.shape == _page().shape
+    result = PageResult.model_validate_json(done["result"])
+    assert int(done["bubbles"]) == len(result.bubbles) > 0
+    assert {"debug_detect", "debug_mask", "debug_inpainted", "debug_final"} <= done.keys()
+
+    bad = form(posted["j2"])
+    assert bad["lease"] == b"L2" and bad["status"] == b"failed"
+    assert b"invalid job message" in bad["error"] and b"context" in bad["error"]
+
+    unreadable = form(posted["j3"])
+    assert unreadable["status"] == b"failed" and b"not a readable image" in unreadable["error"]
+    assert "output" not in unreadable
 
 
 # --- web ------------------------------------------------------------------------------------

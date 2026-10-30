@@ -440,7 +440,7 @@ def fetch_weights(
 
 @app.command()
 def serve() -> None:
-    """Consume jobs from LavinMQ until interrupted."""
+    """Take jobs from the web app (API_URL, WORKER_TOKEN) until interrupted."""
     from .consumer import run
 
     run(get_settings())

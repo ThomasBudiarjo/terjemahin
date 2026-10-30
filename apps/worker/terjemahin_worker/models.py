@@ -128,11 +128,11 @@ class PageResult(BaseModel):
 
 
 class JobMessage(BaseModel):
+    """A job as the web app hands it to `terjemahin-worker serve` (consumer.py)."""
+
     job_id: str
     page_id: str
-    input_path: str
-    output_path: str
-    result_path: str
     context: PageContext = Field(default_factory=PageContext)
     pipeline: PipelineConfig | None = None
-    debug_dir: str | None = None
+    debug: bool = False
+    """Also return the per-stage images (detect, mask, inpainted, final)."""

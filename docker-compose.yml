@@ -1,48 +1,14 @@
 services:
-  lavinmq:
-    image: cloudamqp/lavinmq:latest
-    ports:
-      - "5672:5672"
-      - "15672:15672"   # management UI
-    volumes:
-      - lavinmq-data:/var/lib/lavinmq
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: terjemahin
-      POSTGRES_PASSWORD: terjemahin
-      POSTGRES_DB: terjemahin
-    ports:
-      - "5432:5432"
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-
-  api:
-    build: ./apps/api
-    env_file: .env
-    environment:
-      AMQP_URL: amqp://guest:guest@lavinmq:5672/
-      DATABASE_URL: postgres://terjemahin:terjemahin@postgres:5432/terjemahin?sslmode=disable
-      STORAGE_DIR: /data
-    ports:
-      - "8080:8080"
-    volumes:
-      - shared-data:/data
-    depends_on: [lavinmq, postgres]
-
+  # takes jobs from the web app (apps/web, Cloudflare Worker or `pnpm dev`):
+  #   API_URL and WORKER_TOKEN in .env, then  docker compose up --build worker
   worker:
     build: ./apps/worker
     image: terjemahin-worker:local
     env_file: .env
-    environment:
-      AMQP_URL: amqp://guest:guest@lavinmq:5672/
-      STORAGE_DIR: /data
-    volumes:
-      - shared-data:/data
-    depends_on: [lavinmq]
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # API_URL=http://host.docker.internal:5173 for `pnpm dev`
 
-  # standalone web UI + JSON API of the worker (no queue needed):
+  # standalone web UI + JSON API of the worker (self-host, no app or queue needed):
   #   docker compose --profile web up web   ->  http://localhost:8000
   web:
     profiles: [web]
@@ -57,9 +23,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - shared-data:/data
+      - web-data:/data
 
 volumes:
-  lavinmq-data:
-  pg-data:
-  shared-data:
+  web-data:

@@ -1,0 +1,8 @@
+node_modules
+.svelte-kit
+.wrangler
+.env
+.env.*
+!.env.example
+.dev.vars
+vite.config.ts.timestamp-*

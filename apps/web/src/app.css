@@ -1,0 +1,40 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/bricolage-grotesque";
+@import "@fontsource/noto-sans-jp/500.css";
+@import "@fontsource/noto-sans-jp/800.css";
+
+@theme {
+  --color-paper: #f3f0ea;
+  --color-paper-2: #e9e5dc;
+  --color-ink: #151515;
+  --color-ink-soft: #55524c;
+  --color-shu: #e5402a;
+  --color-shu-dark: #c4321f;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Bricolage Grotesque Variable", "Inter Variable", sans-serif;
+  --font-jp: "Noto Sans JP", sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+
+/* Faint drafting grid, as behind a sketch. */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgb(21 21 21 / 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(21 21 21 / 0.06) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Manga screentone: a dot pattern. */
+.bg-tone {
+  background-image: radial-gradient(rgb(21 21 21 / 0.16) 1.1px, transparent 1.3px);
+  background-size: 7px 7px;
+}

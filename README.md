@@ -16,8 +16,9 @@ the web UI, the HTTP API or `.env`.
  (terjemahin-worker  │   ctd      manga  m2m100       default        telea       default │    + page.json
   web, :8000)        │            _ocr                                                │      (bubbles)
                      └───────────▲────────────────────────────────────────────────────┘
- apps/api (Go, :8080)            │ JobMessage (input path, PageContext, PipelineConfig)
-   POST /v1/pages ──▶ LavinMQ ───┘ terjemahin-worker serve ──▶ results queue ──▶ GET /v1/jobs/{id}
+ apps/web (SvelteKit on Cloudflare Workers)   │ terjemahin-worker serve: claim job, page in,
+   landing page (prerendered), /console (SPA)  │ output + result.json back (HTTP, WORKER_TOKEN)
+   POST /v1/pages ─▶ D1 row + R2 file + CF Queue ┘ ──▶ GET /v1/jobs/{id}, /image, /result
 ```
 
 - `terjemahin_worker/registry.py`: one `Registry` per stage; a method is a factory
@@ -207,30 +208,69 @@ curl localhost:8000/api/methods                   # stages, methods, availabilit
 method or a bad language is a 400; option values are checked when the job starts (before any
 stage runs), so a bad one comes back as a failed job whose error names the option.
 
-### Go API + queue (production path)
+### Cloud API (apps/web)
+
+The hosted service: one SvelteKit app on Cloudflare Workers serves the landing page
+(prerendered to static HTML), the console (`/console`, a browser-only SPA signed in with
+Clerk) and the API. Jobs are rows in D1, page files live in R2 and job ids go through a
+Cloudflare Queue. The Python worker runs anywhere and takes jobs over HTTP, so it never needs
+Cloudflare credentials or an inbound port.
 
 ```sh
-docker compose up lavinmq -d
-(cd apps/api && go run .)                         # :8080
-(cd apps/worker && .venv/bin/terjemahin-worker serve)
-curl -F file=@page.jpg -F 'pipeline={"translator":"nllb","inpainter":"lama_manga"}' \
+curl -H "authorization: Bearer $CLERK_SESSION_TOKEN" \
+     -F file=@page.jpg -F 'pipeline={"translator":"gemini"}' \
      -F 'context={"glossary":[{"source":"ナルト","target":"Naruto"}]}' -F debug=true \
-     localhost:8080/v1/pages                      # 202 + job
-curl localhost:8080/v1/jobs/<id>                  # queued | done | failed
-curl localhost:8080/v1/jobs/<id>/image -o out.png
-curl localhost:8080/v1/jobs/<id>/result           # PageResult JSON
-curl localhost:8080/v1/jobs/<id>/debug/mask -o mask.png   # detect|mask|inpainted|final, debug=true jobs
+     https://<app>/v1/pages                       # 202 + job
+curl .../v1/jobs/<id>                             # queued | running | done | failed | expired
+curl .../v1/jobs/<id>/image -o out.png
+curl .../v1/jobs/<id>/result                      # PageResult JSON
+curl .../v1/jobs/<id>/debug/mask -o mask.png      # detect|mask|inpainted|final, debug=true jobs
 ```
 
-The API validates `pipeline` structurally (known fields and stages) and the worker validates
-method names and options. The job store is in-memory: jobs are lost when the API restarts
-(Postgres is in compose but not wired yet).
+The API checks `pipeline` and `context` structurally (known fields and stages); the worker
+checks method names and options. Jobs and their files are deleted after 2 days; a job not
+finished within 24 hours is `expired` (the queue's message retention on the free plan).
+
+Worker protocol (`Authorization: Bearer $WORKER_TOKEN`): `POST /api/worker/claim` answers 204
+or a job with a lease; `GET /api/worker/jobs/<id>/input` is the page; `POST
+/api/worker/jobs/<id>/result` takes the lease, `status=done|failed` and the output files. A
+job whose result is not posted within 15 minutes goes to another worker. The queue, job store
+and file store are small interfaces in `apps/web/src/lib/server/` (`queue.ts`, `jobs.ts`,
+`blobs.ts`) so another broker or storage can replace them without touching the worker.
+
+Local development (D1, R2 and the queue are simulated; the `jobs` table stands in for the
+queue because Cloudflare's pull API has no local version):
+
+```sh
+cd apps/web && pnpm install && cp .dev.vars.example .dev.vars
+pnpm exec wrangler d1 migrations apply terjemahin --local
+pnpm dev                                          # :5173; without Clerk keys every request is user "dev"
+(cd apps/worker && API_URL=http://localhost:5173 WORKER_TOKEN=dev-worker-token \
+   .venv/bin/terjemahin-worker serve)
+curl -F file=@page.png localhost:5173/v1/pages
+```
+
+Deploying to Cloudflare (once):
+
+```sh
+cd apps/web
+pnpm exec wrangler d1 create terjemahin           # put the database_id in wrangler.jsonc
+pnpm exec wrangler d1 migrations apply terjemahin --remote
+pnpm exec wrangler r2 bucket create terjemahin-files
+pnpm exec wrangler r2 bucket lifecycle add terjemahin-files expire-jobs jobs/ --expire-days 2
+pnpm exec wrangler queues create terjemahin-jobs
+pnpm exec wrangler queues consumer http add terjemahin-jobs   # pull consumer for the worker
+# set PUBLIC_CLERK_PUBLISHABLE_KEY in wrangler.jsonc vars, then the secrets:
+for s in CLERK_SECRET_KEY WORKER_TOKEN CF_ACCOUNT_ID CF_QUEUE_ID CF_QUEUES_API_TOKEN; do
+  pnpm exec wrangler secret put $s; done           # API token: Account > Queues > Edit
+pnpm build && pnpm exec wrangler deploy
+```
 
 ## Docker
 
 ```sh
-docker compose up --build                         # lavinmq, postgres, api, worker (queue)
-docker compose --profile web up --build web       # standalone web UI on :8000
+docker compose up --build worker                  # `serve`: API_URL + WORKER_TOKEN in .env
+docker compose --profile web up --build web       # standalone web UI on :8000 (self-host)
 docker build --build-arg FETCH="--all" -t terjemahin-worker apps/worker
 ```
 
@@ -350,14 +390,14 @@ costs only show in the default row. Not run: API translators (no keys), `ollama`
 - CJK targets need a CJK font (not bundled, `CJK_FONTS=1` in Docker).
 - CPU only was tested. `DEVICE=cuda` applies to the torch methods; the ONNX methods use the
   CPU execution provider.
-- The Go API keeps jobs in memory. The queue path ran end to end once (Go API, RabbitMQ standing
-  in for LavinMQ, `terjemahin-worker serve`; docs/PROOF.md section 6) on an earlier revision;
-  Docker compose and LavinMQ themselves were not exercised.
+- The cloud path (apps/web + `terjemahin-worker serve`) ran end to end locally only (wrangler's
+  simulated D1 and R2, the `d1` queue driver). Cloudflare Queues' pull API and Clerk sign-in
+  have not run against the real services yet.
 
 ## Layout
 
 ```
-apps/api/                 Go HTTP API: upload, queue, job status, results
+apps/web/                 SvelteKit app on Cloudflare Workers: landing page, console, API
 apps/worker/terjemahin_worker/
   detect/ ocr/ translate/ mask/ inpaint/ render/   one module per method
   pipeline.py registry.py models.py config.py weights.py cli.py consumer.py

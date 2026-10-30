@@ -1,0 +1,8 @@
+# Copy to .dev.vars for `pnpm dev`; these override wrangler.jsonc vars locally. Local dev has no
+# Cloudflare Queues pull API, so the D1 jobs table is the queue. The production Clerk key only
+# works on terjemah.in: the console uses the development instance here, and with CLERK_JWT_KEY
+# empty `pnpm dev` (never a build) treats every API request as user "dev".
+QUEUE_DRIVER=d1
+WORKER_TOKEN=dev-worker-token
+PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_bmV4dC1zdGluZ3JheS01LmNsZXJrLmFjY291bnRzLmRldiQ
+CLERK_JWT_KEY=

@@ -1,0 +1,4 @@
+User-agent: *
+Disallow: /console
+Disallow: /api/
+Disallow: /v1/

@@ -1,0 +1,33 @@
+// Cloudflare Worker: the SvelteKit app (landing page, console, public and worker APIs).
+// Setup and deploy steps: README.md "Cloud (Cloudflare)".
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "terjemahin",
+	"main": ".svelte-kit/cloudflare/_worker.js",
+	"compatibility_date": "2026-10-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"assets": { "binding": "ASSETS", "directory": ".svelte-kit/cloudflare" },
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "terjemahin",
+			"database_id": "40e74340-8381-4c56-bc21-7bd88ce970cd",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [{ "binding": "FILES", "bucket_name": "terjemahin-files" }],
+	"queues": { "producers": [{ "binding": "JOBS", "queue": "terjemahin-jobs" }] },
+	"routes": [{ "pattern": "terjemah.in", "custom_domain": true }],
+	"vars": {
+		// cloudflare: CF Queues (the worker pulls through this app); d1: the jobs table is the queue
+		"QUEUE_DRIVER": "cloudflare",
+		"CF_ACCOUNT_ID": "991d2edd07348de19465a4b5c06b73dc",
+		"CF_QUEUE_ID": "b0e8c722b93e40d8bc113dcbe72f0540",
+		// Clerk production instance (clerk.terjemah.in). CLERK_JWT_KEY is its public key
+		// (https://clerk.terjemah.in/.well-known/jwks.json as PEM): session tokens are verified
+		// offline, so the app needs no Clerk secret.
+		"PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsudGVyamVtYWguaW4k",
+		"CLERK_JWT_KEY": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxqogf5FPGBosO6uZ/xpa\nwSZjOl1hbE4AOzlYjZvfTr1CTmHQ6eURNhoAFLv/3AMaVMUXkmFxtfa/lDwhVGN7\nJ618dUQ8u/Uu0G9DT8zGT19jVQtglTuzRV7MnugMIG2xbwgLiRyvQmgJb++zB099\n+DC3xLJ60tql8+u2TK4XvxI7tl/WMBKIZrcDIVpX/s0+4328cLLLHiZkDgMcGQLg\narRKbFapTto9/P+cWweKIU6q7zP0AE+wFP2WTqM+sxi/P8wojit5YYRCnd90F6tq\nqo4Y13Mapv2hDeyr1wRLbaQRgEdK5eXTW3YhtaQ7y6Gsxf65tCOQNKVHKrYaLKu8\nMwIDAQAB\n-----END PUBLIC KEY-----"
+	}
+	// secrets (`wrangler secret put`): WORKER_TOKEN, CF_QUEUES_API_TOKEN (Account > Queues > Edit)
+}
