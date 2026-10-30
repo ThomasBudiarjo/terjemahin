@@ -1,6 +1,0 @@
-{
-  "servicePorts": {
-    "web": 30818,
-    "webprod": 30321
-  }
-}
