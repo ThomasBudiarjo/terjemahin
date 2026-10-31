@@ -1,8 +1,10 @@
-// Job state. Rows older than RETENTION_MS are deleted (their R2 files expire at the same age).
+// Job state: one document per page in the MongoDB `jobs` collection, which is also the queue
+// (queue.ts). A TTL index deletes documents RETENTION_MS after creation; their R2 files expire at
+// the same age.
+import type { Collection } from 'mongodb';
 
 export const RETENTION_MS = 2 * 24 * 3600_000;
-// A job not finished after this is reported `expired`: Cloudflare Queues (free plan) drops
-// messages after 24 hours, so it will never run.
+// A job not finished after this is reported `expired` and no longer handed to workers.
 export const STALE_MS = 24 * 3600_000;
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
@@ -26,8 +28,6 @@ export interface JobStore {
 	get(id: string): Promise<Job | null>;
 	markRunning(id: string): Promise<void>;
 	finish(id: string, result: { status: 'done' | 'failed'; error?: string; bubbles?: number }): Promise<void>;
-	/** Deletes rows older than `before` (unix ms). */
-	purge(before: number): Promise<void>;
 }
 
 /** What GET /v1/jobs/:id answers. */
@@ -44,64 +44,55 @@ export function publicJob(j: Job, now = Date.now()) {
 	};
 }
 
-type Row = {
-	id: string;
-	user_id: string;
-	status: JobStatus;
-	error: string | null;
-	input_key: string;
-	context: string | null;
-	pipeline: string | null;
-	debug: number;
-	bubbles: number | null;
-	created_at: number;
-	updated_at: number;
+export type JobDoc = Omit<Job, 'id' | 'createdAt' | 'updatedAt'> & {
+	_id: string;
+	createdAt: Date; // a Date, for the TTL index
+	updatedAt: Date;
+	lease?: string; // set while a worker holds the job (queue.ts)
+	leaseUntil?: Date;
 };
 
-export function d1JobStore(db: D1Database): JobStore {
+// createIndexes is a no-op when the indexes exist; once per isolate is enough.
+let indexed = false;
+
+export function mongoJobStore(col: Collection<JobDoc>): JobStore {
 	return {
 		async create(j) {
-			await db
-				.prepare(
-					`INSERT INTO jobs (id, user_id, status, error, input_key, context, pipeline, debug,
-					                   bubbles, created_at, updated_at)
-					 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
-				)
-				.bind(j.id, j.userId, j.status, j.error, j.inputKey, j.context, j.pipeline,
-					j.debug ? 1 : 0, j.bubbles, j.createdAt, j.updatedAt)
-				.run();
+			if (!indexed) {
+				await col.createIndexes([
+					{ key: { createdAt: 1 }, expireAfterSeconds: RETENTION_MS / 1000 },
+					{ key: { status: 1, createdAt: 1 } } // queue.ts claim
+				]);
+				indexed = true;
+			}
+			const { id, createdAt, updatedAt, ...rest } = j;
+			await col.insertOne({ _id: id, ...rest, createdAt: new Date(createdAt), updatedAt: new Date(updatedAt) });
 		},
 		async get(id) {
-			const r = await db.prepare('SELECT * FROM jobs WHERE id = ?1').bind(id).first<Row>();
-			if (!r) return null;
+			const d = await col.findOne({ _id: id });
+			if (!d) return null;
 			return {
-				id: r.id,
-				userId: r.user_id,
-				status: r.status,
-				error: r.error,
-				inputKey: r.input_key,
-				context: r.context,
-				pipeline: r.pipeline,
-				debug: r.debug === 1,
-				bubbles: r.bubbles,
-				createdAt: r.created_at,
-				updatedAt: r.updated_at
+				id: d._id,
+				userId: d.userId,
+				status: d.status,
+				error: d.error,
+				inputKey: d.inputKey,
+				context: d.context,
+				pipeline: d.pipeline,
+				debug: d.debug,
+				bubbles: d.bubbles,
+				createdAt: d.createdAt.getTime(),
+				updatedAt: d.updatedAt.getTime()
 			};
 		},
 		async markRunning(id) {
-			await db
-				.prepare(`UPDATE jobs SET status = 'running', updated_at = ?2 WHERE id = ?1 AND status = 'queued'`)
-				.bind(id, Date.now())
-				.run();
+			await col.updateOne({ _id: id, status: 'queued' }, { $set: { status: 'running', updatedAt: new Date() } });
 		},
 		async finish(id, res) {
-			await db
-				.prepare('UPDATE jobs SET status = ?2, error = ?3, bubbles = ?4, updated_at = ?5 WHERE id = ?1')
-				.bind(id, res.status, res.error ?? null, res.bubbles ?? null, Date.now())
-				.run();
-		},
-		async purge(before) {
-			await db.prepare('DELETE FROM jobs WHERE created_at < ?1').bind(before).run();
+			await col.updateOne(
+				{ _id: id },
+				{ $set: { status: res.status, error: res.error ?? null, bubbles: res.bubbles ?? null, updatedAt: new Date() } }
+			);
 		}
 	};
 }

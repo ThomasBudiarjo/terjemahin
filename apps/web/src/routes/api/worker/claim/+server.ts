@@ -9,14 +9,9 @@ const VISIBILITY_MS = 15 * 60_000;
 export const POST: RequestHandler = async (event) => {
 	requireWorker(event);
 	const { jobs, queue } = services();
-	for (let i = 0; i < 5; i++) {
-		const claim = await queue.claim(VISIBILITY_MS);
-		if (!claim) break;
-		const job = await jobs.get(claim.jobId);
-		if (!job || job.status === 'done' || job.status === 'failed') {
-			await queue.ack(claim.lease); // purged, or delivered twice: drop the message
-			continue;
-		}
+	const claim = await queue.claim(VISIBILITY_MS);
+	const job = claim && (await jobs.get(claim.jobId));
+	if (claim && job) {
 		await jobs.markRunning(job.id);
 		return json({
 			lease: claim.lease,

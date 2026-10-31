@@ -1,18 +1,20 @@
 // See https://svelte.dev/docs/kit/types#app.d.ts
+import type { MongoClient } from 'mongodb';
+
 // Bindings, vars and secrets of wrangler.jsonc, read with `import { env } from 'cloudflare:workers'`.
 declare global {
+	namespace App {
+		interface Locals {
+			mongo?: MongoClient; // opened by services(), closed by hooks.server.ts
+		}
+	}
 	namespace Cloudflare {
 		interface Env {
-			DB: D1Database;
 			FILES: R2Bucket;
-			JOBS: Queue;
-			QUEUE_DRIVER: 'cloudflare' | 'd1';
+			MONGODB_URI?: string;
 			PUBLIC_CLERK_PUBLISHABLE_KEY?: string;
 			CLERK_JWT_KEY?: string;
 			WORKER_TOKEN?: string;
-			CF_ACCOUNT_ID?: string;
-			CF_QUEUE_ID?: string;
-			CF_QUEUES_API_TOKEN?: string;
 		}
 	}
 }

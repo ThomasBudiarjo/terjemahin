@@ -1,6 +1,5 @@
 import { error, json } from '@sveltejs/kit';
-import { waitUntil } from 'cloudflare:workers';
-import { publicJob, RETENTION_MS } from '#lib/server/jobs.js';
+import { publicJob } from '#lib/server/jobs.js';
 import { requireUser, services } from '#lib/server/services.js';
 import { checkContext, checkPipeline, parseBool } from '#lib/server/validate.js';
 import type { RequestHandler } from './$types';
@@ -45,7 +44,7 @@ export const POST: RequestHandler = async (event) => {
 		error(400, (e as Error).message);
 	}
 
-	const { jobs, queue, blobs } = services();
+	const { jobs, blobs } = services();
 	const id = crypto.randomUUID().replaceAll('-', '');
 	const inputKey = `jobs/${id}/input.${ext}`;
 	await blobs.put(inputKey, await file.arrayBuffer(), TYPES[ext]);
@@ -64,15 +63,6 @@ export const POST: RequestHandler = async (event) => {
 		createdAt: now,
 		updatedAt: now
 	};
-	// stored before it is queued, so a worker that claims it at once finds the row
-	await jobs.create(job);
-	try {
-		await queue.enqueue(id);
-	} catch (e) {
-		console.error('enqueue', e);
-		await jobs.finish(id, { status: 'failed', error: 'queue unavailable' });
-		error(503, 'queue unavailable');
-	}
-	waitUntil(jobs.purge(now - RETENTION_MS));
+	await jobs.create(job); // a queued job is the queue message
 	return json(publicJob(job), { status: 202 });
 };

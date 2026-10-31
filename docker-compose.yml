@@ -25,5 +25,14 @@ services:
     volumes:
       - web-data:/data
 
+  # MongoDB for `pnpm dev` in apps/web (MONGODB_URI=mongodb://localhost:27017); production uses Atlas
+  mongo:
+    image: mongo:8
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
 volumes:
   web-data:
+  mongo-data:

@@ -1,10 +1,12 @@
 import { dev } from '$app/env';
+import { getRequestEvent } from '$app/server';
 import { verifyToken } from '@clerk/backend';
 import { error, type RequestEvent } from '@sveltejs/kit';
 import { env } from 'cloudflare:workers';
+import { MongoClient } from 'mongodb';
 import { r2Store, type BlobStore } from './blobs.js';
-import { d1JobStore, type JobStore } from './jobs.js';
-import { cloudflareQueue, d1Queue, type JobQueue } from './queue.js';
+import { mongoJobStore, type JobDoc, type JobStore } from './jobs.js';
+import { mongoQueue, type JobQueue } from './queue.js';
 
 export interface Services {
 	jobs: JobStore;
@@ -12,21 +14,16 @@ export interface Services {
 	blobs: BlobStore;
 }
 
+/** The current request's services. Workers cannot share sockets between requests, so each request
+ * opens its own MongoDB connection (on first use); hooks.server.ts closes it. */
 export function services(): Services {
-	let queue: JobQueue;
-	if (env.QUEUE_DRIVER === 'd1') {
-		queue = d1Queue(env.DB);
-	} else {
-		if (!env.CF_ACCOUNT_ID || !env.CF_QUEUE_ID || !env.CF_QUEUES_API_TOKEN) {
-			error(500, 'QUEUE_DRIVER=cloudflare needs CF_ACCOUNT_ID, CF_QUEUE_ID and CF_QUEUES_API_TOKEN');
-		}
-		queue = cloudflareQueue(env.JOBS, {
-			accountId: env.CF_ACCOUNT_ID,
-			queueId: env.CF_QUEUE_ID,
-			token: env.CF_QUEUES_API_TOKEN
-		});
+	const { locals } = getRequestEvent();
+	if (!locals.mongo) {
+		if (!env.MONGODB_URI) error(500, 'MONGODB_URI is not set');
+		locals.mongo = new MongoClient(env.MONGODB_URI, { maxPoolSize: 1, serverSelectionTimeoutMS: 5000 });
 	}
-	return { jobs: d1JobStore(env.DB), queue, blobs: r2Store(env.FILES) };
+	const col = locals.mongo.db('terjemahin').collection<JobDoc>('jobs');
+	return { jobs: mongoJobStore(col), queue: mongoQueue(col), blobs: r2Store(env.FILES) };
 }
 
 /** The signed-in Clerk user, from a session token in `Authorization: Bearer` (the console

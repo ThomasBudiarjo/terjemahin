@@ -18,7 +18,7 @@ the web UI, the HTTP API or `.env`.
                      └───────────▲────────────────────────────────────────────────────┘
  apps/web (SvelteKit on Cloudflare Workers)   │ terjemahin-worker serve: claim job, page in,
    landing page (prerendered), /console (SPA)  │ output + result.json back (HTTP, WORKER_TOKEN)
-   POST /v1/pages ─▶ D1 row + R2 file + CF Queue ┘ ──▶ GET /v1/jobs/{id}, /image, /result
+   POST /v1/pages ─▶ MongoDB job + R2 file ───────┘ ──▶ GET /v1/jobs/{id}, /image, /result
 ```
 
 - `terjemahin_worker/registry.py`: one `Registry` per stage; a method is a factory
@@ -212,9 +212,9 @@ stage runs), so a bad one comes back as a failed job whose error names the optio
 
 The hosted service: one SvelteKit app on Cloudflare Workers serves the landing page
 (prerendered to static HTML), the console (`/console`, a browser-only SPA signed in with
-Clerk) and the API. Jobs are rows in D1, page files live in R2 and job ids go through a
-Cloudflare Queue. The Python worker runs anywhere and takes jobs over HTTP, so it never needs
-Cloudflare credentials or an inbound port.
+Clerk) and the API. Jobs are documents in MongoDB (Atlas), and the jobs collection is also the
+queue; page files live in R2. The Python worker runs anywhere and takes jobs over HTTP, so it
+never needs database or Cloudflare credentials or an inbound port.
 
 ```sh
 curl -H "authorization: Bearer $CLERK_SESSION_TOKEN" \
@@ -229,40 +229,43 @@ curl .../v1/jobs/<id>/debug/mask -o mask.png      # detect|mask|inpainted|final,
 
 The API checks `pipeline` and `context` structurally (known fields and stages); the worker
 checks method names and options. Jobs and their files are deleted after 2 days; a job not
-finished within 24 hours is `expired` (the queue's message retention on the free plan).
+finished within 24 hours is `expired` and no longer handed to a worker.
 
 Worker protocol (`Authorization: Bearer $WORKER_TOKEN`): `POST /api/worker/claim` answers 204
 or a job with a lease; `GET /api/worker/jobs/<id>/input` is the page; `POST
 /api/worker/jobs/<id>/result` takes the lease, `status=done|failed` and the output files. A
-job whose result is not posted within 15 minutes goes to another worker. The queue, job store
-and file store are small interfaces in `apps/web/src/lib/server/` (`queue.ts`, `jobs.ts`,
-`blobs.ts`) so another broker or storage can replace them without touching the worker.
+job whose result is not posted within 15 minutes goes to another worker: a claim is an atomic
+`findOneAndUpdate` that puts a lease on the oldest unfinished job. The queue, job store and file
+store are small interfaces in `apps/web/src/lib/server/` (`queue.ts`, `jobs.ts`, `blobs.ts`) so
+another broker or storage can replace them without touching the worker. Each request opens its
+own MongoDB connection (Workers cannot share sockets between requests), about 300 ms per API call.
 
-Local development (D1, R2 and the queue are simulated; the `jobs` table stands in for the
-queue because Cloudflare's pull API has no local version):
+Local development (R2 is simulated; MongoDB is a local server or an Atlas cluster in `.dev.vars`):
 
 ```sh
+docker compose up -d mongo                        # MongoDB on :27017 (or set MONGODB_URI to Atlas)
 cd apps/web && pnpm install && cp .dev.vars.example .dev.vars
-pnpm exec wrangler d1 migrations apply terjemahin --local
 pnpm dev                                          # :5173; without Clerk keys every request is user "dev"
 (cd apps/worker && API_URL=http://localhost:5173 WORKER_TOKEN=dev-worker-token \
    .venv/bin/terjemahin-worker serve)
 curl -F file=@page.png localhost:5173/v1/pages
 ```
 
-Deploying to Cloudflare (once):
+Deploying (once). Cloudflare Workers Builds then deploys every push to `main` (root directory
+`/apps/web`, build command `pnpm build`, deploy command `npx wrangler deploy`).
+
+1. MongoDB Atlas: create a cluster (the free M0 is enough), a database user, and allow access from
+   anywhere (`0.0.0.0/0`, Workers have no fixed IPs). Copy the `mongodb+srv://` connection string.
+   The app creates the `terjemahin.jobs` collection and its indexes (a TTL index deletes jobs after
+   2 days) on the first upload.
+2. Cloudflare:
 
 ```sh
 cd apps/web
-pnpm exec wrangler d1 create terjemahin           # put the database_id in wrangler.jsonc
-pnpm exec wrangler d1 migrations apply terjemahin --remote
 pnpm exec wrangler r2 bucket create terjemahin-files
 pnpm exec wrangler r2 bucket lifecycle add terjemahin-files expire-jobs jobs/ --expire-days 2
-pnpm exec wrangler queues create terjemahin-jobs
-pnpm exec wrangler queues consumer http add terjemahin-jobs   # pull consumer for the worker
-# set PUBLIC_CLERK_PUBLISHABLE_KEY in wrangler.jsonc vars, then the secrets:
-for s in CLERK_SECRET_KEY WORKER_TOKEN CF_ACCOUNT_ID CF_QUEUE_ID CF_QUEUES_API_TOKEN; do
-  pnpm exec wrangler secret put $s; done           # API token: Account > Queues > Edit
+# Clerk keys are vars in wrangler.jsonc; the secrets (or Worker > Settings > Variables and Secrets):
+for s in WORKER_TOKEN MONGODB_URI; do pnpm exec wrangler secret put $s; done
 pnpm build && pnpm exec wrangler deploy
 ```
 
@@ -390,9 +393,9 @@ costs only show in the default row. Not run: API translators (no keys), `ollama`
 - CJK targets need a CJK font (not bundled, `CJK_FONTS=1` in Docker).
 - CPU only was tested. `DEVICE=cuda` applies to the torch methods; the ONNX methods use the
   CPU execution provider.
-- The cloud path (apps/web + `terjemahin-worker serve`) ran end to end locally only (wrangler's
-  simulated D1 and R2, the `d1` queue driver). Cloudflare Queues' pull API and Clerk sign-in
-  have not run against the real services yet.
+- The cloud API (apps/web) was tested in workerd (`wrangler dev`, simulated R2) against a local
+  MongoDB 8 server, with the worker protocol driven by curl. Atlas and Clerk sign-in have not
+  run against the real services yet.
 
 ## Layout
 
